@@ -26,6 +26,7 @@ const CloseConfirmationDialog = @import("close_confirmation_dialog.zig").CloseCo
 const SplitTree = @import("split_tree.zig").SplitTree;
 const Surface = @import("surface.zig").Surface;
 const Tab = @import("tab.zig").Tab;
+const sidebar = @import("sidebar.zig");
 const DebugWarning = @import("debug_warning.zig").DebugWarning;
 const CommandPalette = @import("command_palette.zig").CommandPalette;
 const WeakRef = @import("../weak_ref.zig").WeakRef;
@@ -248,6 +249,14 @@ pub const Window = extern struct {
 
         /// See tabOverviewOpen for why we have this.
         tab_overview_focus_timer: ?c_uint = null,
+
+        /// Supacode worktree sidebar: repeating poll timer (5s) that rescans
+        /// the projects root for git worktree status.
+        sidebar_timer: ?c_uint = null,
+
+        /// The most recent worktree scan, owned by this window. Indexed by
+        /// ListBox row index for row-activation -> open-worktree mapping.
+        sidebar_statuses: []sidebar.WorktreeStatus = &.{},
 
         /// A weak reference to a command palette.
         command_palette: WeakRef(CommandPalette) = .empty,
@@ -1285,6 +1294,154 @@ pub const Window = extern struct {
         // When we are realized we always setup our appearance since this
         // calls some winproto functions.
         self.syncAppearance();
+
+        // Set up the Supacode worktree sidebar: connect row activation,
+        // perform the first scan, and start the periodic refresh poll.
+        self.initSidebar();
+    }
+
+    /// Connect the sidebar ListBox signals, run the first scan, and start the
+    /// 5s refresh timer. Safe to call once after the window is realized.
+    fn initSidebar(self: *Window) void {
+        const priv = self.private();
+
+        _ = gtk.ListBox.signals.row_activated.connect(
+            priv.sidebar_list,
+            *Window,
+            sidebarRowActivated,
+            self,
+            .{},
+        );
+
+        // First scan immediately, then poll.
+        self.refreshSidebar();
+        priv.sidebar_timer = glib.timeoutAdd(5000, sidebarPollTimer, self);
+    }
+
+    fn sidebarPollTimer(ud: ?*anyopaque) callconv(.c) c_int {
+        const self: *Window = @ptrCast(@alignCast(ud orelse return 0));
+        self.refreshSidebar();
+        // Return true to keep the timer firing.
+        return @intFromBool(true);
+    }
+
+    /// Resolve the projects root (default: $HOME/git).
+    fn projectsRoot(alloc: std.mem.Allocator) ?[]u8 {
+        const home = std.posix.getenv("HOME") orelse return null;
+        return std.fs.path.join(alloc, &.{ home, "git" }) catch null;
+    }
+
+    /// Rescan the projects root and rebuild the sidebar rows.
+    fn refreshSidebar(self: *Window) void {
+        const priv = self.private();
+        const alloc = Application.default().allocator();
+
+        const root = projectsRoot(alloc) orelse {
+            log.warn("sidebar: cannot resolve projects root ($HOME unset)", .{});
+            return;
+        };
+        defer alloc.free(root);
+
+        const statuses = sidebar.scan(alloc, root) catch |err| {
+            log.warn("sidebar: scan failed root={s} err={}", .{ root, err });
+            return;
+        };
+
+        // Replace stored statuses (free the previous scan).
+        if (priv.sidebar_statuses.len > 0) {
+            sidebar.freeStatuses(alloc, priv.sidebar_statuses);
+        }
+        priv.sidebar_statuses = statuses;
+
+        // Rebuild the rows.
+        priv.sidebar_list.removeAll();
+        for (statuses) |*st| {
+            const row = self.buildSidebarRow(st);
+            priv.sidebar_list.append(row.as(gtk.Widget));
+        }
+    }
+
+    /// Build one ListBoxRow widget for a worktree status.
+    fn buildSidebarRow(self: *Window, st: *const sidebar.WorktreeStatus) *gtk.ListBoxRow {
+        _ = self;
+        const alloc = Application.default().allocator();
+
+        const row = gtk.ListBoxRow.new();
+
+        const box = gtk.Box.new(.horizontal, 6);
+        box.as(gtk.Widget).setMarginStart(8);
+        box.as(gtk.Widget).setMarginEnd(8);
+        box.as(gtk.Widget).setMarginTop(4);
+        box.as(gtk.Widget).setMarginBottom(4);
+
+        // Status dot color: pushable=yellow, dirty=orange, behind=blue, clean=green.
+        const dot_color: []const u8 = if (st.pushable())
+            "#e5c07b"
+        else if (st.dirty)
+            "#d19a66"
+        else if (st.behind > 0)
+            "#61afef"
+        else
+            "#98c379";
+
+        // Escape name and branch for Pango markup.
+        const name_z = alloc.dupeZ(u8, st.name) catch return row;
+        defer alloc.free(name_z);
+        const branch_z = alloc.dupeZ(u8, st.branch) catch return row;
+        defer alloc.free(branch_z);
+        const name_esc = glib.markupEscapeText(name_z.ptr, -1);
+        defer glib.free(name_esc);
+        const branch_esc = glib.markupEscapeText(branch_z.ptr, -1);
+        defer glib.free(branch_esc);
+
+        // Indent linked worktrees.
+        const indent: []const u8 = if (st.is_worktree) "    " else "";
+
+        // Badges: ↑ahead ↓behind, or "no upstream".
+        var badge_buf: [128]u8 = undefined;
+        const badges: []const u8 = if (st.no_upstream)
+            " <small><span foreground='#777'>no upstream</span></small>"
+        else blk: {
+            var stream = std.io.fixedBufferStream(&badge_buf);
+            const w = stream.writer();
+            if (st.ahead > 0) w.print(" <small><span foreground='#e5c07b'>↑{d}</span></small>", .{st.ahead}) catch {};
+            if (st.behind > 0) w.print(" <small><span foreground='#61afef'>↓{d}</span></small>", .{st.behind}) catch {};
+            break :blk stream.getWritten();
+        };
+
+        const markup = std.fmt.allocPrintSentinel(
+            alloc,
+            "{s}<span foreground='{s}'>●</span> {s} <small><span foreground='#888'>{s}</span></small>{s}",
+            .{ indent, dot_color, name_esc, branch_esc, badges },
+            0,
+        ) catch return row;
+        defer alloc.free(markup);
+
+        const label = gtk.Label.new(null);
+        label.setMarkup(markup.ptr);
+        label.setXalign(0);
+        label.as(gtk.Widget).setHexpand(@intFromBool(true));
+        label.setEllipsize(.end);
+
+        box.append(label.as(gtk.Widget));
+        row.setChild(box.as(gtk.Widget));
+        return row;
+    }
+
+    /// Row activation: open the corresponding worktree path in a new tab.
+    fn sidebarRowActivated(
+        _: *gtk.ListBox,
+        row: *gtk.ListBoxRow,
+        self: *Window,
+    ) callconv(.c) void {
+        const priv = self.private();
+        const idx = row.getIndex();
+        if (idx < 0) return;
+        const i: usize = @intCast(idx);
+        if (i >= priv.sidebar_statuses.len) return;
+
+        const st = priv.sidebar_statuses[i];
+        self.newTabForWindow(null, .{ .working_directory = st.path });
     }
 
     fn btnNewTab(_: *adw.SplitButton, self: *Self) callconv(.c) void {
