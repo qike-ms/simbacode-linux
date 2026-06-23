@@ -343,6 +343,10 @@ pub const Action = union(Key) {
     /// otherwise the terminal-set title.
     copy_title_to_clipboard,
 
+    /// OSC 3008 hierarchical context signal (UAPI spec). A program inside the
+    /// terminal signalled a context change.
+    context_signal: ContextSignal,
+
     /// Sync with: ghostty_action_tag_e
     pub const Key = enum(c_int) {
         quit,
@@ -410,6 +414,7 @@ pub const Action = union(Key) {
         search_selected,
         readonly,
         copy_title_to_clipboard,
+        context_signal,
 
         test "ghostty.h Action.Key" {
             try lib.checkGhosttyHEnum(Key, "GHOSTTY_ACTION_");
@@ -768,6 +773,28 @@ pub const DesktopNotification = struct {
             value.title,
             value.body,
         });
+    }
+};
+
+pub const ContextSignal = struct {
+    /// 0 = start, 1 = end.
+    action: u8,
+    id: [:0]const u8,
+    metadata: [:0]const u8,
+
+    // Sync with: ghostty_action_context_signal_s
+    pub const C = extern struct {
+        action: u8,
+        id: [*:0]const u8,
+        metadata: [*:0]const u8,
+    };
+
+    pub fn cval(self: ContextSignal) C {
+        return .{
+            .action = self.action,
+            .id = self.id.ptr,
+            .metadata = self.metadata.ptr,
+        };
     }
 };
 

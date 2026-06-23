@@ -455,6 +455,9 @@ typedef struct {
   const char* initial_input;
   bool wait_after_command;
   ghostty_surface_context_e context;
+  const char* const* command_wrapper;
+  size_t command_wrapper_count;
+  bool disable_shell_integration;
 } ghostty_surface_config_s;
 
 typedef struct {
@@ -640,6 +643,13 @@ typedef struct {
   const char* title;
   const char* body;
 } ghostty_action_desktop_notification_s;
+
+// apprt.action.ContextSignal.C
+typedef struct {
+  uint8_t action;  // 0 = start, 1 = end
+  const char* id;
+  const char* metadata;
+} ghostty_action_context_signal_s;
 
 // apprt.action.SetTitle.C
 typedef struct {
@@ -926,6 +936,7 @@ typedef enum {
   GHOSTTY_ACTION_SEARCH_SELECTED,
   GHOSTTY_ACTION_READONLY,
   GHOSTTY_ACTION_COPY_TITLE_TO_CLIPBOARD,
+  GHOSTTY_ACTION_CONTEXT_SIGNAL,
 } ghostty_action_tag_e;
 
 typedef union {
@@ -942,6 +953,7 @@ typedef union {
   ghostty_action_scrollbar_s scrollbar;
   ghostty_action_inspector_e inspector;
   ghostty_action_desktop_notification_s desktop_notification;
+  ghostty_action_context_signal_s context_signal;
   ghostty_action_set_title_s set_title;
   ghostty_action_set_title_s set_tab_title;
   ghostty_action_prompt_title_e prompt_title;
@@ -1082,6 +1094,7 @@ void ghostty_surface_free(ghostty_surface_t);
 void* ghostty_surface_userdata(ghostty_surface_t);
 ghostty_app_t ghostty_surface_app(ghostty_surface_t);
 ghostty_surface_config_s ghostty_surface_inherited_config(ghostty_surface_t, ghostty_surface_context_e);
+float ghostty_surface_font_size(ghostty_surface_t);
 void ghostty_surface_update_config(ghostty_surface_t, ghostty_config_t);
 bool ghostty_surface_needs_confirm_quit(ghostty_surface_t);
 bool ghostty_surface_process_exited(ghostty_surface_t);

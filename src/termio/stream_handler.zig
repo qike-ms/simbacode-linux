@@ -327,6 +327,7 @@ pub const StreamHandler = struct {
             .window_title => try self.windowTitle(value.title),
             .report_pwd => try self.reportPwd(value.url),
             .show_desktop_notification => try self.showDesktopNotification(value.title, value.body),
+            .context_signal => try self.handleContextSignal(value.action, value.id, value.metadata),
             .progress_report => self.progressReport(value),
             .start_hyperlink => try self.startHyperlink(value.uri, value.id),
             .clipboard_contents => try self.clipboardContents(value.kind, value.data),
@@ -1443,6 +1444,41 @@ pub const StreamHandler = struct {
         const body_len = @min(body.len, message.desktop_notification.body.len);
         @memcpy(message.desktop_notification.body[0..body_len], body[0..body_len]);
         message.desktop_notification.body[body_len] = 0;
+
+        self.surfaceMessageWriter(message);
+    }
+
+    fn handleContextSignal(
+        self: *StreamHandler,
+        action: u8,
+        id: []const u8,
+        metadata: []const u8,
+    ) !void {
+        var message = apprt.surface.Message{ .context_signal = undefined };
+
+        message.context_signal.action = action;
+
+        // id is spec-bounded to 64 (max_context_id_len) by the parser; the clamp
+        // is defense-in-depth and is not expected to fire. Warn symmetrically
+        // with the metadata path so a future spec-cap raise doesn't hide an
+        // id-truncation regression.
+        if (id.len > message.context_signal.id.len) {
+            log.warn("OSC 3008: context_signal id truncated from {d} to {d} bytes", .{
+                id.len, message.context_signal.id.len,
+            });
+        }
+        const id_len = @min(id.len, message.context_signal.id.len);
+        @memcpy(message.context_signal.id[0..id_len], id[0..id_len]);
+        message.context_signal.id[id_len] = 0;
+
+        if (metadata.len > message.context_signal.metadata.len) {
+            log.warn("OSC 3008: context_signal metadata truncated from {d} to {d} bytes", .{
+                metadata.len, message.context_signal.metadata.len,
+            });
+        }
+        const metadata_len = @min(metadata.len, message.context_signal.metadata.len);
+        @memcpy(message.context_signal.metadata[0..metadata_len], metadata[0..metadata_len]);
+        message.context_signal.metadata[metadata_len] = 0;
 
         self.surfaceMessageWriter(message);
     }

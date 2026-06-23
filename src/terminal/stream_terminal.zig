@@ -259,6 +259,7 @@ pub const Handler = struct {
             // Have no terminal-modifying effect
             .report_pwd,
             .show_desktop_notification,
+            .context_signal,
             .progress_report,
             .clipboard_contents,
             .title_push,

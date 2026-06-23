@@ -559,6 +559,7 @@ pub const ThreadData = struct {
 
 pub const Config = struct {
     command: ?configpkg.Command = null,
+    command_wrapper: ?configpkg.Command = null,
     env: EnvMap,
     env_override: configpkg.RepeatableStringMap = .{},
     shell_integration: configpkg.Config.ShellIntegration = .detect,
@@ -815,7 +816,7 @@ const Subprocess = struct {
         }
 
         // Build our args list
-        const args: []const [:0]const u8 = execCommand(
+        const base_args: []const [:0]const u8 = execCommand(
             alloc,
             shell_command,
             internal_os.passwd,
@@ -839,6 +840,24 @@ const Subprocess = struct {
             // This logs on its own, this is a bad error.
             error.SystemError => return err,
         };
+
+        // If a command wrapper is configured, prepend its arguments to the
+        // resolved command so the resolved argv (including the macOS login(1)
+        // wrapping and any shell integration) runs as a child of the wrapper.
+        const args: []const [:0]const u8 = if (cfg.command_wrapper) |wrapper| wrap: {
+            var list: std.ArrayList([:0]const u8) = try .initCapacity(
+                alloc,
+                base_args.len + 4,
+            );
+            defer list.deinit(alloc);
+
+            var it = try wrapper.argIterator(alloc);
+            defer it.deinit();
+            while (it.next()) |arg| try list.append(alloc, try alloc.dupeZ(u8, arg));
+
+            try list.appendSlice(alloc, base_args);
+            break :wrap try list.toOwnedSlice(alloc);
+        } else base_args;
 
         // We have to copy the cwd because there is no guarantee that
         // pointers in full_config remain valid.

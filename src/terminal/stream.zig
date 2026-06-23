@@ -125,6 +125,7 @@ pub const Action = union(Key) {
     kitty_color_report: kitty.color.OSC,
     color_operation: ColorOperation,
     semantic_prompt: SemanticPrompt,
+    context_signal: ContextSignal,
 
     pub const Key = lib.Enum(
         lib.target,
@@ -222,6 +223,7 @@ pub const Action = union(Key) {
             "kitty_color_report",
             "color_operation",
             "semantic_prompt",
+            "context_signal",
         },
     );
 
@@ -344,6 +346,26 @@ pub const Action = union(Key) {
             return .{
                 .title = .init(self.title),
                 .body = .init(self.body),
+            };
+        }
+    };
+
+    pub const ContextSignal = struct {
+        action: u8,
+        id: []const u8,
+        metadata: []const u8,
+
+        pub const C = extern struct {
+            action: u8,
+            id: lib.String,
+            metadata: lib.String,
+        };
+
+        pub fn cval(self: ContextSignal) ContextSignal.C {
+            return .{
+                .action = self.action,
+                .id = .init(self.id),
+                .metadata = .init(self.metadata),
             };
         }
     };
@@ -2047,6 +2069,21 @@ pub fn Stream(comptime H: type) type {
                     self.handler.vt(.progress_report, v);
                 },
 
+                .context_signal => |v| {
+                    // The u8 wire value is a locked C ABI; pin the enum mapping so a
+                    // future ghostty bump that reorders Action fails loudly here
+                    // instead of silently renumbering every consumer.
+                    comptime {
+                        std.debug.assert(@intFromEnum(@TypeOf(v.action).start) == 0);
+                        std.debug.assert(@intFromEnum(@TypeOf(v.action).end) == 1);
+                    }
+                    self.handler.vt(.context_signal, .{
+                        .action = @intFromEnum(v.action),
+                        .id = v.id,
+                        .metadata = v.metadata,
+                    });
+                },
+
                 .conemu_sleep,
                 .conemu_show_message_box,
                 .conemu_change_tab_title,
@@ -2058,7 +2095,6 @@ pub fn Stream(comptime H: type) type {
                 .conemu_run_process,
                 .kitty_text_sizing,
                 .kitty_clipboard_protocol,
-                .context_signal,
                 => {
                     log.debug("unimplemented OSC callback: {}", .{cmd});
                 },

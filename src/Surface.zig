@@ -635,6 +635,7 @@ pub fn init(
         // Initialize our IO backend
         var io_exec = try termio.Exec.init(alloc, .{
             .command = command,
+            .command_wrapper = config.@"command-wrapper",
             .env = env,
             .env_override = config.env,
             .shell_integration = config.@"shell-integration",
@@ -1071,6 +1072,16 @@ pub fn handleMessage(self: *Surface, msg: Message) !void {
             const title = std.mem.sliceTo(&notification.title, 0);
             const body = std.mem.sliceTo(&notification.body, 0);
             try self.showDesktopNotification(title, body);
+        },
+
+        .context_signal => |signal| {
+            const id = std.mem.sliceTo(&signal.id, 0);
+            const metadata = std.mem.sliceTo(&signal.metadata, 0);
+            _ = try self.rt_app.performAction(
+                .{ .surface = self },
+                .context_signal,
+                .{ .action = signal.action, .id = id, .metadata = metadata },
+            );
         },
 
         .renderer_health => |health| self.updateRendererHealth(health),

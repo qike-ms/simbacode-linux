@@ -60,6 +60,20 @@ pub const Message = union(enum) {
         body: [255:0]u8,
     },
 
+    /// OSC 3008 hierarchical context signal (UAPI spec).
+    context_signal: struct {
+        /// The signalled action: 0 = start, 1 = end.
+        action: u8,
+
+        /// Context identifier (1-64 chars per spec).
+        id: [64:0]u8,
+
+        /// Raw semicolon-separated key=value metadata, truncated to 2047 bytes
+        /// (may split a field; see handleContextSignal). Sized to carry a
+        /// base64-encoded notification payload, not just the tiny presence fields.
+        metadata: [2047:0]u8,
+    },
+
     /// Health status change for the renderer.
     renderer_health: renderer.Health,
 

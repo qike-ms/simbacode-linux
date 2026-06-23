@@ -460,6 +460,19 @@ pub const Surface = struct {
 
         /// Context for the new surface
         context: apprt.surface.NewSurfaceContext = .window,
+
+        /// A wrapper command (argv) prepended to the final resolved command.
+        /// See the `command-wrapper` config docs. Each element is a NUL
+        /// terminated argument; `command_wrapper_count` is the element count.
+        /// When null/empty, no wrapper is applied.
+        command_wrapper: ?[*]const [*:0]const u8 = null,
+        command_wrapper_count: usize = 0,
+
+        /// Force `shell-integration = none` for this surface only, regardless of
+        /// the global config. For surfaces that run a self-managing command
+        /// (e.g. a script runner that emits its own OSC sequences) and must not
+        /// have Ghostty's integration injected into the shell.
+        disable_shell_integration: bool = false,
     };
 
     pub fn init(self: *Surface, app: *App, opts: Options) !void {
@@ -532,6 +545,25 @@ pub const Surface = struct {
                 config.command = .{ .shell = cmd };
                 config.@"wait-after-command" = true;
             }
+        }
+
+        // If we have a command wrapper from the options then we set it. This
+        // is always a direct (already-tokenized) command so paths with spaces
+        // survive without shell re-splitting.
+        if (opts.command_wrapper) |c_wrapper| {
+            if (opts.command_wrapper_count > 0) {
+                const alloc = config.arenaAlloc();
+                const argv = try alloc.alloc([:0]const u8, opts.command_wrapper_count);
+                for (c_wrapper[0..opts.command_wrapper_count], 0..) |arg, i| {
+                    argv[i] = try alloc.dupeZ(u8, std.mem.sliceTo(arg, 0));
+                }
+                config.@"command-wrapper" = .{ .direct = argv };
+            }
+        }
+
+        // Opt this surface out of shell integration regardless of global config.
+        if (opts.disable_shell_integration) {
+            config.@"shell-integration" = .none;
         }
 
         // Apply any environment variables that were requested.
@@ -1575,6 +1607,14 @@ pub const CAPI = struct {
         source: apprt.surface.NewSurfaceContext,
     ) Surface.Options {
         return surface.newSurfaceOptions(source);
+    }
+
+    /// The surface's manually-zoomed font size in points, or 0 when it is at the
+    /// configured default (never zoomed, or reset). Mirrors the "0 means default"
+    /// config convention and allocates nothing, unlike inherited config.
+    export fn ghostty_surface_font_size(surface: *Surface) f32 {
+        if (!surface.core_surface.font_size_adjusted) return 0;
+        return surface.core_surface.font_size.points;
     }
 
     /// Update the configuration to the provided config for only this surface.
