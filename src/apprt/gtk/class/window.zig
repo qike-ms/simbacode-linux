@@ -258,6 +258,11 @@ pub const Window = extern struct {
         /// ListBox row index for row-activation -> open-worktree mapping.
         sidebar_statuses: []sidebar.WorktreeStatus = &.{},
 
+        /// Set of worktree paths currently flagged as "needs attention" by an
+        /// OSC-3008 context signal. Keys are owned (duped) by this window.
+        /// Consulted in buildSidebarRow so the badge survives the 5s rescan.
+        sidebar_attention: std.StringHashMapUnmanaged(void) = .empty,
+
         /// A weak reference to a command palette.
         command_palette: WeakRef(CommandPalette) = .empty,
 
@@ -1363,7 +1368,7 @@ pub const Window = extern struct {
 
     /// Build one ListBoxRow widget for a worktree status.
     fn buildSidebarRow(self: *Window, st: *const sidebar.WorktreeStatus) *gtk.ListBoxRow {
-        _ = self;
+        const priv = self.private();
         const alloc = Application.default().allocator();
 
         const row = gtk.ListBoxRow.new();
@@ -1409,10 +1414,17 @@ pub const Window = extern struct {
             break :blk stream.getWritten();
         };
 
+        // Attention badge (OSC-3008): bell glyph in red when this worktree
+        // path is flagged as needing attention.
+        const attention: []const u8 = if (priv.sidebar_attention.contains(st.path))
+            " <span foreground='#e06c75'>\u{1F514}</span>"
+        else
+            "";
+
         const markup = std.fmt.allocPrintSentinel(
             alloc,
-            "{s}<span foreground='{s}'>●</span> {s} <small><span foreground='#888'>{s}</span></small>{s}",
-            .{ indent, dot_color, name_esc, branch_esc, badges },
+            "{s}<span foreground='{s}'>●</span> {s} <small><span foreground='#888'>{s}</span></small>{s}{s}",
+            .{ indent, dot_color, name_esc, branch_esc, badges, attention },
             0,
         ) catch return row;
         defer alloc.free(markup);
@@ -1442,6 +1454,34 @@ pub const Window = extern struct {
 
         const st = priv.sidebar_statuses[i];
         self.newTabForWindow(null, .{ .working_directory = st.path });
+    }
+
+    /// Flag (or clear) a worktree path as needing attention. Called from the
+    /// OSC-3008 context_signal handler. Updates the attention set and rebuilds
+    /// the sidebar so the badge appears/disappears immediately.
+    pub fn setWorktreeAttention(self: *Window, path: []const u8, active: bool) void {
+        const priv = self.private();
+        const alloc = Application.default().allocator();
+
+        if (active) {
+            if (priv.sidebar_attention.contains(path)) return;
+            const key = alloc.dupe(u8, path) catch return;
+            priv.sidebar_attention.put(alloc, key, {}) catch {
+                alloc.free(key);
+                return;
+            };
+        } else {
+            if (priv.sidebar_attention.fetchRemove(path)) |kv| {
+                alloc.free(kv.key);
+            } else return;
+        }
+
+        // Rebuild rows from the current scan so the badge state is reflected.
+        priv.sidebar_list.removeAll();
+        for (priv.sidebar_statuses) |*st| {
+            const row = self.buildSidebarRow(st);
+            priv.sidebar_list.append(row.as(gtk.Widget));
+        }
     }
 
     fn btnNewTab(_: *adw.SplitButton, self: *Self) callconv(.c) void {

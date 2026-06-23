@@ -770,8 +770,9 @@ pub const Application = extern struct {
             .search_total => Action.searchTotal(target, value),
             .search_selected => Action.searchSelected(target, value),
 
+            .context_signal => return Action.contextSignal(self, target, value),
+
             // Unimplemented
-            .context_signal,
             .secure_input,
             .close_all_windows,
             .float_window,
@@ -2403,6 +2404,45 @@ const Action = struct {
                 break :surface true;
             },
         };
+    }
+
+    /// Supacode OSC-3008 context signal: an agent running in a surface
+    /// announces it needs (action==0 start) or no longer needs (action==1
+    /// end) the user's attention. We flag the surface's worktree row in the
+    /// sidebar and, on start, raise a desktop notification.
+    pub fn contextSignal(
+        self: *Application,
+        target: apprt.Target,
+        value: apprt.action.ContextSignal,
+    ) bool {
+        const v = switch (target) {
+            .app => return false,
+            .surface => |v| v,
+        };
+
+        const active = value.action == 0;
+
+        // Flag the matching worktree row in the owning window's sidebar.
+        if (v.rt_surface.surface.getPwd()) |surface_pwd| {
+            if (ext.getAncestor(Window, v.rt_surface.surface.as(gtk.Widget))) |window| {
+                window.setWorktreeAttention(surface_pwd, active);
+            }
+        }
+
+        // On start, raise a desktop notification pointing at this surface.
+        if (active) {
+            const notif = gio.Notification.new("Agent needs attention");
+            defer notif.unref();
+            if (value.metadata.len > 0) notif.setBody(value.metadata);
+            const icon = gio.ThemedIcon.new("com.mitchellh.ghostty");
+            defer icon.unref();
+            notif.setIcon(icon.as(gio.Icon));
+
+            const id_str = if (value.id.len > 0) value.id else "supacode-context-signal";
+            self.as(gio.Application).sendNotification(id_str, notif);
+        }
+
+        return true;
     }
 
     pub fn promptTitle(target: apprt.Target, value: apprt.action.PromptTitle) bool {

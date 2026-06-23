@@ -1097,3 +1097,23 @@ test "dcs: too many params" {
     try testing.expect(a[1] == null);
     try testing.expect(a[2] == null);
 }
+
+test "osc: 3008 context_signal start through live parser" {
+    var p: Parser = init();
+    defer p.deinit();
+    p.osc_parser.alloc = std.testing.allocator;
+
+    // ESC ] 3008;start=testid;type=shell
+    _ = p.next(0x1B);
+    _ = p.next(']');
+    for ("3008;start=testid;type=shell") |c| _ = p.next(c);
+
+    // Terminate with BEL, which dispatches the OSC immediately.
+    const a = p.next(0x07);
+
+    try testing.expect(a[0].? == .osc_dispatch);
+    const cmd = a[0].?.osc_dispatch;
+    try testing.expect(cmd == .context_signal);
+    try testing.expectEqual(cmd.context_signal.action, .start);
+    try testing.expectEqualStrings("testid", cmd.context_signal.id);
+}
