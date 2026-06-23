@@ -262,6 +262,8 @@ pub const Window = extern struct {
         tab_view: *adw.TabView,
         toolbar: *adw.ToolbarView,
         toast_overlay: *adw.ToastOverlay,
+        split_view: *adw.OverlaySplitView,
+        sidebar_list: *gtk.ListBox,
 
         pub var offset: c_int = 0;
     };
@@ -2075,6 +2077,8 @@ pub const Window = extern struct {
             class.bindTemplateChildPrivate("tab_view", .{});
             class.bindTemplateChildPrivate("toolbar", .{});
             class.bindTemplateChildPrivate("toast_overlay", .{});
+            class.bindTemplateChildPrivate("split_view", .{});
+            class.bindTemplateChildPrivate("sidebar_list", .{});
 
             // Template Callbacks
             class.bindTemplateCallback("realize", &windowRealize);

@@ -20,7 +20,34 @@ template $GhosttyWindow: Adw.ApplicationWindow {
   // to disable this so that terminal programs can capture F10 (such as htop)
   handle-menubar-accel: false;
 
-  content: Adw.TabOverview tab_overview {
+  content: Adw.OverlaySplitView split_view {
+    sidebar: Adw.ToolbarView {
+      [top]
+      Adw.HeaderBar {
+        show-end-title-buttons: false;
+        title-widget: Adw.WindowTitle {
+          title: _("Worktrees");
+        };
+      }
+
+      content: Gtk.ScrolledWindow {
+        hscrollbar-policy: never;
+
+        Gtk.ListBox sidebar_list {
+          styles [
+            "navigation-sidebar",
+          ]
+
+          selection-mode: single;
+        }
+      };
+    };
+
+    min-sidebar-width: 200;
+    max-sidebar-width: 320;
+    sidebar-width-fraction: 0.25;
+
+    content: Adw.TabOverview tab_overview {
     create-tab => $overview_create_tab();
     notify::open => $overview_notify_open();
     view: tab_view;
@@ -169,6 +196,7 @@ template $GhosttyWindow: Adw.ApplicationWindow {
         }
       }
     }
+  };
   };
 }
 
