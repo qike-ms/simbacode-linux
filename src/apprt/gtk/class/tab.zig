@@ -168,6 +168,11 @@ pub const Tab = extern struct {
         /// The tooltip of this tab. This is usually bound to the active surface.
         tooltip: ?[:0]const u8 = null,
 
+        /// The working directory this tab was created with, if any. Used to
+        /// match sidebar worktree rows to an existing tab so activation
+        /// switches to it instead of opening a duplicate.
+        working_directory: ?[:0]const u8 = null,
+
         // Template bindings
         split_tree: *SplitTree,
 
@@ -199,6 +204,10 @@ pub const Tab = extern struct {
         const priv: *Private = tab.private();
 
         if (config) |c| priv.config = c.ref();
+
+        if (overrides.working_directory) |wd| {
+            priv.working_directory = glib.ext.dupeZ(u8, wd);
+        }
 
         // If our configuration is null then we get the configuration
         // from the application.
@@ -288,6 +297,11 @@ pub const Tab = extern struct {
         return self.getSplitTree().getActiveSurface();
     }
 
+    /// Get the working directory this tab was created with, if any.
+    pub fn getWorkingDirectory(self: *Self) ?[:0]const u8 {
+        return self.private().working_directory;
+    }
+
     /// Get the surface tree of this tab.
     pub fn getSurfaceTree(self: *Self) ?*Surface.Tree {
         const priv = self.private();
@@ -347,6 +361,10 @@ pub const Tab = extern struct {
         if (priv.tooltip) |v| {
             glib.free(@ptrCast(@constCast(v)));
             priv.tooltip = null;
+        }
+        if (priv.working_directory) |v| {
+            glib.free(@ptrCast(@constCast(v)));
+            priv.working_directory = null;
         }
         if (priv.title) |v| {
             glib.free(@ptrCast(@constCast(v)));

@@ -1453,6 +1453,24 @@ pub const Window = extern struct {
         if (i >= priv.sidebar_statuses.len) return;
 
         const st = priv.sidebar_statuses[i];
+
+        // macOS parity (SidebarListView List(selection:)): one persistent tab
+        // per worktree path. If a tab already exists for this path, select it
+        // instead of opening a duplicate.
+        const n = priv.tab_view.getNPages();
+        if (n > 0) {
+            for (0..@intCast(n)) |j| {
+                const page = priv.tab_view.getNthPage(@intCast(j));
+                const child = page.getChild();
+                const tab = gobject.ext.cast(Tab, child) orelse continue;
+                const wd = tab.getWorkingDirectory() orelse continue;
+                if (std.mem.eql(u8, wd, st.path)) {
+                    priv.tab_view.setSelectedPage(page);
+                    return;
+                }
+            }
+        }
+
         self.newTabForWindow(null, .{ .working_directory = st.path });
     }
 
