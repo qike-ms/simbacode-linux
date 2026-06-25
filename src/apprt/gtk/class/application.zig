@@ -2463,22 +2463,33 @@ const Action = struct {
             }
         }
 
-        // Attention flag on the worktree row tracks the attention state, not
-        // mere presence: set on an attention start, cleared on end.
+        // The user-facing detail comes from the `comm` field, never the raw
+        // metadata string (trio MAJOR M3: don't render protocol noise).
+        const comm = fieldValue(value.metadata, "comm") orelse "";
+
+        // Attention is keyed by surface (not worktree path) so two surfaces on
+        // the same worktree don't clear each other's bell (trio MAJOR M2).
+        // A presence-only `start` (agent announced, no attention) explicitly
+        // CLEARS any prior attention on this surface — the Pi extension sends a
+        // presence refresh at the start of every turn, which must un-latch the
+        // previous turn's attention (trio codex MAJOR M1).
         if (surface.getPwd()) |surface_pwd| {
             if (window) |win| {
                 if (active and wants_attention) {
-                    win.setWorktreeAttention(surface_pwd, true);
-                } else if (!active) {
-                    win.setWorktreeAttention(surface_pwd, false);
+                    win.setSurfaceAttention(surface, surface_pwd, true);
+                } else {
+                    // presence-only start, or any end: clear this surface.
+                    win.setSurfaceAttention(surface, surface_pwd, false);
                 }
             }
         }
 
-        // On `end`, dismiss the attention banner.
-        if (!active) {
-            if (window) |win| win.hideAgentBanner();
-            return true;
+        // On `end` (or a presence-only start) dismiss the banner only if it
+        // belongs to THIS surface — a still-waiting banner for another surface
+        // must survive (trio codex: don't dismiss an unrelated context).
+        if (!active or !wants_attention) {
+            if (window) |win| win.hideAgentBannerFor(surface);
+            if (!active) return true;
         }
 
         // Attention start: raise an in-app top banner + desktop notification
@@ -2486,12 +2497,20 @@ const Action = struct {
         if (wants_attention) {
             if (window) |win| {
                 const title = if (agent) |a| a.label() else "Agent";
-                win.showAgentBanner(surface, title, value.metadata);
+                win.showAgentBanner(surface, title, comm);
             }
 
             const notif = gio.Notification.new("Agent needs attention");
             defer notif.unref();
-            if (value.metadata.len > 0) notif.setBody(value.metadata);
+            if (comm.len > 0) {
+                // comm is a mid-slice of metadata, not itself NUL-terminated;
+                // dupe to a sentinel string for the C API.
+                const alloc = self.allocator();
+                if (alloc.dupeZ(u8, comm)) |body| {
+                    defer alloc.free(body);
+                    notif.setBody(body.ptr);
+                } else |_| {}
+            }
             const icon = gio.ThemedIcon.new("com.mitchellh.ghostty");
             defer icon.unref();
             notif.setIcon(icon.as(gio.Icon));

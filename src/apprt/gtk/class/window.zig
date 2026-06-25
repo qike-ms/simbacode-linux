@@ -268,10 +268,12 @@ pub const Window = extern struct {
         /// ListBox row index for row-activation -> open-worktree mapping.
         sidebar_statuses: []sidebar.WorktreeStatus = &.{},
 
-        /// Set of worktree paths currently flagged as "needs attention" by an
-        /// OSC-3008 context signal. Keys are owned (duped) by this window.
-        /// Consulted when rebuilding sidebar rows so the badge survives rescan.
-        sidebar_attention: std.StringHashMapUnmanaged(void) = .empty,
+        /// Surfaces currently flagged as "needs attention" by an OSC-3008
+        /// attention signal, mapped to their worktree path (owned/duped). The
+        /// sidebar bell for a path is shown when ANY surface with that path is
+        /// in this map, so two tabs/surfaces sharing a worktree don't clear
+        /// each other's attention (trio MAJOR M2). Keyed by *Surface pointer.
+        sidebar_attention: std.AutoHashMapUnmanaged(*Surface, [:0]u8) = .empty,
 
         /// Set of repo roots whose worktree group is collapsed in the sidebar.
         /// Keys are owned (duped). Persists across the 5s rescan so the user's
@@ -1274,8 +1276,8 @@ pub const Window = extern struct {
             priv.sidebar_statuses = &.{};
         }
         {
-            var it = priv.sidebar_attention.keyIterator();
-            while (it.next()) |k| alloc.free(k.*);
+            var it = priv.sidebar_attention.valueIterator();
+            while (it.next()) |v| alloc.free(v.*);
             priv.sidebar_attention.deinit(alloc);
             priv.sidebar_attention = .empty;
         }
@@ -1484,11 +1486,10 @@ pub const Window = extern struct {
         var added: u32 = 0;
         var removed: u32 = 0;
         var any_attention = false;
-        const priv = self.private();
         for (group) |*st| {
-            added += st.added;
-            removed += st.removed;
-            if (priv.sidebar_attention.contains(st.path)) any_attention = true;
+            added +|= st.added;
+            removed +|= st.removed;
+            if (self.pathHasAttention(st.path)) any_attention = true;
         }
 
         const arrow: []const u8 = if (collapsed) "\u{25B8}" else "\u{25BE}";
@@ -1547,7 +1548,6 @@ pub const Window = extern struct {
 
     /// Build one ListBoxRow widget for a worktree status (leaf under a repo).
     fn buildWorktreeRow(self: *Window, st: *const sidebar.WorktreeStatus) *gtk.ListBoxRow {
-        const priv = self.private();
         const alloc = Application.default().allocator();
 
         const row = gtk.ListBoxRow.new();
@@ -1590,7 +1590,7 @@ pub const Window = extern struct {
         };
 
         // Attention badge (OSC-3008): bell glyph in red.
-        const attention: []const u8 = if (priv.sidebar_attention.contains(st.path))
+        const attention: []const u8 = if (self.pathHasAttention(st.path))
             " <span foreground='#e06c75'>\u{1F514}</span>"
         else
             "";
@@ -1679,28 +1679,55 @@ pub const Window = extern struct {
         self.newTabForWindow(null, .{ .working_directory = st.path });
     }
 
-    /// Flag (or clear) a worktree path as needing attention. Called from the
-    /// OSC-3008 context_signal handler. Updates the attention set and rebuilds
-    /// the sidebar so the badge appears/disappears immediately.
-    pub fn setWorktreeAttention(self: *Window, path: []const u8, active: bool) void {
+    /// Whether any surface flagged for attention maps to `path`. Drives the
+    /// sidebar bell so two surfaces sharing a worktree aggregate correctly.
+    fn pathHasAttention(self: *Window, path: []const u8) bool {
+        var it = self.private().sidebar_attention.valueIterator();
+        while (it.next()) |v| {
+            if (std.mem.eql(u8, v.*, path)) return true;
+        }
+        return false;
+    }
+
+    /// Flag (or clear) a surface as needing attention, recording its worktree
+    /// path. Called from the OSC-3008 context_signal handler. Attention is
+    /// keyed by surface (not path) so two surfaces on the same worktree don't
+    /// clear each other's bell (trio MAJOR M2). Rebuilds the sidebar so the
+    /// badge updates immediately.
+    pub fn setSurfaceAttention(self: *Window, surface: *Surface, path: []const u8, active: bool) void {
         const priv = self.private();
         const alloc = Application.default().allocator();
 
         if (active) {
-            if (priv.sidebar_attention.contains(path)) return;
-            const key = alloc.dupe(u8, path) catch return;
-            priv.sidebar_attention.put(alloc, key, {}) catch {
-                alloc.free(key);
+            const dup = alloc.dupeZ(u8, path) catch return;
+            const gop = priv.sidebar_attention.getOrPut(alloc, surface) catch {
+                alloc.free(dup);
                 return;
             };
+            if (gop.found_existing) {
+                // Update the stored path (cwd may have changed).
+                alloc.free(gop.value_ptr.*);
+            }
+            gop.value_ptr.* = dup;
         } else {
-            if (priv.sidebar_attention.fetchRemove(path)) |kv| {
-                alloc.free(kv.key);
+            if (priv.sidebar_attention.fetchRemove(surface)) |kv| {
+                alloc.free(kv.value);
             } else return;
         }
 
-        // Rebuild rows from the current scan so the badge state is reflected.
         self.rebuildSidebarRows();
+    }
+
+    /// Clear any attention flag for a surface (teardown). Returns true if one
+    /// was present.
+    fn clearSurfaceAttention(self: *Window, surface: *Surface) bool {
+        const priv = self.private();
+        const alloc = Application.default().allocator();
+        if (priv.sidebar_attention.fetchRemove(surface)) |kv| {
+            alloc.free(kv.value);
+            return true;
+        }
+        return false;
     }
 
     /// Supacode agent presence: attach (or detach) an agent to a surface.
@@ -1786,22 +1813,29 @@ pub const Window = extern struct {
 
         priv.agent_banner_surface = surface;
 
-        // Compose "<title> needs attention" plus a trimmed first line of detail.
+        // The banner title is parsed as Pango markup, so escape the detail
+        // (assistant text may contain < & etc.) before composing (trio m1).
         const trimmed = trimFirstLine(detail);
-        const text: [:0]const u8 = if (trimmed.len > 0)
-            std.fmt.allocPrintSentinel(
-                alloc,
-                "{s} \u{2014} {s}",
-                .{ title, trimmed },
-                0,
-            ) catch (alloc.dupeZ(u8, "Agent needs attention") catch return)
-        else
-            std.fmt.allocPrintSentinel(
+        const text: [:0]const u8 = blk: {
+            if (trimmed.len > 0) {
+                const dz = alloc.dupeZ(u8, trimmed) catch break :blk null;
+                defer alloc.free(dz);
+                const esc = glib.markupEscapeText(dz.ptr, -1);
+                defer glib.free(esc);
+                break :blk std.fmt.allocPrintSentinel(
+                    alloc,
+                    "{s} \u{2014} {s}",
+                    .{ title, std.mem.sliceTo(esc, 0) },
+                    0,
+                ) catch null;
+            }
+            break :blk std.fmt.allocPrintSentinel(
                 alloc,
                 "{s} needs attention",
                 .{title},
                 0,
-            ) catch (alloc.dupeZ(u8, "Agent needs attention") catch return);
+            ) catch null;
+        } orelse (alloc.dupeZ(u8, "Agent needs attention") catch return);
         defer alloc.free(text);
 
         priv.agent_banner.setTitle(text.ptr);
@@ -1813,6 +1847,13 @@ pub const Window = extern struct {
         const priv = self.private();
         priv.agent_banner.setRevealed(@intFromBool(false));
         priv.agent_banner_surface = null;
+    }
+
+    /// Hide the banner only if it currently points at `surface`. Lets one
+    /// surface's `end` dismiss its own banner without clobbering a banner that
+    /// another, still-waiting surface raised.
+    pub fn hideAgentBannerFor(self: *Window, surface: *Surface) void {
+        if (self.private().agent_banner_surface == surface) self.hideAgentBanner();
     }
 
     /// Return the first non-empty line of `s` (up to a newline), trimmed.
@@ -2090,14 +2131,17 @@ pub const Window = extern struct {
         self.clearTabAgents(tab);
     }
 
-    /// Remove all surface_agents entries that belong to `tab`, and clear the
-    /// banner if it pointed at one of them.
+    /// Remove all agent presence AND attention entries that belong to `tab`,
+    /// and clear the banner if it pointed at one of them. Called on tab
+    /// detach so a closed tab leaves no stale icon, bell, or dangling banner
+    /// target (trio footgun #1 / CRITICAL C1).
     fn clearTabAgents(self: *Window, tab: *Tab) void {
         const priv = self.private();
-        var to_remove: std.ArrayListUnmanaged(*Surface) = .empty;
-        defer to_remove.deinit(Application.default().allocator());
         const alloc = Application.default().allocator();
+        var to_remove: std.ArrayListUnmanaged(*Surface) = .empty;
+        defer to_remove.deinit(alloc);
 
+        // Collect surfaces in this tab from the presence map.
         var it = priv.surface_agents.iterator();
         while (it.next()) |entry| {
             const s = entry.key_ptr.*;
@@ -2108,10 +2152,31 @@ pub const Window = extern struct {
                 to_remove.append(alloc, s) catch {};
             }
         }
+        // ...and from the attention map.
+        var ait = priv.sidebar_attention.iterator();
+        while (ait.next()) |entry| {
+            const s = entry.key_ptr.*;
+            const same = if (ext.getAncestor(Tab, s.as(gtk.Widget))) |t| t == tab else true;
+            if (same) {
+                // Avoid duplicates; cheap linear check (sets are tiny).
+                var dup = false;
+                for (to_remove.items) |x| {
+                    if (x == s) {
+                        dup = true;
+                        break;
+                    }
+                }
+                if (!dup) to_remove.append(alloc, s) catch {};
+            }
+        }
+
+        var changed = false;
         for (to_remove.items) |s| {
             _ = priv.surface_agents.remove(s);
+            if (self.clearSurfaceAttention(s)) changed = true;
             if (priv.agent_banner_surface == s) self.hideAgentBanner();
         }
+        if (changed) self.rebuildSidebarRows();
     }
 
     fn tabViewCreateWindow(
@@ -2307,11 +2372,39 @@ pub const Window = extern struct {
     ) callconv(.c) void {
         if (old_tree) |tree| {
             self.disconnectSurfaceHandlers(tree);
+
+            // Prune agent/banner state for any surface that left the tree
+            // (e.g. a split pane closed without the whole tab closing). The
+            // surface widget is about to be destroyed, so leaving a raw
+            // *Surface key in surface_agents or as the banner target would
+            // dangle and later cause a use-after-free in refreshTabAgentIcon
+            // / agentBannerClicked (trio CRITICAL C1).
+            var it = tree.iterator();
+            while (it.next()) |entry| {
+                const surface = entry.view;
+                if (new_tree) |nt| {
+                    if (treeContains(nt, surface)) continue;
+                }
+                _ = self.private().surface_agents.remove(surface);
+                _ = self.clearSurfaceAttention(surface);
+                if (self.private().agent_banner_surface == surface) {
+                    self.hideAgentBanner();
+                }
+            }
         }
 
         if (new_tree) |tree| {
             self.connectSurfaceHandlers(tree);
         }
+    }
+
+    /// Whether `surface` is present in `tree`.
+    fn treeContains(tree: *const Surface.Tree, surface: *Surface) bool {
+        var it = tree.iterator();
+        while (it.next()) |entry| {
+            if (entry.view == surface) return true;
+        }
+        return false;
     }
 
     fn actionAbout(

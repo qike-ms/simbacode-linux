@@ -48,6 +48,13 @@ declare -a extra=()
 
 die() { echo "supacode-signal: $*" >&2; exit 2; }
 
+# Strip OSC-3008-hostile bytes: control chars (0x00-0x1F, 0x7F) and ';' which
+# separates fields. Without this, a ';' in assistant text could inject fields
+# (e.g. spoof attention=1). Mirrors the Pi extension's sanitize().
+sanitize() {
+  printf '%s' "$1" | LC_ALL=C tr -d '\000-\037\177;' | LC_ALL=C tr -s ' '
+}
+
 [ $# -ge 1 ] || die "missing action (start|end)"
 action="$1"; shift
 
@@ -78,13 +85,13 @@ append_field() { fields="${fields};$1"; }
 
 if [ "$action" = "start" ]; then
   payload="start=${id}"
-  [ -n "$agent" ] && append_field "agent=${agent}"
+  [ -n "$agent" ] && append_field "agent=$(sanitize "$agent")"
   [ -n "$attention" ] && append_field "attention=1"
-  [ -n "$detail" ] && append_field "comm=${detail}"
-  for kv in ${extra[@]+"${extra[@]}"}; do append_field "$kv"; done
+  [ -n "$detail" ] && append_field "comm=$(sanitize "$detail")"
+  for kv in ${extra[@]+"${extra[@]}"}; do append_field "$(sanitize "$kv")"; done
   seq="${ESC}]${OSC};${payload}${fields}${BEL}"
 else
-  seq="${ESC}]${OSC};end=${id}${BEL}"
+  seq="${ESC}]${OSC};end=$(sanitize "$id")${BEL}"
 fi
 
 # Emit to the controlling terminal. Prefer /dev/tty so the sequence reaches
