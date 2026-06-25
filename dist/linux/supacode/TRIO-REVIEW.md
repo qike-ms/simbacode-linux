@@ -37,9 +37,9 @@ surface that leaves the tree (`treeContains` helper).
 
 ## Deferred (tracked in HANDOFF "Next steps")
 
-- **Split-focus icon refresh (codex M4, claude m5).** Tab icon doesn't follow
-  focus changes *within* a split (still shows an agent in the tab, just maybe
-  not the focused one). Wire to `Tab.notify::active-surface`.
+- **Split-focus icon refresh (codex M4, claude m5).** ~~Tab icon doesn't follow
+  focus changes *within* a split.~~ **FIXED (stage-8):** wired to
+  `Tab.notify::active-surface` → `refreshTabAgentIcon`.
 - **5s synchronous git poll on the main thread (claude M3, opencode M1/M2).**
   Move `sidebar.scan` to a worker thread + stat-cache + `Gio.FileMonitor` on
   `.git/HEAD,index,packed-refs`; diff before rebuilding the ListBox.

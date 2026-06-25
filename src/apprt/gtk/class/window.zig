@@ -542,6 +542,18 @@ pub const Window = extern struct {
             .{},
         );
 
+        // Refresh the tab's agent indicator icon when focus moves between
+        // panes of a split (stage-8, trio M4/claude m5). The icon shows the
+        // FOCUSED surface's agent; without this it only updated on OSC events,
+        // so focusing a different pane left the previous pane's icon shown.
+        _ = gobject.Object.signals.notify.connect(
+            tab,
+            *Self,
+            tabActiveSurfaceChanged,
+            self,
+            .{ .detail = "active-surface" },
+        );
+
         // Run an initial notification for the surface tree so we can setup
         // initial state.
         tabSplitTreeChanged(
@@ -2362,6 +2374,20 @@ pub const Window = extern struct {
                 @intCast(size.height),
             );
         }
+    }
+
+    /// The focused surface within a tab changed (e.g. the user moved focus
+    /// between panes of a split). Re-derive the tab's agent indicator icon so
+    /// it tracks the focused pane (stage-8). `refreshTabAgentIcon` resolves the
+    /// owning tab from the surface and prefers that tab's active surface, with
+    /// a fallback to any agent present in the tab.
+    fn tabActiveSurfaceChanged(
+        tab: *Tab,
+        _: *gobject.ParamSpec,
+        self: *Self,
+    ) callconv(.c) void {
+        const surface = tab.getActiveSurface() orelse return;
+        self.refreshTabAgentIcon(surface);
     }
 
     fn tabSplitTreeChanged(

@@ -51,6 +51,10 @@ counts; agent symbolic icons rasterize.
    notification + bell). Widened sidebar markup buffers (overflow fix).
    `dist/linux/supacode/` ships `supacode-signal` (OSC emitter),
    `pi-extension/index.ts`, and a protocol README.
+9. **stage-8 split-focus tab icon** — the per-tab agent indicator now follows
+   focus changes *within* a split. Wired `Tab.notify::active-surface` to
+   `refreshTabAgentIcon` so focusing a different pane re-derives the tab icon
+   from the focused surface's agent (closes trio M4 / claude m5).
 
 ## The 4 user requirements — status
 
@@ -112,8 +116,9 @@ order, none blocking):
    `Gtk.TreeListModel` + `Gtk.ListView` + `Gtk.TreeExpander` (row recycling,
    model-driven expansion). Current impl is a grouped `Gtk.ListBox` rebuilt
    wholesale; fine at this scale, worth revisiting if repos×worktrees grows.
-5. **Split-aware tab icon** — refresh `refreshTabAgentIcon` on focused-surface
-   change within a split (currently event-driven from OSC only).
+5. **Split-aware tab icon** — **DONE (stage-8)**: `refreshTabAgentIcon` now
+   also fires on `Tab.notify::active-surface`, so the icon tracks the focused
+   pane within a split, not only OSC events.
 6. **Agent crash heartbeat/TTL** — presence clears on tab detach and on `end`,
    but a crashed agent that never sends `end` and whose surface stays open will
    keep its icon. Add a TTL/heartbeat (trio footgun #1).
