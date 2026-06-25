@@ -1,0 +1,97 @@
+#!/usr/bin/env bash
+# supacode-signal — emit an OSC-3008 (Hierarchical Context Signalling) sequence
+# to the controlling terminal so supacode-linux can show agent presence and
+# attention for the current surface.
+#
+# This is the Linux agent-integration transport. On macOS supacode injects a
+# Unix-domain socket + env vars and agents post JSON to it; on Linux we instead
+# carry the same information over OSC-3008, which the terminal already routes to
+# the exact surface the escape arrives on (no socket, no PID->surface mapping).
+#
+# Usage:
+#   supacode-signal start [--agent NAME] [--attention] [--id ID] [k=v ...]
+#   supacode-signal end   [--id ID]
+#
+# Examples:
+#   # Announce agent presence (lights up the tab icon):
+#   supacode-signal start --agent claude
+#
+#   # Request the user's attention (top banner + notification + sidebar bell):
+#   supacode-signal start --agent claude --attention "review the failing test"
+#
+#   # Clear presence/attention when the turn ends:
+#   supacode-signal end
+#
+# The sequence emitted is:
+#   ESC ] 3008 ; start=<id> ; agent=<name> ; attention=1 ; <extra> BEL
+#   ESC ] 3008 ; end=<id> BEL
+#
+# Notes:
+#  - <id> defaults to a stable per-process id so start/end pair up. Override
+#    with --id for multiple concurrent contexts.
+#  - All output goes to the controlling tty (/dev/tty) so it is not captured by
+#    a pipe and reaches the terminal even when stdout is redirected.
+#  - Best-effort: if there is no tty, this is a silent no-op.
+
+set -u
+
+OSC="3008"
+ESC=$'\033'
+BEL=$'\007'
+
+id="sc-$$"
+action=""
+agent=""
+attention=""
+detail=""
+declare -a extra=()
+
+die() { echo "supacode-signal: $*" >&2; exit 2; }
+
+[ $# -ge 1 ] || die "missing action (start|end)"
+action="$1"; shift
+
+case "$action" in
+  start|end) ;;
+  *) die "unknown action '$action' (expected start|end)" ;;
+esac
+
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --agent) agent="${2:-}"; shift 2 ;;
+    --agent=*) agent="${1#*=}"; shift ;;
+    --attention) attention="1"; shift
+      # Optional free-text detail follows --attention.
+      if [ $# -gt 0 ] && [ "${1#--}" = "$1" ] && [[ "$1" != *=* ]]; then
+        detail="$1"; shift
+      fi ;;
+    --id) id="${2:-}"; shift 2 ;;
+    --id=*) id="${1#*=}"; shift ;;
+    *=*) extra+=("$1"); shift ;;
+    *) die "unexpected argument '$1'" ;;
+  esac
+done
+
+# Build the metadata field list (semicolon-separated key=value).
+fields=""
+append_field() { fields="${fields};$1"; }
+
+if [ "$action" = "start" ]; then
+  payload="start=${id}"
+  [ -n "$agent" ] && append_field "agent=${agent}"
+  [ -n "$attention" ] && append_field "attention=1"
+  [ -n "$detail" ] && append_field "comm=${detail}"
+  for kv in ${extra[@]+"${extra[@]}"}; do append_field "$kv"; done
+  seq="${ESC}]${OSC};${payload}${fields}${BEL}"
+else
+  seq="${ESC}]${OSC};end=${id}${BEL}"
+fi
+
+# Emit to the controlling terminal. Prefer /dev/tty so the sequence reaches
+# the terminal even when stdout is redirected; fall back to stdout when there
+# is no controlling tty (e.g. CI). Best-effort throughout.
+if { printf '%s' "$seq" >/dev/tty; } 2>/dev/null; then
+  :
+else
+  printf '%s' "$seq" 2>/dev/null || true
+fi

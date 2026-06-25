@@ -2426,6 +2426,10 @@ const Action = struct {
         const surface = v.rt_surface.surface;
         const window = ext.getAncestor(Window, surface.as(gtk.Widget));
 
+        log.debug("supacode context_signal action={d} id={s} metadata={s}", .{
+            value.action, value.id, value.metadata,
+        });
+
         // Parse an `agent=<name>` field from the metadata, if present. This is
         // how an agent announces its identity to the surface (trio decision:
         // OSC carries identity because the escape is already surface-scoped, so
@@ -2434,6 +2438,14 @@ const Action = struct {
             parseAgentField(value.metadata)
         else
             null;
+
+        // Distinguish PRESENCE (long-lived: which agent runs here -> tab icon)
+        // from ATTENTION (momentary: agent wants the user -> banner +
+        // notification). The trio was emphatic these must not be conflated:
+        // an attention-clear must not drop the agent icon. A start that only
+        // announces an agent is presence; attention is opt-in via the
+        // `attention` field (attention=1 / attention=true).
+        const wants_attention = value.metadata.len > 0 and parseAttentionField(value.metadata);
 
         // Agent presence -> per-tab indicator icon (req 3). On `start` with an
         // agent name, attach it; on `end`, detach. Keyed by surface pointer.
@@ -2451,21 +2463,27 @@ const Action = struct {
             }
         }
 
-        // Flag the matching worktree row in the owning window's sidebar.
+        // Attention flag on the worktree row tracks the attention state, not
+        // mere presence: set on an attention start, cleared on end.
         if (surface.getPwd()) |surface_pwd| {
             if (window) |win| {
-                win.setWorktreeAttention(surface_pwd, active);
+                if (active and wants_attention) {
+                    win.setWorktreeAttention(surface_pwd, true);
+                } else if (!active) {
+                    win.setWorktreeAttention(surface_pwd, false);
+                }
             }
         }
 
         // On `end`, dismiss the attention banner.
         if (!active) {
             if (window) |win| win.hideAgentBanner();
+            return true;
         }
 
-        // On start, raise an in-app top banner + desktop notification pointing
-        // at this surface.
-        if (active) {
+        // Attention start: raise an in-app top banner + desktop notification
+        // pointing at this surface. Presence-only starts do nothing further.
+        if (wants_attention) {
             if (window) |win| {
                 const title = if (agent) |a| a.label() else "Agent";
                 win.showAgentBanner(surface, title, value.metadata);
@@ -2489,12 +2507,23 @@ const Action = struct {
     /// (semicolon-separated key=value pairs). Returns the recognized Agent, or
     /// null when there is no `agent` field.
     fn parseAgentField(metadata: []const u8) ?agentpkg.Agent {
+        if (fieldValue(metadata, "agent")) |v| return agentpkg.Agent.parse(v);
+        return null;
+    }
+
+    /// Parse a truthy `attention` field (attention=1 / attention=true).
+    fn parseAttentionField(metadata: []const u8) bool {
+        const v = fieldValue(metadata, "attention") orelse return false;
+        return std.mem.eql(u8, v, "1") or std.ascii.eqlIgnoreCase(v, "true");
+    }
+
+    /// Return the value of `key` in a semicolon-separated key=value metadata
+    /// string, or null when absent.
+    fn fieldValue(metadata: []const u8, field_key: []const u8) ?[]const u8 {
         var it = std.mem.splitScalar(u8, metadata, ';');
         while (it.next()) |field| {
             const eq = std.mem.indexOfScalar(u8, field, '=') orelse continue;
-            if (std.mem.eql(u8, field[0..eq], "agent")) {
-                return agentpkg.Agent.parse(field[eq + 1 ..]);
-            }
+            if (std.mem.eql(u8, field[0..eq], field_key)) return field[eq + 1 ..];
         }
         return null;
     }

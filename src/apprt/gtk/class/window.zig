@@ -1503,7 +1503,7 @@ pub const Window = extern struct {
         defer glib.free(branch_esc);
 
         // Diff summary: +adds/-dels, only when non-zero.
-        var diff_buf: [96]u8 = undefined;
+        var diff_buf: [256]u8 = undefined;
         const diff: []const u8 = blk: {
             if (added == 0 and removed == 0) break :blk "";
             var stream = std.io.fixedBufferStream(&diff_buf);
@@ -1574,7 +1574,7 @@ pub const Window = extern struct {
         defer glib.free(branch_esc);
 
         // Badges: up-ahead down-behind / no upstream, plus +adds/-dels diff counts.
-        var badge_buf: [192]u8 = undefined;
+        var badge_buf: [512]u8 = undefined;
         const badges: []const u8 = blk: {
             var stream = std.io.fixedBufferStream(&badge_buf);
             const w = stream.writer();
