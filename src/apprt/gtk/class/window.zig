@@ -217,6 +217,15 @@ pub const Window = extern struct {
     };
 
     const Private = struct {
+        /// Tag for a sidebar ListBox row: either a collapsible repo header or a
+        /// worktree leaf. `index` indexes into `sidebar_statuses` for worktree
+        /// rows, or is the index of the repo's FIRST worktree for header rows
+        /// (used to read repo_root/repo_name for collapse toggling).
+        pub const SidebarRowRef = struct {
+            kind: enum { repo_header, worktree },
+            index: usize,
+        };
+
         /// Whether this window is a quick terminal. If it is then it
         /// behaves slightly differently under certain scenarios.
         quick_terminal: bool = false,
@@ -260,8 +269,18 @@ pub const Window = extern struct {
 
         /// Set of worktree paths currently flagged as "needs attention" by an
         /// OSC-3008 context signal. Keys are owned (duped) by this window.
-        /// Consulted in buildSidebarRow so the badge survives the 5s rescan.
+        /// Consulted when rebuilding sidebar rows so the badge survives rescan.
         sidebar_attention: std.StringHashMapUnmanaged(void) = .empty,
+
+        /// Set of repo roots whose worktree group is collapsed in the sidebar.
+        /// Keys are owned (duped). Persists across the 5s rescan so the user's
+        /// expand/collapse choice is sticky.
+        sidebar_collapsed: std.StringHashMapUnmanaged(void) = .empty,
+
+        /// Parallel mapping from ListBox row index -> what that row represents
+        /// (a repo header, or a worktree by index into sidebar_statuses).
+        /// Rebuilt on every refresh. Owned by this window.
+        sidebar_rows: std.ArrayListUnmanaged(SidebarRowRef) = .empty,
 
         /// A weak reference to a command palette.
         command_palette: WeakRef(CommandPalette) = .empty,
@@ -1230,6 +1249,31 @@ pub const Window = extern struct {
 
         priv.command_palette.set(null);
 
+        // Supacode sidebar teardown: stop the poll timer and free owned state.
+        const alloc = Application.default().allocator();
+        if (priv.sidebar_timer) |timer| {
+            _ = glib.Source.remove(timer);
+            priv.sidebar_timer = null;
+        }
+        if (priv.sidebar_statuses.len > 0) {
+            sidebar.freeStatuses(alloc, priv.sidebar_statuses);
+            priv.sidebar_statuses = &.{};
+        }
+        {
+            var it = priv.sidebar_attention.keyIterator();
+            while (it.next()) |k| alloc.free(k.*);
+            priv.sidebar_attention.deinit(alloc);
+            priv.sidebar_attention = .empty;
+        }
+        {
+            var it = priv.sidebar_collapsed.keyIterator();
+            while (it.next()) |k| alloc.free(k.*);
+            priv.sidebar_collapsed.deinit(alloc);
+            priv.sidebar_collapsed = .empty;
+        }
+        priv.sidebar_rows.deinit(alloc);
+        priv.sidebar_rows = .empty;
+
         if (priv.config) |v| {
             v.unref();
             priv.config = null;
@@ -1358,26 +1402,145 @@ pub const Window = extern struct {
         }
         priv.sidebar_statuses = statuses;
 
-        // Rebuild the rows.
+        self.rebuildSidebarRows();
+    }
+
+    /// Rebuild the ListBox rows from `sidebar_statuses`, grouping worktrees
+    /// under collapsible repo headers. Also rebuilds the `sidebar_rows`
+    /// index->ref mapping used by row activation. Safe to call any time the
+    /// statuses, attention set, or collapsed set changes.
+    fn rebuildSidebarRows(self: *Window) void {
+        const priv = self.private();
+        const alloc = Application.default().allocator();
+        const statuses = priv.sidebar_statuses;
+
+        priv.sidebar_rows.clearRetainingCapacity();
         priv.sidebar_list.removeAll();
-        for (statuses) |*st| {
-            const row = self.buildSidebarRow(st);
-            priv.sidebar_list.append(row.as(gtk.Widget));
+
+        var i: usize = 0;
+        while (i < statuses.len) {
+            // Find the contiguous run of worktrees belonging to this repo.
+            const repo_root = statuses[i].repo_root;
+            var j = i;
+            while (j < statuses.len and std.mem.eql(u8, statuses[j].repo_root, repo_root)) : (j += 1) {}
+            const group = statuses[i..j];
+
+            const collapsed = priv.sidebar_collapsed.contains(repo_root);
+
+            // Repo header row.
+            const header = self.buildRepoHeaderRow(group, collapsed);
+            priv.sidebar_list.append(header.as(gtk.Widget));
+            priv.sidebar_rows.append(alloc, .{ .kind = .repo_header, .index = i }) catch {};
+
+            // Worktree leaf rows (hidden when collapsed).
+            if (!collapsed) {
+                for (group, i..) |*st, idx| {
+                    const row = self.buildWorktreeRow(st);
+                    priv.sidebar_list.append(row.as(gtk.Widget));
+                    priv.sidebar_rows.append(alloc, .{ .kind = .worktree, .index = idx }) catch {};
+                }
+            }
+
+            i = j;
         }
     }
 
-    /// Build one ListBoxRow widget for a worktree status.
-    fn buildSidebarRow(self: *Window, st: *const sidebar.WorktreeStatus) *gtk.ListBoxRow {
+    /// Build a collapsible repo header row. Aggregates the group's diff state
+    /// and shows a disclosure triangle + repo name + summary badges.
+    fn buildRepoHeaderRow(
+        self: *Window,
+        group: []const sidebar.WorktreeStatus,
+        collapsed: bool,
+    ) *gtk.ListBoxRow {
+        const alloc = Application.default().allocator();
+        const row = gtk.ListBoxRow.new();
+
+        const box = gtk.Box.new(.horizontal, 6);
+        box.as(gtk.Widget).setMarginStart(6);
+        box.as(gtk.Widget).setMarginEnd(8);
+        box.as(gtk.Widget).setMarginTop(5);
+        box.as(gtk.Widget).setMarginBottom(5);
+
+        const repo_name = if (group.len > 0) group[0].repo_name else "";
+        const repo_branch = if (group.len > 0) group[0].branch else "";
+
+        // Aggregate diff counts across the group's worktrees.
+        var added: u32 = 0;
+        var removed: u32 = 0;
+        var any_attention = false;
+        const priv = self.private();
+        for (group) |*st| {
+            added += st.added;
+            removed += st.removed;
+            if (priv.sidebar_attention.contains(st.path)) any_attention = true;
+        }
+
+        const arrow: []const u8 = if (collapsed) "\u{25B8}" else "\u{25BE}";
+
+        const name_z = alloc.dupeZ(u8, repo_name) catch return row;
+        defer alloc.free(name_z);
+        const name_esc = glib.markupEscapeText(name_z.ptr, -1);
+        defer glib.free(name_esc);
+        const branch_z = alloc.dupeZ(u8, repo_branch) catch return row;
+        defer alloc.free(branch_z);
+        const branch_esc = glib.markupEscapeText(branch_z.ptr, -1);
+        defer glib.free(branch_esc);
+
+        // Diff summary: +adds/-dels, only when non-zero.
+        var diff_buf: [96]u8 = undefined;
+        const diff: []const u8 = blk: {
+            if (added == 0 and removed == 0) break :blk "";
+            var stream = std.io.fixedBufferStream(&diff_buf);
+            const w = stream.writer();
+            if (added > 0) w.print(" <small><span foreground='#98c379'>+{d}</span></small>", .{added}) catch {};
+            if (removed > 0) w.print(" <small><span foreground='#e06c75'>-{d}</span></small>", .{removed}) catch {};
+            break :blk stream.getWritten();
+        };
+
+        const attention: []const u8 = if (any_attention)
+            " <span foreground='#e06c75'>\u{1F514}</span>"
+        else
+            "";
+
+        const markup = if (group.len == 1)
+            std.fmt.allocPrintSentinel(
+                alloc,
+                "<span foreground='#888'>{s}</span> <b>{s}</b> <small><span foreground='#888'>{s}</span></small>{s}{s}",
+                .{ arrow, name_esc, branch_esc, diff, attention },
+                0,
+            ) catch return row
+        else
+            std.fmt.allocPrintSentinel(
+                alloc,
+                "<span foreground='#888'>{s}</span> <b>{s}</b>{s}{s}",
+                .{ arrow, name_esc, diff, attention },
+                0,
+            ) catch return row;
+        defer alloc.free(markup);
+
+        const label = gtk.Label.new(null);
+        label.setMarkup(markup.ptr);
+        label.setXalign(0);
+        label.as(gtk.Widget).setHexpand(@intFromBool(true));
+        label.setEllipsize(.end);
+
+        box.append(label.as(gtk.Widget));
+        row.setChild(box.as(gtk.Widget));
+        return row;
+    }
+
+    /// Build one ListBoxRow widget for a worktree status (leaf under a repo).
+    fn buildWorktreeRow(self: *Window, st: *const sidebar.WorktreeStatus) *gtk.ListBoxRow {
         const priv = self.private();
         const alloc = Application.default().allocator();
 
         const row = gtk.ListBoxRow.new();
 
         const box = gtk.Box.new(.horizontal, 6);
-        box.as(gtk.Widget).setMarginStart(8);
+        box.as(gtk.Widget).setMarginStart(22);
         box.as(gtk.Widget).setMarginEnd(8);
-        box.as(gtk.Widget).setMarginTop(4);
-        box.as(gtk.Widget).setMarginBottom(4);
+        box.as(gtk.Widget).setMarginTop(3);
+        box.as(gtk.Widget).setMarginBottom(3);
 
         // Status dot color: pushable=yellow, dirty=orange, behind=blue, clean=green.
         const dot_color: []const u8 = if (st.pushable())
@@ -1389,33 +1552,28 @@ pub const Window = extern struct {
         else
             "#98c379";
 
-        // Escape name and branch for Pango markup.
-        const name_z = alloc.dupeZ(u8, st.name) catch return row;
-        defer alloc.free(name_z);
         const branch_z = alloc.dupeZ(u8, st.branch) catch return row;
         defer alloc.free(branch_z);
-        const name_esc = glib.markupEscapeText(name_z.ptr, -1);
-        defer glib.free(name_esc);
         const branch_esc = glib.markupEscapeText(branch_z.ptr, -1);
         defer glib.free(branch_esc);
 
-        // Indent linked worktrees.
-        const indent: []const u8 = if (st.is_worktree) "    " else "";
-
-        // Badges: ↑ahead ↓behind, or "no upstream".
-        var badge_buf: [128]u8 = undefined;
-        const badges: []const u8 = if (st.no_upstream)
-            " <small><span foreground='#777'>no upstream</span></small>"
-        else blk: {
+        // Badges: up-ahead down-behind / no upstream, plus +adds/-dels diff counts.
+        var badge_buf: [192]u8 = undefined;
+        const badges: []const u8 = blk: {
             var stream = std.io.fixedBufferStream(&badge_buf);
             const w = stream.writer();
-            if (st.ahead > 0) w.print(" <small><span foreground='#e5c07b'>↑{d}</span></small>", .{st.ahead}) catch {};
-            if (st.behind > 0) w.print(" <small><span foreground='#61afef'>↓{d}</span></small>", .{st.behind}) catch {};
+            if (st.no_upstream) {
+                w.print(" <small><span foreground='#777'>no upstream</span></small>", .{}) catch {};
+            } else {
+                if (st.ahead > 0) w.print(" <small><span foreground='#e5c07b'>\u{2191}{d}</span></small>", .{st.ahead}) catch {};
+                if (st.behind > 0) w.print(" <small><span foreground='#61afef'>\u{2193}{d}</span></small>", .{st.behind}) catch {};
+            }
+            if (st.added > 0) w.print(" <small><span foreground='#98c379'>+{d}</span></small>", .{st.added}) catch {};
+            if (st.removed > 0) w.print(" <small><span foreground='#e06c75'>-{d}</span></small>", .{st.removed}) catch {};
             break :blk stream.getWritten();
         };
 
-        // Attention badge (OSC-3008): bell glyph in red when this worktree
-        // path is flagged as needing attention.
+        // Attention badge (OSC-3008): bell glyph in red.
         const attention: []const u8 = if (priv.sidebar_attention.contains(st.path))
             " <span foreground='#e06c75'>\u{1F514}</span>"
         else
@@ -1423,8 +1581,8 @@ pub const Window = extern struct {
 
         const markup = std.fmt.allocPrintSentinel(
             alloc,
-            "{s}<span foreground='{s}'>●</span> {s} <small><span foreground='#888'>{s}</span></small>{s}{s}",
-            .{ indent, dot_color, name_esc, branch_esc, badges, attention },
+            "<span foreground='{s}'>\u{25CF}</span> <span foreground='#bbb'>{s}</span>{s}{s}",
+            .{ dot_color, branch_esc, badges, attention },
             0,
         ) catch return row;
         defer alloc.free(markup);
@@ -1440,7 +1598,8 @@ pub const Window = extern struct {
         return row;
     }
 
-    /// Row activation: open the corresponding worktree path in a new tab.
+    /// Row activation: a repo header toggles collapse; a worktree leaf opens
+    /// (or focuses) that worktree's tab.
     fn sidebarRowActivated(
         _: *gtk.ListBox,
         row: *gtk.ListBoxRow,
@@ -1449,11 +1608,41 @@ pub const Window = extern struct {
         const priv = self.private();
         const idx = row.getIndex();
         if (idx < 0) return;
-        const i: usize = @intCast(idx);
-        if (i >= priv.sidebar_statuses.len) return;
+        const ri: usize = @intCast(idx);
+        if (ri >= priv.sidebar_rows.items.len) return;
 
-        const st = priv.sidebar_statuses[i];
+        const row_ref = priv.sidebar_rows.items[ri];
+        switch (row_ref.kind) {
+            .repo_header => {
+                if (row_ref.index >= priv.sidebar_statuses.len) return;
+                self.toggleRepoCollapsed(priv.sidebar_statuses[row_ref.index].repo_root);
+            },
+            .worktree => {
+                if (row_ref.index >= priv.sidebar_statuses.len) return;
+                self.openWorktree(&priv.sidebar_statuses[row_ref.index]);
+            },
+        }
+    }
 
+    /// Toggle the collapsed state of a repo group and rebuild the rows.
+    fn toggleRepoCollapsed(self: *Window, repo_root: []const u8) void {
+        const priv = self.private();
+        const alloc = Application.default().allocator();
+        if (priv.sidebar_collapsed.fetchRemove(repo_root)) |kv| {
+            alloc.free(kv.key);
+        } else {
+            const key = alloc.dupe(u8, repo_root) catch return;
+            priv.sidebar_collapsed.put(alloc, key, {}) catch {
+                alloc.free(key);
+                return;
+            };
+        }
+        self.rebuildSidebarRows();
+    }
+
+    /// Open (or focus an existing) tab for a worktree path.
+    fn openWorktree(self: *Window, st: *const sidebar.WorktreeStatus) void {
+        const priv = self.private();
         // macOS parity (SidebarListView List(selection:)): one persistent tab
         // per worktree path. If a tab already exists for this path, select it
         // instead of opening a duplicate.
@@ -1495,11 +1684,7 @@ pub const Window = extern struct {
         }
 
         // Rebuild rows from the current scan so the badge state is reflected.
-        priv.sidebar_list.removeAll();
-        for (priv.sidebar_statuses) |*st| {
-            const row = self.buildSidebarRow(st);
-            priv.sidebar_list.append(row.as(gtk.Widget));
-        }
+        self.rebuildSidebarRows();
     }
 
     fn btnNewTab(_: *adw.SplitButton, self: *Self) callconv(.c) void {

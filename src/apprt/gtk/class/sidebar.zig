@@ -33,11 +33,22 @@ pub const WorktreeStatus = struct {
     no_upstream: bool,
     /// True if this is a linked worktree (not the main checkout).
     is_worktree: bool,
+    /// Lines added in the working tree (uncommitted, vs HEAD).
+    added: u32,
+    /// Lines removed in the working tree (uncommitted, vs HEAD).
+    removed: u32,
+    /// Absolute path to the owning repository's main checkout top-level,
+    /// NUL-terminated. Used to group worktrees under their repo in the sidebar.
+    repo_root: [:0]const u8,
+    /// Display name of the owning repository (basename of repo_root).
+    repo_name: []const u8,
 
     pub fn deinit(self: *const WorktreeStatus, alloc: Allocator) void {
         alloc.free(self.name);
         alloc.free(self.path);
         alloc.free(self.branch);
+        alloc.free(self.repo_root);
+        alloc.free(self.repo_name);
     }
 
     /// A worktree that has commits to push (ahead of upstream, has upstream).
@@ -89,6 +100,7 @@ fn statusFor(
     alloc: Allocator,
     dir: []const u8,
     is_worktree: bool,
+    repo_root: []const u8,
 ) ?WorktreeStatus {
     // Branch (abbrev ref); fall back to "HEAD" when detached or on error.
     const branch = git(alloc, dir, &.{ "git", "rev-parse", "--abbrev-ref", "HEAD" }) orelse
@@ -99,6 +111,18 @@ fn statusFor(
     if (git(alloc, dir, &.{ "git", "status", "--porcelain" })) |st| {
         dirty = st.len > 0;
         alloc.free(st);
+    }
+
+    // Diff line counts vs HEAD (working tree + staged). `git diff HEAD
+    // --shortstat` prints e.g. " 3 files changed, 12 insertions(+), 4
+    // deletions(-)". Parse insertions/deletions; absent on a clean tree.
+    var added: u32 = 0;
+    var removed: u32 = 0;
+    if (dirty) {
+        if (git(alloc, dir, &.{ "git", "diff", "HEAD", "--shortstat" })) |ss| {
+            defer alloc.free(ss);
+            parseShortstat(ss, &added, &removed);
+        }
     }
 
     // Ahead/behind vs upstream. `--left-right --count @{u}...HEAD` prints
@@ -124,6 +148,19 @@ fn statusFor(
         alloc.free(name);
         return null;
     };
+    const rroot = alloc.dupeZ(u8, repo_root) catch {
+        alloc.free(branch);
+        alloc.free(name);
+        alloc.free(path);
+        return null;
+    };
+    const rname = alloc.dupe(u8, std.fs.path.basename(repo_root)) catch {
+        alloc.free(branch);
+        alloc.free(name);
+        alloc.free(path);
+        alloc.free(rroot);
+        return null;
+    };
 
     return .{
         .name = name,
@@ -134,7 +171,26 @@ fn statusFor(
         .behind = behind,
         .no_upstream = no_upstream,
         .is_worktree = is_worktree,
+        .added = added,
+        .removed = removed,
+        .repo_root = rroot,
+        .repo_name = rname,
     };
+}
+
+/// Parse a `git diff --shortstat` line, extracting insertion/deletion counts.
+/// Example input: " 3 files changed, 12 insertions(+), 4 deletions(-)".
+fn parseShortstat(line: []const u8, added: *u32, removed: *u32) void {
+    var it = std.mem.tokenizeAny(u8, line, " ,\n");
+    var prev: ?u32 = null;
+    while (it.next()) |tok| {
+        if (std.mem.startsWith(u8, tok, "insertion")) {
+            if (prev) |n| added.* = n;
+        } else if (std.mem.startsWith(u8, tok, "deletion")) {
+            if (prev) |n| removed.* = n;
+        }
+        prev = std.fmt.parseInt(u32, tok, 10) catch null;
+    }
 }
 
 /// Parse `git worktree list --porcelain` output for worktree paths.
@@ -200,19 +256,24 @@ pub fn scan(alloc: Allocator, root: []const u8) ![]WorktreeStatus {
 
         if (wt_paths.items.len == 0) {
             // No worktree info; treat top as the single (main) checkout.
-            if (statusFor(alloc, top, false)) |s| try results.append(alloc, s);
+            if (statusFor(alloc, top, false, top)) |s| try results.append(alloc, s);
             continue;
         }
 
         for (wt_paths.items) |wp| {
             const is_linked = !std.mem.eql(u8, wp, top);
-            if (statusFor(alloc, wp, is_linked)) |s| try results.append(alloc, s);
+            if (statusFor(alloc, wp, is_linked, top)) |s| try results.append(alloc, s);
         }
     }
 
-    // Sort by name for stable display.
+    // Sort by repo name, then main-checkout-first, then worktree name. This
+    // groups worktrees under their owning repo for the grouped sidebar.
     std.mem.sort(WorktreeStatus, results.items, {}, struct {
         fn lessThan(_: void, a: WorktreeStatus, b: WorktreeStatus) bool {
+            const repo_cmp = std.mem.order(u8, a.repo_name, b.repo_name);
+            if (repo_cmp != .eq) return repo_cmp == .lt;
+            // Within a repo: main checkout (not is_worktree) sorts first.
+            if (a.is_worktree != b.is_worktree) return !a.is_worktree;
             return std.mem.lessThan(u8, a.name, b.name);
         }
     }.lessThan);
@@ -223,4 +284,36 @@ pub fn scan(alloc: Allocator, root: []const u8) ![]WorktreeStatus {
 pub fn freeStatuses(alloc: Allocator, statuses: []WorktreeStatus) void {
     for (statuses) |*s| s.deinit(alloc);
     alloc.free(statuses);
+}
+
+test "parseShortstat: insertions and deletions" {
+    var added: u32 = 0;
+    var removed: u32 = 0;
+    parseShortstat(" 3 files changed, 12 insertions(+), 4 deletions(-)", &added, &removed);
+    try std.testing.expectEqual(@as(u32, 12), added);
+    try std.testing.expectEqual(@as(u32, 4), removed);
+}
+
+test "parseShortstat: insertions only" {
+    var added: u32 = 0;
+    var removed: u32 = 0;
+    parseShortstat(" 1 file changed, 5 insertions(+)", &added, &removed);
+    try std.testing.expectEqual(@as(u32, 5), added);
+    try std.testing.expectEqual(@as(u32, 0), removed);
+}
+
+test "parseShortstat: deletions only" {
+    var added: u32 = 0;
+    var removed: u32 = 0;
+    parseShortstat(" 2 files changed, 7 deletions(-)", &added, &removed);
+    try std.testing.expectEqual(@as(u32, 0), added);
+    try std.testing.expectEqual(@as(u32, 7), removed);
+}
+
+test "parseShortstat: empty" {
+    var added: u32 = 0;
+    var removed: u32 = 0;
+    parseShortstat("", &added, &removed);
+    try std.testing.expectEqual(@as(u32, 0), added);
+    try std.testing.expectEqual(@as(u32, 0), removed);
 }
