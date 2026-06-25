@@ -36,6 +36,7 @@ const WeakRef = @import("../weak_ref.zig").WeakRef;
 const Config = @import("config.zig").Config;
 const Surface = @import("surface.zig").Surface;
 const SplitTree = @import("split_tree.zig").SplitTree;
+const agentpkg = @import("agent.zig");
 const Window = @import("window.zig").Window;
 const Tab = @import("tab.zig").Tab;
 const CloseConfirmationDialog = @import("close_confirmation_dialog.zig").CloseConfirmationDialog;
@@ -2422,15 +2423,54 @@ const Action = struct {
 
         const active = value.action == 0;
 
-        // Flag the matching worktree row in the owning window's sidebar.
-        if (v.rt_surface.surface.getPwd()) |surface_pwd| {
-            if (ext.getAncestor(Window, v.rt_surface.surface.as(gtk.Widget))) |window| {
-                window.setWorktreeAttention(surface_pwd, active);
+        const surface = v.rt_surface.surface;
+        const window = ext.getAncestor(Window, surface.as(gtk.Widget));
+
+        // Parse an `agent=<name>` field from the metadata, if present. This is
+        // how an agent announces its identity to the surface (trio decision:
+        // OSC carries identity because the escape is already surface-scoped, so
+        // we get tab/surface attribution for free).
+        const agent: ?agentpkg.Agent = if (value.metadata.len > 0)
+            parseAgentField(value.metadata)
+        else
+            null;
+
+        // Agent presence -> per-tab indicator icon (req 3). On `start` with an
+        // agent name, attach it; on `end`, detach. Keyed by surface pointer.
+        if (window) |win| {
+            if (agent) |a| {
+                if (active) {
+                    win.setSurfaceAgent(surface, a);
+                } else {
+                    win.setSurfaceAgent(surface, null);
+                }
+            } else if (!active) {
+                // A bare `end` with no agent name still clears any presence on
+                // this surface (defensive teardown).
+                win.clearSurfaceAgent(surface);
             }
         }
 
-        // On start, raise a desktop notification pointing at this surface.
+        // Flag the matching worktree row in the owning window's sidebar.
+        if (surface.getPwd()) |surface_pwd| {
+            if (window) |win| {
+                win.setWorktreeAttention(surface_pwd, active);
+            }
+        }
+
+        // On `end`, dismiss the attention banner.
+        if (!active) {
+            if (window) |win| win.hideAgentBanner();
+        }
+
+        // On start, raise an in-app top banner + desktop notification pointing
+        // at this surface.
         if (active) {
+            if (window) |win| {
+                const title = if (agent) |a| a.label() else "Agent";
+                win.showAgentBanner(surface, title, value.metadata);
+            }
+
             const notif = gio.Notification.new("Agent needs attention");
             defer notif.unref();
             if (value.metadata.len > 0) notif.setBody(value.metadata);
@@ -2443,6 +2483,20 @@ const Action = struct {
         }
 
         return true;
+    }
+
+    /// Parse an `agent=<name>` field out of an OSC-3008 metadata string
+    /// (semicolon-separated key=value pairs). Returns the recognized Agent, or
+    /// null when there is no `agent` field.
+    fn parseAgentField(metadata: []const u8) ?agentpkg.Agent {
+        var it = std.mem.splitScalar(u8, metadata, ';');
+        while (it.next()) |field| {
+            const eq = std.mem.indexOfScalar(u8, field, '=') orelse continue;
+            if (std.mem.eql(u8, field[0..eq], "agent")) {
+                return agentpkg.Agent.parse(field[eq + 1 ..]);
+            }
+        }
+        return null;
     }
 
     pub fn promptTitle(target: apprt.Target, value: apprt.action.PromptTitle) bool {

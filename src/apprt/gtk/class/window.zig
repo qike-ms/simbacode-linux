@@ -27,6 +27,7 @@ const SplitTree = @import("split_tree.zig").SplitTree;
 const Surface = @import("surface.zig").Surface;
 const Tab = @import("tab.zig").Tab;
 const sidebar = @import("sidebar.zig");
+const agentpkg = @import("agent.zig");
 const DebugWarning = @import("debug_warning.zig").DebugWarning;
 const CommandPalette = @import("command_palette.zig").CommandPalette;
 const WeakRef = @import("../weak_ref.zig").WeakRef;
@@ -282,6 +283,18 @@ pub const Window = extern struct {
         /// Rebuilt on every refresh. Owned by this window.
         sidebar_rows: std.ArrayListUnmanaged(SidebarRowRef) = .empty,
 
+        /// Supacode agent presence: maps a surface (by pointer, stable identity)
+        /// to the agent attached to it. Populated by OSC-3008 `agent=<name>`
+        /// metadata; cleared on `end` or surface teardown. The tab indicator
+        /// icon is derived from the focused surface's entry here. Keyed by
+        /// surface pointer so two tabs sharing a worktree don't collide.
+        surface_agents: std.AutoHashMapUnmanaged(*Surface, agentpkg.Agent) = .empty,
+
+        /// The surface the agent attention banner currently points at, so the
+        /// banner's "Open" button can teleport focus there (trio: close the
+        /// loop — signal -> one-click jump to the waiting agent).
+        agent_banner_surface: ?*Surface = null,
+
         /// A weak reference to a command palette.
         command_palette: WeakRef(CommandPalette) = .empty,
 
@@ -297,6 +310,7 @@ pub const Window = extern struct {
         toast_overlay: *adw.ToastOverlay,
         split_view: *adw.OverlaySplitView,
         sidebar_list: *gtk.ListBox,
+        agent_banner: *adw.Banner,
 
         pub var offset: c_int = 0;
     };
@@ -1273,6 +1287,8 @@ pub const Window = extern struct {
         }
         priv.sidebar_rows.deinit(alloc);
         priv.sidebar_rows = .empty;
+        priv.surface_agents.deinit(alloc);
+        priv.surface_agents = .empty;
 
         if (priv.config) |v| {
             v.unref();
@@ -1687,6 +1703,138 @@ pub const Window = extern struct {
         self.rebuildSidebarRows();
     }
 
+    /// Supacode agent presence: attach (or detach) an agent to a surface.
+    /// Called from the OSC-3008 context_signal handler when an `agent=<name>`
+    /// metadata field is present. `surface` is keyed by pointer (stable). On
+    /// attach we record the agent; on detach we remove it. Either way we
+    /// refresh the indicator icon of the surface's tab.
+    pub fn setSurfaceAgent(self: *Window, surface: *Surface, agent: ?agentpkg.Agent) void {
+        const priv = self.private();
+        const alloc = Application.default().allocator();
+
+        if (agent) |a| {
+            priv.surface_agents.put(alloc, surface, a) catch return;
+        } else {
+            _ = priv.surface_agents.remove(surface);
+        }
+
+        self.refreshTabAgentIcon(surface);
+    }
+
+    /// Clear any agent presence recorded for a surface. Called on surface
+    /// teardown so a crashed/exited agent doesn't leave a stale tab icon
+    /// (trio footgun #1: missing end-events leak icons).
+    pub fn clearSurfaceAgent(self: *Window, surface: *Surface) void {
+        const priv = self.private();
+        if (priv.surface_agents.remove(surface)) {
+            self.refreshTabAgentIcon(surface);
+        }
+    }
+
+    /// Recompute and apply the indicator icon for the tab that owns `surface`.
+    /// The tab shows the agent of its FOCUSED surface; if that surface has no
+    /// agent we fall back to any agent present on another surface in the same
+    /// tab (most-recent-wins is approximated by focused-first). One icon per
+    /// tab (req 3).
+    fn refreshTabAgentIcon(self: *Window, surface: *Surface) void {
+        const priv = self.private();
+
+        // Find the Tab that owns this surface, then its TabPage.
+        const tab = ext.getAncestor(Tab, surface.as(gtk.Widget)) orelse return;
+        const page = priv.tab_view.getPage(tab.as(gtk.Widget));
+
+        // Prefer the focused surface's agent; else the first surface in the tab
+        // that has one.
+        const chosen: ?agentpkg.Agent = blk: {
+            if (tab.getActiveSurface()) |active| {
+                if (priv.surface_agents.get(active)) |a| break :blk a;
+            }
+            // Fall back: scan this tab's surfaces for any recorded agent.
+            var it = priv.surface_agents.iterator();
+            while (it.next()) |entry| {
+                const s = entry.key_ptr.*;
+                if (ext.getAncestor(Tab, s.as(gtk.Widget))) |t| {
+                    if (t == tab) break :blk entry.value_ptr.*;
+                }
+            }
+            break :blk null;
+        };
+
+        if (chosen) |a| {
+            if (a.newIcon()) |icon| {
+                defer icon.unref();
+                page.setIndicatorIcon(icon);
+                page.setIndicatorTooltip(a.label().ptr);
+            }
+        } else {
+            page.setIndicatorIcon(null);
+            page.setIndicatorTooltip("");
+        }
+    }
+
+    /// Show the top-of-window agent attention banner (req 4). `title` is the
+    /// agent label; `detail` is optional metadata shown after it. The banner's
+    /// "Open" button teleports focus to `surface`.
+    pub fn showAgentBanner(
+        self: *Window,
+        surface: *Surface,
+        title: []const u8,
+        detail: []const u8,
+    ) void {
+        const priv = self.private();
+        const alloc = Application.default().allocator();
+
+        priv.agent_banner_surface = surface;
+
+        // Compose "<title> needs attention" plus a trimmed first line of detail.
+        const trimmed = trimFirstLine(detail);
+        const text: [:0]const u8 = if (trimmed.len > 0)
+            std.fmt.allocPrintSentinel(
+                alloc,
+                "{s} \u{2014} {s}",
+                .{ title, trimmed },
+                0,
+            ) catch (alloc.dupeZ(u8, "Agent needs attention") catch return)
+        else
+            std.fmt.allocPrintSentinel(
+                alloc,
+                "{s} needs attention",
+                .{title},
+                0,
+            ) catch (alloc.dupeZ(u8, "Agent needs attention") catch return);
+        defer alloc.free(text);
+
+        priv.agent_banner.setTitle(text.ptr);
+        priv.agent_banner.setRevealed(@intFromBool(true));
+    }
+
+    /// Hide the agent attention banner and forget its target surface.
+    pub fn hideAgentBanner(self: *Window) void {
+        const priv = self.private();
+        priv.agent_banner.setRevealed(@intFromBool(false));
+        priv.agent_banner_surface = null;
+    }
+
+    /// Return the first non-empty line of `s` (up to a newline), trimmed.
+    fn trimFirstLine(s: []const u8) []const u8 {
+        const line = if (std.mem.indexOfScalar(u8, s, '\n')) |nl| s[0..nl] else s;
+        return std.mem.trim(u8, line, " \t\r");
+    }
+
+    /// Banner "Open" clicked: teleport to the surface that raised the signal
+    /// (focus its tab + surface) and dismiss the banner.
+    fn agentBannerClicked(_: *adw.Banner, self: *Window) callconv(.c) void {
+        const priv = self.private();
+        if (priv.agent_banner_surface) |surface| {
+            if (ext.getAncestor(Tab, surface.as(gtk.Widget))) |tab| {
+                const page = priv.tab_view.getPage(tab.as(gtk.Widget));
+                priv.tab_view.setSelectedPage(page);
+                _ = surface.as(gtk.Widget).grabFocus();
+            }
+        }
+        self.hideAgentBanner();
+    }
+
     fn btnNewTab(_: *adw.SplitButton, self: *Self) callconv(.c) void {
         self.performBindingAction(.new_tab);
     }
@@ -1934,6 +2082,35 @@ pub const Window = extern struct {
         // Remove the tree handlers
         if (tab.getSurfaceTree()) |tree| {
             self.disconnectSurfaceHandlers(tree);
+        }
+
+        // Supacode: clear agent presence for any surface in this tab so a
+        // closed tab doesn't leave a stale icon or dangling banner target
+        // (trio footgun #1: missing end-events leak presence).
+        self.clearTabAgents(tab);
+    }
+
+    /// Remove all surface_agents entries that belong to `tab`, and clear the
+    /// banner if it pointed at one of them.
+    fn clearTabAgents(self: *Window, tab: *Tab) void {
+        const priv = self.private();
+        var to_remove: std.ArrayListUnmanaged(*Surface) = .empty;
+        defer to_remove.deinit(Application.default().allocator());
+        const alloc = Application.default().allocator();
+
+        var it = priv.surface_agents.iterator();
+        while (it.next()) |entry| {
+            const s = entry.key_ptr.*;
+            if (ext.getAncestor(Tab, s.as(gtk.Widget))) |t| {
+                if (t == tab) to_remove.append(alloc, s) catch {};
+            } else {
+                // Surface no longer has a tab ancestor (being torn down): drop.
+                to_remove.append(alloc, s) catch {};
+            }
+        }
+        for (to_remove.items) |s| {
+            _ = priv.surface_agents.remove(s);
+            if (priv.agent_banner_surface == s) self.hideAgentBanner();
         }
     }
 
@@ -2479,9 +2656,11 @@ pub const Window = extern struct {
             class.bindTemplateChildPrivate("toast_overlay", .{});
             class.bindTemplateChildPrivate("split_view", .{});
             class.bindTemplateChildPrivate("sidebar_list", .{});
+            class.bindTemplateChildPrivate("agent_banner", .{});
 
             // Template Callbacks
             class.bindTemplateCallback("realize", &windowRealize);
+            class.bindTemplateCallback("agent_banner_clicked", &agentBannerClicked);
             class.bindTemplateCallback("new_tab", &btnNewTab);
             class.bindTemplateCallback("overview_create_tab", &tabOverviewCreateTab);
             class.bindTemplateCallback("overview_notify_open", &tabOverviewOpen);
