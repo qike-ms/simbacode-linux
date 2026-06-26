@@ -7,21 +7,31 @@ A Ghostty fork that adds a worktree sidebar + AI-agent integration to the GTK
 
 No nix. Build natively against system GTK4/libadwaita and zig 0.15.2.
 
-The only dep the distro lacks is a recent `blueprint-compiler` (apt ships
-0.12.0; the build needs >= 0.16.0). Install 0.16.0 to `~/.local` once — it is
-pure-python and goes on PATH ahead of the system copy. See
-`scripts/install-blueprint-compiler.sh` in this repo, then:
+Two deps the distro lacks, both installed to `~/.local` (no root) by
+`scripts/install-build-deps.sh`:
+
+- `blueprint-compiler` 0.16 (apt ships 0.12; the build needs >= 0.16)
+- `gtk4-layer-shell` (not packaged; required for the Wayland build)
+
+Run it once, ensure `~/.local/bin` is on PATH ahead of `/usr/bin`, then build
+with both Wayland and X11 enabled:
 
 ```bash
-zig build -Demit-macos-app=false -Dgtk-wayland=false
+scripts/install-build-deps.sh
+
+PKG_CONFIG_PATH="$HOME/.local/lib/x86_64-linux-gnu/pkgconfig:$PKG_CONFIG_PATH" \
+LIBRARY_PATH="$HOME/.local/lib/x86_64-linux-gnu:$LIBRARY_PATH" \
+zig build -Demit-macos-app=false \
+  --search-prefix "$HOME/.local" \
+  -Dpatch-rpath="$HOME/.local/lib/x86_64-linux-gnu"
 ```
 
 Binary lands at `zig-out/bin/ghostty`.
 
 - `-Demit-macos-app=false` skips the macOS app bundle (faster, not needed on Linux).
-- `-Dgtk-wayland=false` builds X11-only, avoiding the `gtk4-layer-shell-0`
-  system lib (not packaged on this distro). Drop it once that lib is available
-  if you need Wayland layer-shell (quick-terminal).
+- `--search-prefix` + `-Dpatch-rpath` let zig find `gtk4-layer-shell` in
+  `~/.local` and bake its path into the binary so it runs without
+  `LD_LIBRARY_PATH`. Wayland and X11 are both enabled.
 - Targeted tests: `zig build test -Dtest-filter=<name>` (full suite is slow).
 - Format: `zig fmt .`
 
