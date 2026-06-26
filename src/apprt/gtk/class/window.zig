@@ -227,6 +227,23 @@ pub const Window = extern struct {
             index: usize,
         };
 
+        /// Supacode (#11): one entry in the notification bell history. Owns its
+        /// strings; freed in `clearNotifications` / dispose.
+        pub const Notification = struct {
+            /// Owned NUL-terminated worktree path the event came from. Used to
+            /// navigate to that worktree when the popover row is activated.
+            path: [:0]u8,
+            /// Owned display text (agent label + first line of detail).
+            text: [:0]u8,
+            /// Whether the user has seen this (drives the unread badge).
+            read: bool = false,
+
+            pub fn deinit(self: *const Notification, alloc: std.mem.Allocator) void {
+                alloc.free(self.path);
+                alloc.free(self.text);
+            }
+        };
+
         /// Whether this window is a quick terminal. If it is then it
         /// behaves slightly differently under certain scenarios.
         quick_terminal: bool = false,
@@ -297,6 +314,11 @@ pub const Window = extern struct {
         /// loop — signal -> one-click jump to the waiting agent).
         agent_banner_surface: ?*Surface = null,
 
+        /// Supacode (#11): notification history backing the toolbar bell
+        /// popover. Each record is an aggregated agent attention event. The
+        /// banner is transient; this list is the persistent history.
+        notifications: std.ArrayListUnmanaged(Notification) = .empty,
+
         /// A weak reference to a command palette.
         command_palette: WeakRef(CommandPalette) = .empty,
 
@@ -319,6 +341,12 @@ pub const Window = extern struct {
         identity_avatar: *adw.Avatar,
         identity_branch: *gtk.Label,
         identity_repo: *gtk.Label,
+
+        /// Supacode (#11): notification bell button + popover widgets.
+        notification_button: *gtk.MenuButton,
+        notification_list: *gtk.ListBox,
+        notification_empty: *gtk.Label,
+        notification_clear_button: *gtk.Button,
 
         /// Supacode per-worktree tab spaces (#7, Option A): a Gtk.Stack holding
         /// one Adw.TabView per worktree path. Selecting a worktree in the
@@ -1556,6 +1584,11 @@ pub const Window = extern struct {
         priv.surface_agents.deinit(alloc);
         priv.surface_agents = .empty;
 
+        // Supacode (#11): free notification history.
+        for (priv.notifications.items) |*n| n.deinit(alloc);
+        priv.notifications.deinit(alloc);
+        priv.notifications = .empty;
+
         // Supacode per-worktree views (#7): free the owned (duped) path keys.
         // The TabView widgets themselves are owned by the worktree_stack and
         // torn down by disposeTemplate / GTK.
@@ -1639,6 +1672,9 @@ pub const Window = extern struct {
         // Set up the Supacode worktree sidebar: connect row activation,
         // perform the first scan, and start the periodic refresh poll.
         self.initSidebar();
+
+        // Initialize the notification bell popover empty-state (#11).
+        self.refreshNotifications();
     }
 
     /// Connect the sidebar ListBox signals, run the first scan, and start the
@@ -2264,6 +2300,186 @@ pub const Window = extern struct {
     /// another, still-waiting surface raised.
     pub fn hideAgentBannerFor(self: *Window, surface: *Surface) void {
         if (self.private().agent_banner_surface == surface) self.hideAgentBanner();
+    }
+
+    /// Supacode (#11): append an agent attention event to the notification
+    /// bell history and refresh the popover. `title` is the agent label;
+    /// `detail` is optional metadata (first line shown). The banner is the
+    /// transient surface for this same event; the bell is the persistent log.
+    pub fn pushNotification(
+        self: *Window,
+        surface: *Surface,
+        title: []const u8,
+        detail: []const u8,
+    ) void {
+        const priv = self.private();
+        const alloc = Application.default().allocator();
+
+        // The worktree path lets the popover row navigate back to the surface.
+        const pwd = surface.getPwd() orelse "";
+        const path = alloc.dupeZ(u8, pwd) catch return;
+
+        // Compose "<agent> — <first line>" (or "<agent> needs attention").
+        const trimmed = trimFirstLine(detail);
+        const text: [:0]u8 = blk: {
+            if (trimmed.len > 0) {
+                break :blk std.fmt.allocPrintSentinel(
+                    alloc,
+                    "{s} \u{2014} {s}",
+                    .{ title, trimmed },
+                    0,
+                ) catch {
+                    alloc.free(path);
+                    return;
+                };
+            }
+            break :blk std.fmt.allocPrintSentinel(
+                alloc,
+                "{s} needs attention",
+                .{title},
+                0,
+            ) catch {
+                alloc.free(path);
+                return;
+            };
+        };
+
+        priv.notifications.append(alloc, .{
+            .path = path,
+            .text = text,
+            .read = false,
+        }) catch {
+            alloc.free(path);
+            alloc.free(text);
+            return;
+        };
+
+        // Cap history so a long-running session doesn't grow unbounded.
+        const max_history = 100;
+        while (priv.notifications.items.len > max_history) {
+            const oldest = priv.notifications.orderedRemove(0);
+            oldest.deinit(alloc);
+        }
+
+        self.refreshNotifications();
+    }
+
+    /// Rebuild the notification popover list and update the bell's unread
+    /// state. Shows an empty-state label when there are no notifications.
+    fn refreshNotifications(self: *Window) void {
+        const priv = self.private();
+        const alloc = Application.default().allocator();
+
+        priv.notification_list.removeAll();
+
+        const count = priv.notifications.items.len;
+        priv.notification_empty.as(gtk.Widget).setVisible(@intFromBool(count == 0));
+        priv.notification_list.as(gtk.Widget).setVisible(@intFromBool(count != 0));
+        priv.notification_clear_button.as(gtk.Widget).setSensitive(@intFromBool(count != 0));
+
+        var unread: usize = 0;
+        // Newest first.
+        var i: usize = count;
+        while (i > 0) {
+            i -= 1;
+            const n = priv.notifications.items[i];
+            if (!n.read) unread += 1;
+
+            const row = gtk.ListBoxRow.new();
+            const box = gtk.Box.new(.horizontal, 8);
+            box.as(gtk.Widget).setMarginStart(8);
+            box.as(gtk.Widget).setMarginEnd(8);
+            box.as(gtk.Widget).setMarginTop(6);
+            box.as(gtk.Widget).setMarginBottom(6);
+
+            const dot_color: []const u8 = if (n.read) "#666" else "#e5c07b";
+            // Build the dot markup BEFORE creating any widget so an OOM here
+            // can't strand an unparented floating Label (trio nit).
+            const dot_markup = std.fmt.allocPrintSentinel(
+                alloc,
+                "<span foreground='{s}'>\u{25CF}</span>",
+                .{dot_color},
+                0,
+            ) catch {
+                row.setChild(box.as(gtk.Widget));
+                priv.notification_list.append(row.as(gtk.Widget));
+                continue;
+            };
+            defer alloc.free(dot_markup);
+            const dot = gtk.Label.new(null);
+            dot.setMarkup(dot_markup.ptr);
+            dot.as(gtk.Widget).setValign(.start);
+            box.append(dot.as(gtk.Widget));
+
+            const label = gtk.Label.new(n.text.ptr);
+            label.setXalign(0);
+            label.as(gtk.Widget).setHexpand(@intFromBool(true));
+            label.setWrap(@intFromBool(true));
+            label.setLines(2);
+            label.setEllipsize(.end);
+            if (n.read) label.as(gtk.Widget).addCssClass("dim-label");
+            box.append(label.as(gtk.Widget));
+
+            row.setChild(box.as(gtk.Widget));
+            priv.notification_list.append(row.as(gtk.Widget));
+        }
+
+        // Bell icon reflects unread state (badge tint via CSS class).
+        if (unread > 0) {
+            priv.notification_button.as(gtk.Widget).addCssClass("has-notifications");
+        } else {
+            priv.notification_button.as(gtk.Widget).removeCssClass("has-notifications");
+        }
+    }
+
+    /// Map a popover ListBox row index back to a notification (newest-first
+    /// display order) and navigate to its worktree, marking it read.
+    fn notificationRowActivated(
+        _: *gtk.ListBox,
+        row: *gtk.ListBoxRow,
+        self: *Window,
+    ) callconv(.c) void {
+        const priv = self.private();
+        const idx = row.getIndex();
+        if (idx < 0) return;
+        const display_i: usize = @intCast(idx);
+        const count = priv.notifications.items.len;
+        if (display_i >= count) return;
+        // Rows are newest-first; map back to storage order.
+        const store_i = count - 1 - display_i;
+
+        const n = &priv.notifications.items[store_i];
+        n.read = true;
+        const path = n.path;
+
+        // Navigate to the worktree the notification came from, if known.
+        if (path.len > 0) {
+            for (priv.sidebar_statuses) |*st| {
+                if (std.mem.eql(u8, st.path, path)) {
+                    self.openWorktree(st);
+                    break;
+                }
+            }
+        }
+
+        // Close the popover and refresh read state.
+        priv.notification_button.popdown();
+        self.refreshNotifications();
+    }
+
+    /// "Clear All" clicked in the popover: drop the whole history.
+    fn notificationClearClicked(_: *gtk.Button, self: *Window) callconv(.c) void {
+        self.clearNotifications();
+        self.private().notification_button.popdown();
+    }
+
+    /// Free and empty the notification history, then refresh the popover.
+    fn clearNotifications(self: *Window) void {
+        const priv = self.private();
+        const alloc = Application.default().allocator();
+        for (priv.notifications.items) |*n| n.deinit(alloc);
+        priv.notifications.clearRetainingCapacity();
+        self.refreshNotifications();
     }
 
     /// Return the first non-empty line of `s` (up to a newline), trimmed.
@@ -3207,10 +3423,16 @@ pub const Window = extern struct {
             class.bindTemplateChildPrivate("identity_avatar", .{});
             class.bindTemplateChildPrivate("identity_branch", .{});
             class.bindTemplateChildPrivate("identity_repo", .{});
+            class.bindTemplateChildPrivate("notification_button", .{});
+            class.bindTemplateChildPrivate("notification_list", .{});
+            class.bindTemplateChildPrivate("notification_empty", .{});
+            class.bindTemplateChildPrivate("notification_clear_button", .{});
 
             // Template Callbacks
             class.bindTemplateCallback("realize", &windowRealize);
             class.bindTemplateCallback("agent_banner_clicked", &agentBannerClicked);
+            class.bindTemplateCallback("notification_row_activated", &notificationRowActivated);
+            class.bindTemplateCallback("notification_clear_clicked", &notificationClearClicked);
             class.bindTemplateCallback("new_tab", &btnNewTab);
             class.bindTemplateCallback("overview_create_tab", &tabOverviewCreateTab);
             class.bindTemplateCallback("overview_notify_open", &tabOverviewOpen);

@@ -67,6 +67,7 @@ pub const css = [_][]const u8{
 pub const custom_icons = [_][]const u8{
     "supacode-split-right-symbolic",
     "supacode-split-down-symbolic",
+    "supacode-bell-symbolic",
 };
 
 pub const Blueprint = struct {

@@ -127,6 +127,72 @@ template $GhosttyWindow: Adw.ApplicationWindow {
             focus-on-click: false;
           }
 
+          // Supacode (#11): notification bell + per-worktree history popover.
+          Gtk.MenuButton notification_button {
+            icon-name: "supacode-bell-symbolic";
+            tooltip-text: _("Notifications");
+            can-focus: false;
+            focus-on-click: false;
+
+            popover: Gtk.Popover {
+              Gtk.Box {
+                orientation: vertical;
+                spacing: 6;
+                margin-top: 8;
+                margin-bottom: 8;
+                margin-start: 8;
+                margin-end: 8;
+                width-request: 300;
+
+                Gtk.Box {
+                  orientation: horizontal;
+                  spacing: 6;
+
+                  Gtk.Label {
+                    label: _("Notifications");
+                    xalign: 0;
+                    hexpand: true;
+                    styles [
+                      "heading",
+                    ]
+                  }
+
+                  Gtk.Button notification_clear_button {
+                    clicked => $notification_clear_clicked();
+                    label: _("Clear All");
+                    can-focus: false;
+                    styles [
+                      "flat",
+                    ]
+                  }
+                }
+
+                Gtk.ScrolledWindow {
+                  hscrollbar-policy: never;
+                  min-content-height: 80;
+                  max-content-height: 360;
+                  propagate-natural-height: true;
+
+                  Gtk.ListBox notification_list {
+                    selection-mode: none;
+                    row-activated => $notification_row_activated();
+                    styles [
+                      "boxed-list",
+                    ]
+                  }
+                }
+
+                Gtk.Label notification_empty {
+                  label: _("No notifications");
+                  xalign: 0;
+                  styles [
+                    "dim-label",
+                  ]
+                }
+              }
+            };
+          }
+
           Gtk.MenuButton {
             notify::active => $notify_menu_active();
             icon-name: "open-menu-symbolic";

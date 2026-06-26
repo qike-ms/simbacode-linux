@@ -191,3 +191,12 @@ label.resize-overlay {
   background-color: alpha(currentColor, 0.08);
   border-radius: 6px;
 }
+
+/*
+ * Supacode: notification bell unread tint (#11). When unread notifications
+ * are present the bell is tinted amber to draw the eye, matching the macOS
+ * bell.badge.fill orange treatment.
+ */
+.has-notifications {
+  color: #e5c07b;
+}

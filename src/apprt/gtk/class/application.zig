@@ -2498,6 +2498,8 @@ const Action = struct {
             if (window) |win| {
                 const title = if (agent) |a| a.label() else "Agent";
                 win.showAgentBanner(surface, title, comm);
+                // Also log it to the persistent notification bell (#11).
+                win.pushNotification(surface, title, comm);
             }
 
             const notif = gio.Notification.new("Agent needs attention");
