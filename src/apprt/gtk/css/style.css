@@ -181,3 +181,13 @@ label.resize-overlay {
   margin: 0;
   padding: 0;
 }
+
+/*
+ * Supacode: pinned "Active" session card in the sidebar (#9). A subtle
+ * lighter-than-sidebar fill so the card reads as selected/highlighted,
+ * matching the macOS reference.
+ */
+.sidebar-active-card {
+  background-color: alpha(currentColor, 0.08);
+  border-radius: 6px;
+}

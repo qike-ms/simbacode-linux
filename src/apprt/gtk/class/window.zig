@@ -223,7 +223,7 @@ pub const Window = extern struct {
         /// rows, or is the index of the repo's FIRST worktree for header rows
         /// (used to read repo_root/repo_name for collapse toggling).
         pub const SidebarRowRef = struct {
-            kind: enum { repo_header, worktree },
+            kind: enum { active_header, active_card, repo_header, worktree },
             index: usize,
         };
 
@@ -981,6 +981,34 @@ pub const Window = extern struct {
         return priv.tab_view;
     }
 
+    /// The worktree path whose tab space is currently visible, or null when on
+    /// the default (template) space. Used to pin the sidebar "Active" card to
+    /// the focused worktree. Resolved by matching the visible stack child back
+    /// to a registered per-worktree view.
+    fn activeWorktreePath(self: *Self) ?[]const u8 {
+        const priv = self.private();
+        const active = priv.worktree_stack.getVisibleChild() orelse return null;
+        var it = priv.worktree_views.iterator();
+        while (it.next()) |entry| {
+            const view = entry.value_ptr.*;
+            if (view.as(gtk.Widget) == active) {
+                const key = entry.key_ptr.*;
+                // The default space is registered under the empty-string key.
+                if (key.len == 0) return null;
+                return key;
+            }
+        }
+        return null;
+    }
+
+    /// The agent (if any) attached to the currently active surface. Drives the
+    /// sidebar "Active" card's agent icon.
+    fn activeAgent(self: *Self) ?agentpkg.Agent {
+        const priv = self.private();
+        const surface = self.getActiveSurface() orelse return null;
+        return priv.surface_agents.get(surface);
+    }
+
     /// Find the TabView that owns `tab` (its nearest Adw.TabView ancestor),
     /// across all per-worktree views. Falls back to the active view.
     fn viewForTab(self: *Self, tab: *Tab) *adw.TabView {
@@ -1114,6 +1142,8 @@ pub const Window = extern struct {
         // Recompute window-level state (title/subtitle) for the newly active
         // view by re-running the selected-page sync against it.
         self.refreshActiveTabBinding();
+        // Re-pin the sidebar "Active" card to the newly focused worktree (#9).
+        self.rebuildSidebarRows();
     }
 
     /// Sync the tab binding group (title/subtitle/etc.) from the active view's
@@ -1645,6 +1675,24 @@ pub const Window = extern struct {
         priv.sidebar_rows.clearRetainingCapacity();
         priv.sidebar_list.removeAll();
 
+        // Supacode (#9): pinned "Active" section at the very top showing the
+        // focused worktree + its agent, matching macOS annotation #2. Only
+        // shown when a specific worktree space is active (not the default).
+        if (self.activeWorktreePath()) |active_path| {
+            for (statuses, 0..) |*st, idx| {
+                if (std.mem.eql(u8, st.path, active_path)) {
+                    const hdr = buildActiveHeaderRow();
+                    priv.sidebar_list.append(hdr.as(gtk.Widget));
+                    priv.sidebar_rows.append(alloc, .{ .kind = .active_header, .index = idx }) catch {};
+
+                    const card = self.buildActiveCardRow(st);
+                    priv.sidebar_list.append(card.as(gtk.Widget));
+                    priv.sidebar_rows.append(alloc, .{ .kind = .active_card, .index = idx }) catch {};
+                    break;
+                }
+            }
+        }
+
         var i: usize = 0;
         while (i < statuses.len) {
             // Find the contiguous run of worktrees belonging to this repo.
@@ -1671,6 +1719,99 @@ pub const Window = extern struct {
 
             i = j;
         }
+    }
+
+    /// Build the "Active" section header row: small muted caps label with a
+    /// blue presence dot, matching macOS annotation #2.
+    fn buildActiveHeaderRow() *gtk.ListBoxRow {
+        const row = gtk.ListBoxRow.new();
+        row.setSelectable(@intFromBool(false));
+        row.setActivatable(@intFromBool(false));
+
+        const box = gtk.Box.new(.horizontal, 6);
+        box.as(gtk.Widget).setMarginStart(10);
+        box.as(gtk.Widget).setMarginEnd(8);
+        box.as(gtk.Widget).setMarginTop(6);
+        box.as(gtk.Widget).setMarginBottom(2);
+
+        const label = gtk.Label.new(null);
+        label.setMarkup("<small><span foreground='#888'>ACTIVE</span></small> <span foreground='#61afef'>\u{25CF}</span>");
+        label.setXalign(0);
+        box.append(label.as(gtk.Widget));
+
+        row.setChild(box.as(gtk.Widget));
+        return row;
+    }
+
+    /// Build the pinned "Active" session card: branch icon + branch name, a
+    /// repo · worktree subtitle, and the active agent icon pinned top-right.
+    fn buildActiveCardRow(self: *Window, st: *const sidebar.WorktreeStatus) *gtk.ListBoxRow {
+        const alloc = Application.default().allocator();
+        const row = gtk.ListBoxRow.new();
+        // Distinct highlight so the card reads as selected, macOS-style.
+        row.as(gtk.Widget).addCssClass("sidebar-active-card");
+
+        const box = gtk.Box.new(.horizontal, 8);
+        box.as(gtk.Widget).setMarginStart(10);
+        box.as(gtk.Widget).setMarginEnd(8);
+        box.as(gtk.Widget).setMarginTop(4);
+        box.as(gtk.Widget).setMarginBottom(6);
+
+        const branch_z = alloc.dupeZ(u8, st.branch) catch return row;
+        defer alloc.free(branch_z);
+        const branch_esc = glib.markupEscapeText(branch_z.ptr, -1);
+        defer glib.free(branch_esc);
+        const repo_z = alloc.dupeZ(u8, st.repo_name) catch return row;
+        defer alloc.free(repo_z);
+        const repo_esc = glib.markupEscapeText(repo_z.ptr, -1);
+        defer glib.free(repo_esc);
+
+        // Two-line text block (left, expanding): branch (bold) then a muted
+        // "repo · worktree" subtitle.
+        const text_box = gtk.Box.new(.vertical, 1);
+        text_box.as(gtk.Widget).setHexpand(@intFromBool(true));
+
+        const title_markup = std.fmt.allocPrintSentinel(
+            alloc,
+            "<span foreground='#888'>\u{2387}</span> <b><span foreground='#eee'>{s}</span></b>",
+            .{branch_esc},
+            0,
+        ) catch return row;
+        defer alloc.free(title_markup);
+        const title = gtk.Label.new(null);
+        title.setMarkup(title_markup.ptr);
+        title.setXalign(0);
+        title.setEllipsize(.end);
+        text_box.append(title.as(gtk.Widget));
+
+        const subtitle_markup = std.fmt.allocPrintSentinel(
+            alloc,
+            "<small><span foreground='#999'>{s}</span> <span foreground='#666'>\u{00B7}</span> <span foreground='#e5c07b'>Default</span></small>",
+            .{repo_esc},
+            0,
+        ) catch return row;
+        defer alloc.free(subtitle_markup);
+        const subtitle = gtk.Label.new(null);
+        subtitle.setMarkup(subtitle_markup.ptr);
+        subtitle.setXalign(0);
+        subtitle.setEllipsize(.end);
+        text_box.append(subtitle.as(gtk.Widget));
+
+        box.append(text_box.as(gtk.Widget));
+
+        // Agent icon (right): the active surface's agent, if any.
+        if (self.activeAgent()) |agent| {
+            if (agent.newIcon()) |icon| {
+                defer icon.unref();
+                const img = gtk.Image.newFromGicon(icon);
+                img.as(gtk.Widget).setValign(.start);
+                img.as(gtk.Widget).setTooltipText(agent.label().ptr);
+                box.append(img.as(gtk.Widget));
+            }
+        }
+
+        row.setChild(box.as(gtk.Widget));
+        return row;
     }
 
     /// Build a collapsible repo header row. Aggregates the group's diff state
@@ -1858,6 +1999,12 @@ pub const Window = extern struct {
 
         const row_ref = priv.sidebar_rows.items[ri];
         switch (row_ref.kind) {
+            // The "Active" header is non-activatable; ignore defensively.
+            .active_header => {},
+            .active_card => {
+                if (row_ref.index >= priv.sidebar_statuses.len) return;
+                self.openWorktree(&priv.sidebar_statuses[row_ref.index]);
+            },
             .repo_header => {
                 if (row_ref.index >= priv.sidebar_statuses.len) return;
                 self.toggleRepoCollapsed(priv.sidebar_statuses[row_ref.index].repo_root);
@@ -1969,6 +2116,9 @@ pub const Window = extern struct {
         }
 
         self.refreshTabAgentIcon(surface);
+        // The active card shows the active surface's agent icon (#9); refresh
+        // the sidebar so it tracks agent attach/detach.
+        self.rebuildSidebarRows();
     }
 
     /// Clear any agent presence recorded for a surface. Called on surface
@@ -1978,6 +2128,7 @@ pub const Window = extern struct {
         const priv = self.private();
         if (priv.surface_agents.remove(surface)) {
             self.refreshTabAgentIcon(surface);
+            self.rebuildSidebarRows();
         }
     }
 
