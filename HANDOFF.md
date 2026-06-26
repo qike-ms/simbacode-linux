@@ -5,18 +5,23 @@ A Ghostty fork that adds a worktree sidebar + AI-agent integration to the GTK
 
 ## Build
 
-The build requires `blueprint-compiler` >= 0.16.0. The system package is 0.12.0
-and will fail, so build inside the nix dev shell (provides blueprint-compiler
-0.18.0 and zig 0.15.2):
+No nix. Build natively against system GTK4/libadwaita and zig 0.15.2.
+
+The only dep the distro lacks is a recent `blueprint-compiler` (apt ships
+0.12.0; the build needs >= 0.16.0). Install 0.16.0 to `~/.local` once — it is
+pure-python and goes on PATH ahead of the system copy. See
+`scripts/install-blueprint-compiler.sh` in this repo, then:
 
 ```bash
-nix develop --extra-experimental-features 'nix-command flakes' \
-  --command bash -c "zig build -Demit-macos-app=false"
+zig build -Demit-macos-app=false -Dgtk-wayland=false
 ```
 
 Binary lands at `zig-out/bin/ghostty`.
 
 - `-Demit-macos-app=false` skips the macOS app bundle (faster, not needed on Linux).
+- `-Dgtk-wayland=false` builds X11-only, avoiding the `gtk4-layer-shell-0`
+  system lib (not packaged on this distro). Drop it once that lib is available
+  if you need Wayland layer-shell (quick-terminal).
 - Targeted tests: `zig build test -Dtest-filter=<name>` (full suite is slow).
 - Format: `zig fmt .`
 
