@@ -1713,34 +1713,20 @@ pub const Window = extern struct {
         const branch_esc = glib.markupEscapeText(branch_z.ptr, -1);
         defer glib.free(branch_esc);
 
-        // Diff summary: +adds/-dels, only when non-zero.
-        var diff_buf: [256]u8 = undefined;
-        const diff: []const u8 = blk: {
-            if (added == 0 and removed == 0) break :blk "";
-            var stream = std.io.fixedBufferStream(&diff_buf);
-            const w = stream.writer();
-            if (added > 0) w.print(" <small><span foreground='#98c379'>+{d}</span></small>", .{added}) catch {};
-            if (removed > 0) w.print(" <small><span foreground='#e06c75'>-{d}</span></small>", .{removed}) catch {};
-            break :blk stream.getWritten();
-        };
-
-        const attention: []const u8 = if (any_attention)
-            " <span foreground='#e06c75'>\u{1F514}</span>"
-        else
-            "";
-
+        // Name label (left): arrow + repo name (+ branch when single worktree).
+        // Ellipsizes and expands so the title takes the squeeze, macOS-style.
         const markup = if (group.len == 1)
             std.fmt.allocPrintSentinel(
                 alloc,
-                "<span foreground='#888'>{s}</span> <b>{s}</b> <small><span foreground='#888'>{s}</span></small>{s}{s}",
-                .{ arrow, name_esc, branch_esc, diff, attention },
+                "<span foreground='#888'>{s}</span> <b>{s}</b> <small><span foreground='#888'>{s}</span></small>",
+                .{ arrow, name_esc, branch_esc },
                 0,
             ) catch return row
         else
             std.fmt.allocPrintSentinel(
                 alloc,
-                "<span foreground='#888'>{s}</span> <b>{s}</b>{s}{s}",
-                .{ arrow, name_esc, diff, attention },
+                "<span foreground='#888'>{s}</span> <b>{s}</b>",
+                .{ arrow, name_esc },
                 0,
             ) catch return row;
         defer alloc.free(markup);
@@ -1750,8 +1736,31 @@ pub const Window = extern struct {
         label.setXalign(0);
         label.as(gtk.Widget).setHexpand(@intFromBool(true));
         label.setEllipsize(.end);
-
         box.append(label.as(gtk.Widget));
+
+        // Badge label (right): aggregated diff stat + attention bell. Fixed
+        // size, right-aligned, so counters never get clipped by long names.
+        var badge_buf: [320]u8 = undefined;
+        const badges: []const u8 = blk: {
+            var stream = std.io.fixedBufferStream(&badge_buf);
+            const w = stream.writer();
+            // macOS shows both +added and -removed together whenever any
+            // change exists (so "+8 -0" renders), not only the non-zero side.
+            if (added > 0 or removed > 0) {
+                w.print("<small><span foreground='#98c379'>+{d}</span> <span foreground='#e06c75'>-{d}</span></small>", .{ added, removed }) catch {};
+            }
+            if (any_attention) w.print(" <span foreground='#e06c75'>\u{1F514}</span>", .{}) catch {};
+            break :blk std.mem.trim(u8, stream.getWritten(), " ");
+        };
+        if (badges.len > 0) {
+            const badge_z = alloc.dupeZ(u8, badges) catch return row;
+            defer alloc.free(badge_z);
+            const badge_label = gtk.Label.new(null);
+            badge_label.setMarkup(badge_z.ptr);
+            badge_label.setXalign(1);
+            box.append(badge_label.as(gtk.Widget));
+        }
+
         row.setChild(box.as(gtk.Widget));
         return row;
     }
@@ -1783,32 +1792,32 @@ pub const Window = extern struct {
         const branch_esc = glib.markupEscapeText(branch_z.ptr, -1);
         defer glib.free(branch_esc);
 
-        // Badges: up-ahead down-behind / no upstream, plus +adds/-dels diff counts.
+        // Badges: up-ahead down-behind / no upstream, plus +adds/-dels diff
+        // counts. The diff stat shows both sides together (macOS "+8 -0")
+        // whenever the worktree has any uncommitted change.
         var badge_buf: [512]u8 = undefined;
         const badges: []const u8 = blk: {
             var stream = std.io.fixedBufferStream(&badge_buf);
             const w = stream.writer();
             if (st.no_upstream) {
-                w.print(" <small><span foreground='#777'>no upstream</span></small>", .{}) catch {};
+                w.print("<small><span foreground='#777'>no upstream</span></small>", .{}) catch {};
             } else {
-                if (st.ahead > 0) w.print(" <small><span foreground='#e5c07b'>\u{2191}{d}</span></small>", .{st.ahead}) catch {};
-                if (st.behind > 0) w.print(" <small><span foreground='#61afef'>\u{2193}{d}</span></small>", .{st.behind}) catch {};
+                if (st.ahead > 0) w.print("<small><span foreground='#e5c07b'>\u{2191}{d}</span></small> ", .{st.ahead}) catch {};
+                if (st.behind > 0) w.print("<small><span foreground='#61afef'>\u{2193}{d}</span></small> ", .{st.behind}) catch {};
             }
-            if (st.added > 0) w.print(" <small><span foreground='#98c379'>+{d}</span></small>", .{st.added}) catch {};
-            if (st.removed > 0) w.print(" <small><span foreground='#e06c75'>-{d}</span></small>", .{st.removed}) catch {};
-            break :blk stream.getWritten();
+            if (st.added > 0 or st.removed > 0) {
+                w.print("<small><span foreground='#98c379'>+{d}</span> <span foreground='#e06c75'>-{d}</span></small>", .{ st.added, st.removed }) catch {};
+            }
+            // Attention badge (OSC-3008): bell glyph in red.
+            if (self.pathHasAttention(st.path)) w.print(" <span foreground='#e06c75'>\u{1F514}</span>", .{}) catch {};
+            break :blk std.mem.trim(u8, stream.getWritten(), " ");
         };
 
-        // Attention badge (OSC-3008): bell glyph in red.
-        const attention: []const u8 = if (self.pathHasAttention(st.path))
-            " <span foreground='#e06c75'>\u{1F514}</span>"
-        else
-            "";
-
+        // Name label (left): status dot + branch, expanding/ellipsizing.
         const markup = std.fmt.allocPrintSentinel(
             alloc,
-            "<span foreground='{s}'>\u{25CF}</span> <span foreground='#bbb'>{s}</span>{s}{s}",
-            .{ dot_color, branch_esc, badges, attention },
+            "<span foreground='{s}'>\u{25CF}</span> <span foreground='#bbb'>{s}</span>",
+            .{ dot_color, branch_esc },
             0,
         ) catch return row;
         defer alloc.free(markup);
@@ -1818,8 +1827,18 @@ pub const Window = extern struct {
         label.setXalign(0);
         label.as(gtk.Widget).setHexpand(@intFromBool(true));
         label.setEllipsize(.end);
-
         box.append(label.as(gtk.Widget));
+
+        // Badge label (right): fixed size, right-aligned, never clipped.
+        if (badges.len > 0) {
+            const badge_z = alloc.dupeZ(u8, badges) catch return row;
+            defer alloc.free(badge_z);
+            const badge_label = gtk.Label.new(null);
+            badge_label.setMarkup(badge_z.ptr);
+            badge_label.setXalign(1);
+            box.append(badge_label.as(gtk.Widget));
+        }
+
         row.setChild(box.as(gtk.Widget));
         return row;
     }
