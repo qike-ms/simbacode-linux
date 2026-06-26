@@ -62,6 +62,13 @@ pub const css = [_][]const u8{
     "style-hc-dark.css",
 };
 
+/// Supacode custom symbolic icons (basename without extension) embedded under
+/// the icon theme's `scalable/actions/` path. Resolvable by `icon-name`.
+pub const custom_icons = [_][]const u8{
+    "supacode-split-right-symbolic",
+    "supacode-split-down-symbolic",
+};
+
 pub const Blueprint = struct {
     major: u16,
     minor: u16,
@@ -71,7 +78,7 @@ pub const Blueprint = struct {
 /// The list of filepaths that we depend on. Used for the build
 /// system to have proper caching.
 pub const file_inputs = deps: {
-    const total = (icon_sizes.len * 2) + blueprints.len + css.len;
+    const total = (icon_sizes.len * 2) + blueprints.len + css.len + custom_icons.len;
     var deps: [total][]const u8 = undefined;
     var index: usize = 0;
     for (icon_sizes) |size| {
@@ -90,6 +97,13 @@ pub const file_inputs = deps: {
     }
     for (css) |name| {
         deps[index] = std.fmt.comptimePrint("{s}/{s}", .{ css_path, name });
+        index += 1;
+    }
+    for (custom_icons) |name| {
+        deps[index] = std.fmt.comptimePrint(
+            "images/icons/scalable/actions/{s}.svg",
+            .{name},
+        );
         index += 1;
     }
     break :deps deps;
@@ -200,6 +214,23 @@ fn genIcons(writer: *std.Io.Writer) !void {
                 .{ alias, build_info.base_application_id, source },
             );
         }
+    }
+
+    // Supacode custom symbolic action icons (e.g. split-right/split-down for
+    // the tab-bar button group). These live under the icon theme's
+    // `scalable/actions/` path so GTK's default icon theme — which
+    // automatically includes `<resource_base_path>/icons/` — can resolve them
+    // by `icon-name`.
+    inline for (custom_icons) |name| {
+        const source = std.fmt.comptimePrint(
+            "images/icons/scalable/actions/{s}.svg",
+            .{name},
+        );
+        try cwd.access(source, .{});
+        try writer.print(
+            \\    <file alias="scalable/actions/{s}.svg">{s}</file>
+            \\
+        , .{ name, source });
     }
 
     try writer.writeAll(

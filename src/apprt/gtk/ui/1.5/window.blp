@@ -144,6 +144,45 @@ template $GhosttyWindow: Adw.ApplicationWindow {
           orientation: horizontal;
           visible: bind $titlebar_style_is_tabs(template.titlebar-style) as <bool>;
 
+          // Supacode (#12): explicit new-tab + split button group, matching
+          // macOS annotation #5. All three target the active worktree's tab
+          // space via the window actions (which use activeTabView()).
+          Gtk.Button {
+            styles [
+              "flat",
+            ]
+
+            action-name: "win.new-tab";
+            icon-name: "tab-new-symbolic";
+            tooltip-text: _("New Tab");
+            can-focus: false;
+            focus-on-click: false;
+          }
+
+          Gtk.Button {
+            styles [
+              "flat",
+            ]
+
+            action-name: "win.split-right";
+            icon-name: "supacode-split-right-symbolic";
+            tooltip-text: _("Split Right");
+            can-focus: false;
+            focus-on-click: false;
+          }
+
+          Gtk.Button {
+            styles [
+              "flat",
+            ]
+
+            action-name: "win.split-down";
+            icon-name: "supacode-split-down-symbolic";
+            tooltip-text: _("Split Down");
+            can-focus: false;
+            focus-on-click: false;
+          }
+
           Gtk.ToggleButton {
             styles [
               "flat",
