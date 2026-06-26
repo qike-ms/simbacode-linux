@@ -188,16 +188,18 @@ template $GhosttyWindow: Adw.ApplicationWindow {
         }
 
         Adw.ToastOverlay toast_overlay {
-          Adw.TabView tab_view {
-            notify::n-pages => $notify_n_pages();
-            notify::selected-page => $notify_selected_page();
-            close-page => $close_page();
-            page-attached => $page_attached();
-            page-detached => $page_detached();
-            create-window => $tab_create_window();
-            setup-menu => $setup_tab_menu();
-            menu-model: tab_context_menu;
-            shortcuts: none;
+          Gtk.Stack worktree_stack {
+            Adw.TabView tab_view {
+              notify::n-pages => $notify_n_pages();
+              notify::selected-page => $notify_selected_page();
+              close-page => $close_page();
+              page-attached => $page_attached();
+              page-detached => $page_detached();
+              create-window => $tab_create_window();
+              setup-menu => $setup_tab_menu();
+              menu-model: tab_context_menu;
+              shortcuts: none;
+            }
           }
         }
       }

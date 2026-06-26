@@ -314,6 +314,25 @@ pub const Window = extern struct {
         sidebar_list: *gtk.ListBox,
         agent_banner: *adw.Banner,
 
+        /// Supacode per-worktree tab spaces (#7, Option A): a Gtk.Stack holding
+        /// one Adw.TabView per worktree path. Selecting a worktree in the
+        /// sidebar swaps the visible TabView (and repoints tab_bar / overview)
+        /// so each folder owns its own set of tabs, matching macOS supacode
+        /// (Worktree.ID -> [TerminalTabID]). The template `tab_view` is the
+        /// DEFAULT view used for menu-opened tabs with no worktree.
+        worktree_stack: *gtk.Stack,
+
+        /// Per-worktree TabViews keyed by owned (duped) worktree path. The
+        /// template tab_view is registered here under the empty-string key as
+        /// the default. Freed in dispose().
+        worktree_views: std.StringHashMapUnmanaged(*adw.TabView) = .empty,
+
+        /// Set true at the start of dispose() so per-view signal handlers
+        /// (notify::n-pages firing as the stack tears down its children) don't
+        /// re-enter window-close logic during teardown (#7 review: dispose
+        /// re-entrancy).
+        disposing: bool = false,
+
         pub var offset: c_int = 0;
     };
 
@@ -368,6 +387,10 @@ pub const Window = extern struct {
         // are only synced from the currently active tab.
         priv.tab_bindings = gobject.BindingGroup.new();
         priv.tab_bindings.bind("title", self.as(gobject.Object), "title", .{});
+
+        // Supacode (#7): register the template tab_view as the default tab
+        // space so per-worktree view bookkeeping has a consistent fallback.
+        self.registerDefaultWorktreeView();
 
         // Set our window icon. We can't set this in the blueprint file
         // because its dependent on the build config.
@@ -477,7 +500,7 @@ pub const Window = extern struct {
         },
     ) *adw.TabPage {
         const priv: *Private = self.private();
-        const tab_view = priv.tab_view;
+        const tab_view = self.activeTabView();
 
         // Create our new tab object
         const tab = Tab.new(
@@ -576,8 +599,7 @@ pub const Window = extern struct {
     /// Select the tab as requested. Returns true if the tab selection
     /// changed.
     pub fn selectTab(self: *Self, n: SelectTab) bool {
-        const priv = self.private();
-        const tab_view = priv.tab_view;
+        const tab_view = self.activeTabView();
 
         // Get our current tab numeric position
         const selected = tab_view.getSelectedPage() orelse return false;
@@ -630,8 +652,7 @@ pub const Window = extern struct {
         surface: *Surface,
         amount: isize,
     ) bool {
-        const priv = self.private();
-        const tab_view = priv.tab_view;
+        const tab_view = self.activeTabView();
 
         // If we have one tab we never move.
         const total = tab_view.getNPages();
@@ -939,11 +960,174 @@ pub const Window = extern struct {
         return self.private().config;
     }
 
-    /// Get the tab view for this window.
+    /// Get the tab view for this window. Returns the ACTIVE per-worktree view
+    /// (the one currently visible in the worktree_stack), falling back to the
+    /// template default view. All single-view tab operations route through
+    /// here so they target the active worktree's tab space (#7).
     pub fn getTabView(self: *Self) *adw.TabView {
-        return self.private().tab_view;
+        return self.activeTabView();
     }
 
+    /// The currently visible per-worktree TabView. Falls back to the template
+    /// `tab_view` (default space) if the stack has no visible child yet.
+    fn activeTabView(self: *Self) *adw.TabView {
+        const priv = self.private();
+        if (priv.worktree_stack.getVisibleChild()) |child| {
+            if (gobject.ext.cast(adw.TabView, child)) |view| return view;
+            // The stack should only ever hold TabViews; a non-TabView child
+            // means a wiring bug elsewhere. Don't crash, but surface it.
+            log.warn("worktree_stack visible child is not a TabView", .{});
+        }
+        return priv.tab_view;
+    }
+
+    /// Find the TabView that owns `tab` (its nearest Adw.TabView ancestor),
+    /// across all per-worktree views. Falls back to the active view.
+    fn viewForTab(self: *Self, tab: *Tab) *adw.TabView {
+        if (ext.getAncestor(adw.TabView, tab.as(gtk.Widget))) |view| return view;
+        return self.activeTabView();
+    }
+
+    /// Total number of tab pages across every worktree view.
+    fn totalTabPages(self: *Self) c_int {
+        var total: c_int = 0;
+        var vit = self.private().worktree_views.valueIterator();
+        while (vit.next()) |view_ptr| total += view_ptr.*.getNPages();
+        return total;
+    }
+
+    /// Connect the per-view signal handlers that the template wires for the
+    /// default `tab_view`, so a runtime-created worktree view behaves
+    /// identically. (overview create-tab / notify::open stay on the single
+    /// tab_overview, which we repoint with setView on switch.)
+    fn connectTabViewSignals(self: *Self, view: *adw.TabView) void {
+        _ = gobject.signalConnectData(
+            view.as(gobject.Object),
+            "close-page",
+            @ptrCast(&tabViewClosePage),
+            self,
+            null,
+            .{},
+        );
+        _ = gobject.signalConnectData(
+            view.as(gobject.Object),
+            "page-attached",
+            @ptrCast(&tabViewPageAttached),
+            self,
+            null,
+            .{},
+        );
+        _ = gobject.signalConnectData(
+            view.as(gobject.Object),
+            "page-detached",
+            @ptrCast(&tabViewPageDetached),
+            self,
+            null,
+            .{},
+        );
+        _ = gobject.signalConnectData(
+            view.as(gobject.Object),
+            "create-window",
+            @ptrCast(&tabViewCreateWindow),
+            self,
+            null,
+            .{},
+        );
+        _ = gobject.signalConnectData(
+            view.as(gobject.Object),
+            "setup-menu",
+            @ptrCast(&setupTabMenu),
+            self,
+            null,
+            .{},
+        );
+        _ = gobject.Object.signals.notify.connect(
+            view,
+            *Self,
+            tabViewNPages,
+            self,
+            .{ .detail = "n-pages" },
+        );
+        _ = gobject.Object.signals.notify.connect(
+            view,
+            *Self,
+            tabViewSelectedPage,
+            self,
+            .{ .detail = "selected-page" },
+        );
+    }
+
+    /// Register the template `tab_view` as the default-space view under the
+    /// empty-string key. Called once at construction.
+    fn registerDefaultWorktreeView(self: *Self) void {
+        const priv = self.private();
+        const alloc = Application.default().allocator();
+        const key = alloc.dupe(u8, "") catch return;
+        priv.worktree_views.put(alloc, key, priv.tab_view) catch {
+            alloc.free(key);
+            return;
+        };
+    }
+
+    /// Ensure a TabView exists for `path`, creating and wiring one if needed.
+    /// Returns the view (or the default view on allocation failure).
+    fn ensureWorktreeView(self: *Self, path: []const u8) *adw.TabView {
+        const priv = self.private();
+        const alloc = Application.default().allocator();
+
+        if (priv.worktree_views.get(path)) |view| return view;
+
+        // Reserve the map slot BEFORE creating/adding the view so a partially
+        // registered (orphan) view can never end up in the stack but missing
+        // from worktree_views on OOM (review: ensureWorktreeView orphan). On
+        // allocation failure we fall back to the default view untouched.
+        const key = alloc.dupe(u8, path) catch return priv.tab_view;
+        const gop = priv.worktree_views.getOrPut(alloc, key) catch {
+            alloc.free(key);
+            return priv.tab_view;
+        };
+        // getOrPut on a fresh key can't already exist (we checked .get above),
+        // but guard anyway to avoid leaking the dup.
+        if (gop.found_existing) {
+            alloc.free(key);
+            return gop.value_ptr.*;
+        }
+        // Initialize the slot to a safe sentinel before we create the real
+        // view, so the map never exposes an uninitialized value_ptr.
+        gop.value_ptr.* = priv.tab_view;
+
+        const view = gobject.ext.newInstance(adw.TabView, .{});
+        view.as(gtk.Widget).setVisible(@intFromBool(true));
+        self.connectTabViewSignals(view);
+        _ = priv.worktree_stack.addChild(view.as(gtk.Widget));
+        gop.value_ptr.* = view;
+        return view;
+    }
+
+    /// Make `view` the active tab space: show it in the stack and repoint the
+    /// shared tab bar + overview at it.
+    fn switchToWorktreeView(self: *Self, view: *adw.TabView) void {
+        const priv = self.private();
+        priv.worktree_stack.setVisibleChild(view.as(gtk.Widget));
+        priv.tab_bar.setView(view);
+        priv.tab_overview.setView(view);
+        // Recompute window-level state (title/subtitle) for the newly active
+        // view by re-running the selected-page sync against it.
+        self.refreshActiveTabBinding();
+    }
+
+    /// Sync the tab binding group (title/subtitle/etc.) from the active view's
+    /// selected page. Shared by the selected-page signal and view switching.
+    fn refreshActiveTabBinding(self: *Self) void {
+        const priv = self.private();
+        priv.tab_bindings.setSource(null);
+        const view = self.activeTabView();
+        const page = view.getSelectedPage() orelse return;
+        const child = page.getChild();
+        assert(gobject.ext.isA(child, Tab));
+        priv.tab_bindings.setSource(child.as(gobject.Object));
+        page.setNeedsAttention(@intFromBool(false));
+    }
     /// Get the current window decoration value for this window.
     pub fn getWindowDecoration(self: *Self) configpkg.WindowDecoration {
         const priv = self.private();
@@ -985,29 +1169,29 @@ pub const Window = extern struct {
 
     /// Get the currently selected tab as a Tab object.
     fn getSelectedTab(self: *Self) ?*Tab {
-        const priv = self.private();
-        const page = priv.tab_view.getSelectedPage() orelse return null;
+        const page = self.activeTabView().getSelectedPage() orelse return null;
         const child = page.getChild();
         assert(gobject.ext.isA(child, Tab));
         return gobject.ext.cast(Tab, child);
     }
 
-    /// Returns true if this window needs confirmation before quitting.
+    /// Returns true if this window needs confirmation before quitting. Checks
+    /// every worktree tab space (#7), not just the active one.
     fn getNeedsConfirmQuit(self: *Self) bool {
-        const priv = self.private();
-        const n = priv.tab_view.getNPages();
-        assert(n >= 0);
-
-        for (0..@intCast(n)) |i| {
-            const page = priv.tab_view.getNthPage(@intCast(i));
-            const child = page.getChild();
-            const tab = gobject.ext.cast(Tab, child) orelse {
-                log.warn("unexpected non-Tab child in tab view", .{});
-                continue;
-            };
-            if (tab.getNeedsConfirmQuit()) return true;
+        var vit = self.private().worktree_views.valueIterator();
+        while (vit.next()) |view_ptr| {
+            const view = view_ptr.*;
+            const n = view.getNPages();
+            for (0..@intCast(n)) |i| {
+                const page = view.getNthPage(@intCast(i));
+                const child = page.getChild();
+                const tab = gobject.ext.cast(Tab, child) orelse {
+                    log.warn("unexpected non-Tab child in tab view", .{});
+                    continue;
+                };
+                if (tab.getNeedsConfirmQuit()) return true;
+            }
         }
-
         return false;
     }
 
@@ -1275,6 +1459,10 @@ pub const Window = extern struct {
     fn dispose(self: *Self) callconv(.c) void {
         const priv = self.private();
 
+        // Mark teardown in progress so per-view notify::n-pages handlers don't
+        // re-enter window-close logic as the stack disposes its children.
+        priv.disposing = true;
+
         priv.command_palette.set(null);
 
         // Supacode sidebar teardown: stop the poll timer and free owned state.
@@ -1303,6 +1491,16 @@ pub const Window = extern struct {
         priv.sidebar_rows = .empty;
         priv.surface_agents.deinit(alloc);
         priv.surface_agents = .empty;
+
+        // Supacode per-worktree views (#7): free the owned (duped) path keys.
+        // The TabView widgets themselves are owned by the worktree_stack and
+        // torn down by disposeTemplate / GTK.
+        {
+            var it = priv.worktree_views.keyIterator();
+            while (it.next()) |k| alloc.free(k.*);
+            priv.worktree_views.deinit(alloc);
+            priv.worktree_views = .empty;
+        }
 
         if (priv.config) |v| {
             v.unref();
@@ -1668,27 +1866,21 @@ pub const Window = extern struct {
         self.rebuildSidebarRows();
     }
 
-    /// Open (or focus an existing) tab for a worktree path.
+    /// Open a worktree's tab space (#7, Option A). Each worktree owns its own
+    /// Adw.TabView: selecting a worktree in the sidebar swaps the visible view
+    /// to that worktree's tabs (creating the view + an initial tab on first
+    /// visit). This matches macOS supacode where a worktree keeps a persistent
+    /// set of terminal tabs (Worktree.ID -> [TerminalTabID]); the user can open
+    /// many tabs/splits under one folder, not just one.
     fn openWorktree(self: *Window, st: *const sidebar.WorktreeStatus) void {
-        const priv = self.private();
-        // macOS parity (SidebarListView List(selection:)): one persistent tab
-        // per worktree path. If a tab already exists for this path, select it
-        // instead of opening a duplicate.
-        const n = priv.tab_view.getNPages();
-        if (n > 0) {
-            for (0..@intCast(n)) |j| {
-                const page = priv.tab_view.getNthPage(@intCast(j));
-                const child = page.getChild();
-                const tab = gobject.ext.cast(Tab, child) orelse continue;
-                const wd = tab.getWorkingDirectory() orelse continue;
-                if (std.mem.eql(u8, wd, st.path)) {
-                    priv.tab_view.setSelectedPage(page);
-                    return;
-                }
-            }
-        }
+        const view = self.ensureWorktreeView(st.path);
+        const had_tabs = view.getNPages() > 0;
+        self.switchToWorktreeView(view);
 
-        self.newTabForWindow(null, .{ .working_directory = st.path });
+        // First visit: open an initial terminal in the worktree's cwd.
+        if (!had_tabs) {
+            self.newTabForWindow(null, .{ .working_directory = st.path });
+        }
     }
 
     /// Whether any surface flagged for attention maps to `path`. Drives the
@@ -1780,7 +1972,7 @@ pub const Window = extern struct {
 
         // Find the Tab that owns this surface, then its TabPage.
         const tab = ext.getAncestor(Tab, surface.as(gtk.Widget)) orelse return;
-        const page = priv.tab_view.getPage(tab.as(gtk.Widget));
+        const page = self.viewForTab(tab).getPage(tab.as(gtk.Widget));
 
         // Prefer the focused surface's agent; else the first surface in the tab
         // that has one.
@@ -1880,8 +2072,12 @@ pub const Window = extern struct {
         const priv = self.private();
         if (priv.agent_banner_surface) |surface| {
             if (ext.getAncestor(Tab, surface.as(gtk.Widget))) |tab| {
-                const page = priv.tab_view.getPage(tab.as(gtk.Widget));
-                priv.tab_view.setSelectedPage(page);
+                const view = self.viewForTab(tab);
+                const page = view.getPage(tab.as(gtk.Widget));
+                // Surface lives in a (possibly non-active) worktree view: make
+                // that view active first, then select the page.
+                self.switchToWorktreeView(view);
+                view.setSelectedPage(page);
                 _ = surface.as(gtk.Widget).grabFocus();
             }
         }
@@ -2008,19 +2204,25 @@ pub const Window = extern struct {
     }
 
     fn tabViewClosePage(
-        _: *adw.TabView,
+        view: *adw.TabView,
         page: *adw.TabPage,
         self: *Self,
     ) callconv(.c) c_int {
-        const priv = self.private();
+        // During teardown, let pages close without our bookkeeping.
+        if (self.private().disposing) {
+            view.closePageFinish(page, @intFromBool(true));
+            return @intFromBool(true);
+        }
         const child = page.getChild();
         const tab = gobject.ext.cast(Tab, child) orelse
             return @intFromBool(false);
 
+        // `view` is the emitting TabView (the worktree space that owns this
+        // page), so close operates on the correct space directly (#7).
         // If the tab says it doesn't need confirmation then we go ahead
         // and close immediately.
         if (!tab.getNeedsConfirmQuit()) {
-            priv.tab_view.closePageFinish(page, @intFromBool(true));
+            view.closePageFinish(page, @intFromBool(true));
             return @intFromBool(true);
         }
 
@@ -2047,27 +2249,19 @@ pub const Window = extern struct {
     }
 
     fn tabViewSelectedPage(
-        _: *adw.TabView,
+        view: *adw.TabView,
         _: *gobject.ParamSpec,
         self: *Self,
     ) callconv(.c) void {
-        const priv = self.private();
-
-        // Always reset our binding source in case we have no pages.
-        priv.tab_bindings.setSource(null);
-
-        // Get our current page which MUST be a Tab object.
-        const page = priv.tab_view.getSelectedPage() orelse return;
-        const child = page.getChild();
-        assert(gobject.ext.isA(child, Tab));
-
-        // Setup our binding group. This ensures things like the title
-        // are synced from the active tab.
-        priv.tab_bindings.setSource(child.as(gobject.Object));
-
-        // If the tab was previously marked as needing attention
-        // (e.g. due to a bell character), we now unmark that
-        page.setNeedsAttention(@intFromBool(false));
+        // Skip during teardown: the binding group and child views are being
+        // torn down (#7 review: guard all per-view handlers symmetrically).
+        if (self.private().disposing) return;
+        // Only the active (visible) view drives the window title binding and
+        // attention clearing. A background worktree view emitting selected-page
+        // (e.g. during drag-detach) must not retarget the title or clear the
+        // active page's attention (#7 review: emitting-view awareness).
+        if (view != self.activeTabView()) return;
+        self.refreshActiveTabBinding();
     }
 
     fn tabViewPageAttached(
@@ -2076,6 +2270,7 @@ pub const Window = extern struct {
         _: c_int,
         self: *Self,
     ) callconv(.c) void {
+        if (self.private().disposing) return;
         // Get the attached page which must be a Tab object.
         const child = page.getChild();
         const tab = gobject.ext.cast(Tab, child) orelse return;
@@ -2119,6 +2314,10 @@ pub const Window = extern struct {
         _: c_int,
         self: *Self,
     ) callconv(.c) void {
+        // During window teardown the per-tab agent/attention maps are being
+        // freed in dispose(); skip touching them to avoid use-after-free as
+        // the stack disposes its child views (#7 review Finding 7).
+        if (self.private().disposing) return;
         // We need to get the tab to disconnect the signals.
         const child = page.getChild();
         const tab = gobject.ext.cast(Tab, child) orelse return;
@@ -2214,19 +2413,25 @@ pub const Window = extern struct {
         tab: *Tab,
         self: *Self,
     ) callconv(.c) void {
-        const priv = self.private();
-        const page = priv.tab_view.getPage(tab.as(gtk.Widget));
+        const view = self.viewForTab(tab);
+        const page = view.getPage(tab.as(gtk.Widget));
         // TODO: connect close page handler to tab to check for confirmation
-        priv.tab_view.closePage(page);
+        view.closePage(page);
     }
 
     fn tabViewNPages(
-        _: *adw.TabView,
+        view: *adw.TabView,
         _: *gobject.ParamSpec,
         self: *Self,
     ) callconv(.c) void {
         const priv = self.private();
-        if (priv.tab_view.getNPages() == 0) {
+
+        // During teardown the stack disposes its child TabViews, which emits
+        // notify::n-pages. Don't re-enter window-close logic then (#7 review:
+        // dispose re-entrancy).
+        if (priv.disposing) return;
+
+        if (self.totalTabPages() == 0) {
             // If we have no pages left then we want to close window.
 
             // If the tab overview is open, then we don't close the window
@@ -2236,6 +2441,21 @@ pub const Window = extern struct {
             if (priv.tab_overview.getOpen() != 0) return;
 
             self.as(gtk.Window).close();
+            return;
+        }
+
+        // The emitting view just emptied but other worktree spaces still have
+        // tabs: don't strand the user on a blank pane. Switch to a non-empty
+        // view (#7 review: empty-active-view dead-end).
+        if (view == self.activeTabView() and view.getNPages() == 0) {
+            var it = priv.worktree_views.valueIterator();
+            while (it.next()) |v_ptr| {
+                const v = v_ptr.*;
+                if (v != view and v.getNPages() > 0) {
+                    self.switchToWorktreeView(v);
+                    break;
+                }
+            }
         }
     }
     fn setupTabMenu(
@@ -2311,9 +2531,9 @@ pub const Window = extern struct {
         };
 
         // Get the page that contains this tab
-        const priv = self.private();
-        const tab_view = priv.tab_view;
+        const tab_view = self.viewForTab(tab);
         const page = tab_view.getPage(tab.as(gtk.Widget));
+        self.switchToWorktreeView(tab_view);
         tab_view.setSelectedPage(page);
 
         // Grab focus
@@ -2771,6 +2991,7 @@ pub const Window = extern struct {
             class.bindTemplateChildPrivate("tab_overview", .{});
             class.bindTemplateChildPrivate("tab_bar", .{});
             class.bindTemplateChildPrivate("tab_view", .{});
+            class.bindTemplateChildPrivate("worktree_stack", .{});
             class.bindTemplateChildPrivate("toolbar", .{});
             class.bindTemplateChildPrivate("toast_overlay", .{});
             class.bindTemplateChildPrivate("split_view", .{});
