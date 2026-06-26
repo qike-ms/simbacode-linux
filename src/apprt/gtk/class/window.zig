@@ -314,6 +314,12 @@ pub const Window = extern struct {
         sidebar_list: *gtk.ListBox,
         agent_banner: *adw.Banner,
 
+        /// Supacode (#10): title-bar repo + user identity chip widgets.
+        identity_chip: *gtk.Box,
+        identity_avatar: *adw.Avatar,
+        identity_branch: *gtk.Label,
+        identity_repo: *gtk.Label,
+
         /// Supacode per-worktree tab spaces (#7, Option A): a Gtk.Stack holding
         /// one Adw.TabView per worktree path. Selecting a worktree in the
         /// sidebar swaps the visible TabView (and repoints tab_bar / overview)
@@ -1009,6 +1015,47 @@ pub const Window = extern struct {
         return priv.surface_agents.get(surface);
     }
 
+    /// Update the title-bar identity chip (#10): avatar initials + branch
+    /// (bold) over repo name, sourced from the active worktree. The chip is
+    /// hidden when no specific worktree space is active (default/menu tabs).
+    fn updateIdentityChip(self: *Self) void {
+        const priv = self.private();
+
+        const active_path = self.activeWorktreePath() orelse {
+            priv.identity_chip.as(gtk.Widget).setVisible(@intFromBool(false));
+            return;
+        };
+
+        // Resolve the active worktree's status row for branch/repo labels.
+        var repo_name: []const u8 = "";
+        var branch: []const u8 = "";
+        for (priv.sidebar_statuses) |*st| {
+            if (std.mem.eql(u8, st.path, active_path)) {
+                repo_name = st.repo_name;
+                branch = st.branch;
+                break;
+            }
+        }
+        if (repo_name.len == 0 and branch.len == 0) {
+            priv.identity_chip.as(gtk.Widget).setVisible(@intFromBool(false));
+            return;
+        }
+
+        const alloc = Application.default().allocator();
+        if (alloc.dupeZ(u8, branch)) |z| {
+            defer alloc.free(z);
+            priv.identity_branch.setText(z.ptr);
+        } else |_| {}
+        if (alloc.dupeZ(u8, repo_name)) |z| {
+            defer alloc.free(z);
+            priv.identity_repo.setText(z.ptr);
+            // Seed the avatar initials from the repo name.
+            priv.identity_avatar.setText(z.ptr);
+        } else |_| {}
+
+        priv.identity_chip.as(gtk.Widget).setVisible(@intFromBool(true));
+    }
+
     /// Find the TabView that owns `tab` (its nearest Adw.TabView ancestor),
     /// across all per-worktree views. Falls back to the active view.
     fn viewForTab(self: *Self, tab: *Tab) *adw.TabView {
@@ -1144,6 +1191,8 @@ pub const Window = extern struct {
         self.refreshActiveTabBinding();
         // Re-pin the sidebar "Active" card to the newly focused worktree (#9).
         self.rebuildSidebarRows();
+        // Update the title-bar identity chip for the newly focused worktree (#10).
+        self.updateIdentityChip();
     }
 
     /// Sync the tab binding group (title/subtitle/etc.) from the active view's
@@ -1468,21 +1517,6 @@ pub const Window = extern struct {
         });
     }
 
-    fn closureSubtitle(
-        _: *Self,
-        config_: ?*Config,
-        pwd_: ?[*:0]const u8,
-    ) callconv(.c) ?[*:0]const u8 {
-        const config = if (config_) |v| v.get() else return null;
-        return switch (config.@"window-subtitle") {
-            .false => null,
-            .@"working-directory" => pwd: {
-                const pwd = pwd_ orelse return null;
-                break :pwd glib.ext.dupeZ(u8, std.mem.span(pwd));
-            },
-        };
-    }
-
     //---------------------------------------------------------------
     // Virtual methods
 
@@ -1661,6 +1695,8 @@ pub const Window = extern struct {
         priv.sidebar_statuses = statuses;
 
         self.rebuildSidebarRows();
+        // Refresh the identity chip now that branch/repo labels are available (#10).
+        self.updateIdentityChip();
     }
 
     /// Rebuild the ListBox rows from `sidebar_statuses`, grouping worktrees
@@ -3167,6 +3203,10 @@ pub const Window = extern struct {
             class.bindTemplateChildPrivate("split_view", .{});
             class.bindTemplateChildPrivate("sidebar_list", .{});
             class.bindTemplateChildPrivate("agent_banner", .{});
+            class.bindTemplateChildPrivate("identity_chip", .{});
+            class.bindTemplateChildPrivate("identity_avatar", .{});
+            class.bindTemplateChildPrivate("identity_branch", .{});
+            class.bindTemplateChildPrivate("identity_repo", .{});
 
             // Template Callbacks
             class.bindTemplateCallback("realize", &windowRealize);
@@ -3190,7 +3230,6 @@ pub const Window = extern struct {
             class.bindTemplateCallback("notify_quick_terminal", &propQuickTerminal);
             class.bindTemplateCallback("notify_scale_factor", &propScaleFactor);
             class.bindTemplateCallback("titlebar_style_is_tabs", &closureTitlebarStyleIsTab);
-            class.bindTemplateCallback("computed_subtitle", &closureSubtitle);
 
             // Virtual methods
             gobject.Object.virtual_methods.dispose.implement(class, &dispose);

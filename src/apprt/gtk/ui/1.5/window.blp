@@ -66,15 +66,44 @@ template $GhosttyWindow: Adw.ApplicationWindow {
       Adw.HeaderBar {
         visible: bind template.headerbar-visible;
 
-        title-widget: Adw.WindowTitle {
-          title: bind template.title;
-          // Blueprint auto-formatter won't let me split this into multiple
-          // lines. Let me explain myself. All parameters to a closure are used
-          // as notifications to recompute the value of the closure. All
-          // elements of a property chain are also subscribed to for changes.
-          // This one long, ugly line saves us from manually building up this
-          // massive notify chain in code.
-          subtitle: bind $computed_subtitle(template.config, tab_view.selected-page.child as <$GhosttyTab>.active-surface as <$GhosttySurface>.pwd) as <string>;
+        // Supacode (#10): repo + user identity chip in the title bar — a
+        // square account avatar plus a two-line block (branch bold over repo
+        // name), matching m5/supa tabs.png annotation #3. Updated from Zig as
+        // the active worktree changes; hidden when no worktree is active.
+        title-widget: Gtk.Box identity_chip {
+          orientation: horizontal;
+          spacing: 8;
+          halign: center;
+          valign: center;
+
+          Adw.Avatar identity_avatar {
+            size: 26;
+            show-initials: true;
+            valign: center;
+          }
+
+          Gtk.Box {
+            orientation: vertical;
+            valign: center;
+            spacing: 0;
+
+            Gtk.Label identity_branch {
+              xalign: 0;
+              ellipsize: end;
+              styles [
+                "heading",
+              ]
+            }
+
+            Gtk.Label identity_repo {
+              xalign: 0;
+              ellipsize: end;
+              styles [
+                "caption",
+                "dim-label",
+              ]
+            }
+          }
         };
 
         [start]
