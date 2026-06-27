@@ -27,8 +27,8 @@
 > worktree sidebar and AI coding-agent integration to the GTK (Linux) app.
 > It is inspired by [supacode](https://github.com/supabitapp/supacode), bringing
 > its agent-presence experience to Linux. See [SETUP.md](SETUP.md) for build and
-> run instructions, and [HANDOFF.md](HANDOFF.md) for design notes. The rest of
-> this README is the upstream Ghostty documentation.
+> run instructions. The rest of this README is the upstream Ghostty
+> documentation.
 
 ## About
 
