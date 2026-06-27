@@ -183,16 +183,6 @@ label.resize-overlay {
 }
 
 /*
- * Supacode: pinned "Active" session card in the sidebar (#9). A subtle
- * lighter-than-sidebar fill so the card reads as selected/highlighted,
- * matching the macOS reference.
- */
-.sidebar-active-card {
-  background-color: alpha(currentColor, 0.08);
-  border-radius: 6px;
-}
-
-/*
  * Supacode: notification bell unread tint (#11). When unread notifications
  * are present the bell is tinted amber to draw the eye, matching the macOS
  * bell.badge.fill orange treatment.

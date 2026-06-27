@@ -224,18 +224,14 @@ pub const Window = extern struct {
         /// rows, or is the index of the repo's FIRST worktree for header rows
         /// (used to read repo_root/repo_name for collapse toggling).
         pub const SidebarRowRef = struct {
-            kind: enum { active_header, active_card, repo_header, worktree },
+            kind: enum { repo_header, worktree },
             index: usize,
         };
 
-        /// Supacode (#22): an agent recorded on a surface, plus the worktree
-        /// path that owned the surface at attach time (or null for the default
-        /// space / menu tabs). The path is captured while the surface is live
-        /// so teardown never walks a half-destroyed ancestry.
+        /// Supacode (#22): an agent recorded on a surface. Drives the per-tab
+        /// agent indicator icon and (via OSC-3008 events) its activity state.
         pub const AgentEntry = struct {
             agent: agentpkg.Agent,
-            /// Owned NUL-terminated worktree path, or null for the default space.
-            path: ?[:0]u8,
             /// The agent's current activity, set by OSC-3008 busy/idle/
             /// awaiting_input events. Mirrors AgentPresenceFeature.Activity:
             /// busy = working, idle = waiting, awaiting_input = needs the user.
@@ -247,14 +243,6 @@ pub const Window = extern struct {
             /// crashed local agent that never sent session_end is cleaned up.
             /// Mirrors AgentPresenceFeature.PresenceRecord.pids + livenessSweep.
             pid: ?std.posix.pid_t = null,
-        };
-
-        /// Supacode (#22): aggregate agent presence for one worktree path.
-        pub const WorktreeAgents = struct {
-            /// Number of live agent surfaces under this worktree.
-            count: u32 = 0,
-            /// A representative agent for the Active card icon.
-            agent: agentpkg.Agent,
         };
 
         /// Supacode (#11): one entry in the notification bell history. Owns its
@@ -352,13 +340,6 @@ pub const Window = extern struct {
         /// walk a half-destroyed widget ancestry (#22 / trio CRITICAL). Keyed
         /// by surface pointer so two tabs sharing a worktree don't collide.
         surface_agents: std.AutoHashMapUnmanaged(*Surface, AgentEntry) = .empty,
-
-        /// Supacode (#22): per-worktree-path agent count + a representative
-        /// agent for the "Active" card icon. Maintained incrementally as agents
-        /// attach/detach (when surfaces are live), so `rebuildSidebarRows` is
-        /// an O(1) lookup per worktree and never touches widget ancestry. Keys
-        /// are owned (duped path); an entry exists iff its count > 0.
-        worktree_agents: std.StringHashMapUnmanaged(WorktreeAgents) = .empty,
 
         /// The surface the agent attention banner currently points at, so the
         /// banner's "Open" button can teleport focus there (trio: close the
@@ -1118,70 +1099,6 @@ pub const Window = extern struct {
         return path;
     }
 
-    /// Whether worktree `path` has ≥1 running agent (#22). O(1) lookup into
-    /// the incrementally-maintained `worktree_agents` map — never walks widget
-    /// ancestry, so it's safe to call during teardown.
-    fn worktreeHasAgent(self: *Self, path: []const u8) bool {
-        return self.private().worktree_agents.contains(path);
-    }
-
-    /// A representative agent for worktree `path`'s Active card icon (#22), or
-    /// null when the worktree has no agent.
-    fn agentForWorktreePath(self: *Self, path: []const u8) ?agentpkg.Agent {
-        const wa = self.private().worktree_agents.get(path) orelse return null;
-        return wa.agent;
-    }
-
-    /// Increment the per-worktree agent count for `path` (#22), recording
-    /// `agent` as the representative for the Active card icon. Owns a duped
-    /// copy of `path` on first insert. Called when an agent attaches while the
-    /// surface is live, so no ancestry walk is needed later.
-    fn incrWorktreeAgent(self: *Self, path: []const u8, agent: agentpkg.Agent) void {
-        const priv = self.private();
-        const alloc = Application.default().allocator();
-        const gop = priv.worktree_agents.getOrPut(alloc, path) catch return;
-        if (!gop.found_existing) {
-            const key = alloc.dupe(u8, path) catch {
-                _ = priv.worktree_agents.remove(path);
-                return;
-            };
-            gop.key_ptr.* = key;
-            gop.value_ptr.* = .{ .count = 1, .agent = agent };
-        } else {
-            gop.value_ptr.count += 1;
-            gop.value_ptr.agent = agent;
-        }
-    }
-
-    /// Decrement the per-worktree agent count for `path` (#22). Frees the
-    /// owned key and drops the entry when the count reaches zero, so the
-    /// worktree leaves "Active". When agents remain, re-elect a representative
-    /// agent for the Active card icon from a still-attached surface so the
-    /// card never keeps showing a just-detached agent's icon. (The detaching
-    /// surface is already removed from `surface_agents` by the time this runs,
-    /// so it can't re-elect itself.)
-    fn decrWorktreeAgent(self: *Self, path: []const u8) void {
-        const priv = self.private();
-        const alloc = Application.default().allocator();
-        const entry = priv.worktree_agents.getEntry(path) orelse return;
-        if (entry.value_ptr.count > 1) {
-            entry.value_ptr.count -= 1;
-            var it = priv.surface_agents.valueIterator();
-            while (it.next()) |e| {
-                if (e.path) |p| {
-                    if (std.mem.eql(u8, p, path)) {
-                        entry.value_ptr.agent = e.agent;
-                        break;
-                    }
-                }
-            }
-            return;
-        }
-        const key = entry.key_ptr.*;
-        _ = priv.worktree_agents.remove(path);
-        alloc.free(key);
-    }
-
     /// Update the title-bar identity chip (#10): avatar initials + branch
     /// (bold) over repo name, sourced from the active worktree. The chip is
     /// hidden when no specific worktree space is active (default/menu tabs).
@@ -1725,22 +1642,8 @@ pub const Window = extern struct {
         }
         priv.sidebar_rows.deinit(alloc);
         priv.sidebar_rows = .empty;
-        {
-            // Free cached worktree paths on each agent entry, then the map.
-            var it = priv.surface_agents.valueIterator();
-            while (it.next()) |e| {
-                if (e.path) |p| alloc.free(p);
-            }
-            priv.surface_agents.deinit(alloc);
-            priv.surface_agents = .empty;
-        }
-        {
-            // Free owned worktree-agent count keys (#22).
-            var it = priv.worktree_agents.keyIterator();
-            while (it.next()) |k| alloc.free(k.*);
-            priv.worktree_agents.deinit(alloc);
-            priv.worktree_agents = .empty;
-        }
+        priv.surface_agents.deinit(alloc);
+        priv.surface_agents = .empty;
 
         // Supacode (#11): free notification history.
         for (priv.notifications.items) |*n| n.deinit(alloc);
@@ -2034,33 +1937,6 @@ pub const Window = extern struct {
         priv.sidebar_rows.clearRetainingCapacity();
         priv.sidebar_list.removeAll();
 
-        // Supacode: pinned "Active" section at the very top. Per #22 this
-        // lists EVERY worktree that has ≥1 running agent (each as its own
-        // card), not just the focused one (#9). The focused worktree is also
-        // included even with no agent so the user always sees where they are.
-        // The set comes from the incrementally-maintained `worktree_agents`
-        // count via `worktreeHasAgent` — an O(1) lookup that never walks widget
-        // ancestry, so it's safe during teardown.
-        {
-            const active_path = self.activeWorktreePath();
-            var shown_header = false;
-            for (statuses, 0..) |*st, idx| {
-                const is_focused = if (active_path) |ap| std.mem.eql(u8, st.path, ap) else false;
-                if (!is_focused and !self.worktreeHasAgent(st.path)) continue;
-
-                if (!shown_header) {
-                    const hdr = buildActiveHeaderRow();
-                    priv.sidebar_list.append(hdr.as(gtk.Widget));
-                    priv.sidebar_rows.append(alloc, .{ .kind = .active_header, .index = idx }) catch {};
-                    shown_header = true;
-                }
-
-                const card = self.buildActiveCardRow(st);
-                priv.sidebar_list.append(card.as(gtk.Widget));
-                priv.sidebar_rows.append(alloc, .{ .kind = .active_card, .index = idx }) catch {};
-            }
-        }
-
         var i: usize = 0;
         while (i < statuses.len) {
             // Find the contiguous run of worktrees belonging to this repo.
@@ -2087,101 +1963,6 @@ pub const Window = extern struct {
 
             i = j;
         }
-    }
-
-    /// Build the "Active" section header row: small muted caps label with a
-    /// blue presence dot, matching macOS annotation #2.
-    fn buildActiveHeaderRow() *gtk.ListBoxRow {
-        const row = gtk.ListBoxRow.new();
-        row.setSelectable(@intFromBool(false));
-        row.setActivatable(@intFromBool(false));
-
-        const box = gtk.Box.new(.horizontal, 6);
-        box.as(gtk.Widget).setMarginStart(10);
-        box.as(gtk.Widget).setMarginEnd(8);
-        box.as(gtk.Widget).setMarginTop(6);
-        box.as(gtk.Widget).setMarginBottom(2);
-
-        const label = gtk.Label.new(null);
-        label.setMarkup("<small><span foreground='#888'>ACTIVE</span></small> <span foreground='#61afef'>\u{25CF}</span>");
-        label.setXalign(0);
-        box.append(label.as(gtk.Widget));
-
-        row.setChild(box.as(gtk.Widget));
-        return row;
-    }
-
-    /// Build the pinned "Active" session card: branch icon + branch name, a
-    /// repo · worktree subtitle, and the active agent icon pinned top-right.
-    fn buildActiveCardRow(self: *Window, st: *const sidebar.WorktreeStatus) *gtk.ListBoxRow {
-        const alloc = Application.default().allocator();
-        const row = gtk.ListBoxRow.new();
-        // Distinct highlight so the card reads as selected, macOS-style.
-        row.as(gtk.Widget).addCssClass("sidebar-active-card");
-
-        const box = gtk.Box.new(.horizontal, 8);
-        box.as(gtk.Widget).setMarginStart(10);
-        box.as(gtk.Widget).setMarginEnd(8);
-        box.as(gtk.Widget).setMarginTop(4);
-        box.as(gtk.Widget).setMarginBottom(6);
-
-        const branch_z = alloc.dupeZ(u8, st.branch) catch return row;
-        defer alloc.free(branch_z);
-        const branch_esc = glib.markupEscapeText(branch_z.ptr, -1);
-        defer glib.free(branch_esc);
-        const repo_z = alloc.dupeZ(u8, st.repo_name) catch return row;
-        defer alloc.free(repo_z);
-        const repo_esc = glib.markupEscapeText(repo_z.ptr, -1);
-        defer glib.free(repo_esc);
-
-        // Two-line text block (left, expanding): branch (bold) then a muted
-        // "repo · worktree" subtitle.
-        const text_box = gtk.Box.new(.vertical, 1);
-        text_box.as(gtk.Widget).setHexpand(@intFromBool(true));
-
-        const title_markup = std.fmt.allocPrintSentinel(
-            alloc,
-            "<span foreground='#888'>\u{2387}</span> <b><span foreground='#eee'>{s}</span></b>",
-            .{branch_esc},
-            0,
-        ) catch return row;
-        defer alloc.free(title_markup);
-        const title = gtk.Label.new(null);
-        title.setMarkup(title_markup.ptr);
-        title.setXalign(0);
-        title.setEllipsize(.end);
-        text_box.append(title.as(gtk.Widget));
-
-        const subtitle_markup = std.fmt.allocPrintSentinel(
-            alloc,
-            "<small><span foreground='#999'>{s}</span> <span foreground='#666'>\u{00B7}</span> <span foreground='#e5c07b'>Default</span></small>",
-            .{repo_esc},
-            0,
-        ) catch return row;
-        defer alloc.free(subtitle_markup);
-        const subtitle = gtk.Label.new(null);
-        subtitle.setMarkup(subtitle_markup.ptr);
-        subtitle.setXalign(0);
-        subtitle.setEllipsize(.end);
-        text_box.append(subtitle.as(gtk.Widget));
-
-        box.append(text_box.as(gtk.Widget));
-
-        // Agent icon (right): this worktree's own agent, if any (#22). Keyed
-        // by the card's worktree path so each Active card shows its own agent,
-        // not just the focused surface's.
-        if (self.agentForWorktreePath(st.path)) |agent| {
-            if (agent.newIcon()) |icon| {
-                defer icon.unref();
-                const img = gtk.Image.newFromGicon(icon);
-                img.as(gtk.Widget).setValign(.start);
-                img.as(gtk.Widget).setTooltipText(agent.label().ptr);
-                box.append(img.as(gtk.Widget));
-            }
-        }
-
-        row.setChild(box.as(gtk.Widget));
-        return row;
     }
 
     /// Build a collapsible repo header row. Aggregates the group's diff state
@@ -2417,12 +2198,6 @@ pub const Window = extern struct {
 
         const row_ref = priv.sidebar_rows.items[ri];
         switch (row_ref.kind) {
-            // The "Active" header is non-activatable; ignore defensively.
-            .active_header => {},
-            .active_card => {
-                if (row_ref.index >= priv.sidebar_statuses.len) return;
-                self.openWorktree(&priv.sidebar_statuses[row_ref.index]);
-            },
             .repo_header => {
                 if (row_ref.index >= priv.sidebar_statuses.len) return;
                 self.toggleRepoCollapsed(priv.sidebar_statuses[row_ref.index].repo_root);
@@ -2528,56 +2303,26 @@ pub const Window = extern struct {
         const alloc = Application.default().allocator();
 
         if (agent) |a| {
-            // Resolve the owning worktree path NOW, while the surface is live,
-            // and cache it on the entry. Teardown paths then decrement the
-            // per-worktree count without walking a half-destroyed ancestry.
-            const path: ?[:0]u8 = if (self.worktreePathForSurface(surface)) |wp|
-                (alloc.dupeZ(u8, wp) catch null)
-            else
-                null;
-            const gop = priv.surface_agents.getOrPut(alloc, surface) catch {
-                if (path) |p| alloc.free(p);
-                return;
-            };
-            if (gop.found_existing) {
-                // Re-attach on the same surface: drop the previous worktree
-                // count + path before recording the new one.
-                if (gop.value_ptr.path) |old| {
-                    self.decrWorktreeAgent(old);
-                    alloc.free(old);
-                }
-            }
+            const gop = priv.surface_agents.getOrPut(alloc, surface) catch return;
             gop.value_ptr.* = .{
                 .agent = a,
-                .path = path,
                 // Preserve activity + pid across a re-attach on the same surface.
                 .activity = if (gop.found_existing) gop.value_ptr.activity else .idle,
                 .pid = if (gop.found_existing) gop.value_ptr.pid else null,
             };
-            if (path) |p| self.incrWorktreeAgent(p, a);
         } else {
             _ = self.removeSurfaceAgent(surface);
         }
 
         self.refreshTabAgentIcon(surface);
-        // Refresh the sidebar so the Active section tracks agent attach/detach.
-        self.rebuildSidebarRows();
     }
 
-    /// Remove a surface's agent entry, decrementing its worktree count and
-    /// freeing the cached path. Returns true if an entry was present. The
-    /// single chokepoint for agent removal so the per-worktree count (#22) and
-    /// the owned path are always kept consistent. Does NOT rebuild the sidebar;
-    /// callers batch that.
+    /// Remove a surface's agent entry. Returns true if an entry was present.
+    /// The single chokepoint for agent removal. Does NOT refresh the tab icon;
+    /// callers do that.
     fn removeSurfaceAgent(self: *Window, surface: *Surface) bool {
         const priv = self.private();
-        const alloc = Application.default().allocator();
-        const kv = priv.surface_agents.fetchRemove(surface) orelse return false;
-        if (kv.value.path) |p| {
-            self.decrWorktreeAgent(p);
-            alloc.free(p);
-        }
-        return true;
+        return priv.surface_agents.remove(surface);
     }
 
     /// Clear any agent presence recorded for a surface. Called on surface
@@ -2586,7 +2331,6 @@ pub const Window = extern struct {
     pub fn clearSurfaceAgent(self: *Window, surface: *Surface) void {
         if (self.removeSurfaceAgent(surface)) {
             self.refreshTabAgentIcon(surface);
-            self.rebuildSidebarRows();
         }
     }
 
