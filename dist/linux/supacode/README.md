@@ -2,95 +2,103 @@
 
 supacode-linux shows, per terminal surface:
 
-- an **agent icon** on the tab (which coding agent is running there), and
-- **attention** signals (a top banner + desktop notification + a bell in the
-  worktree sidebar) when an agent finishes a turn and is waiting on you.
+- which **coding agent** is running there (a tab icon + sidebar "Active"
+  membership),
+- whether it is **working** (busy) or **waiting** (idle), and
+- when it **needs you** (a top banner + desktop notification + a sidebar bell).
 
 On macOS, supacode injects a Unix-domain socket and a set of `SUPACODE_*` env
 vars into every managed terminal, and each agent's hook posts JSON to the
-socket. On Linux we use a simpler, transport-free mechanism: **OSC-3008**
-(Hierarchical Context Signalling). The agent writes an escape sequence to its
-controlling terminal; the emulator already routes it to the exact surface the
-agent is running in, so there is no socket, no env injection, and no
-PID→surface mapping to maintain.
+socket. On Linux we carry the same information over **OSC-3008** (Hierarchical
+Context Signalling): the agent writes an escape sequence to its controlling
+terminal and the emulator routes it to the exact surface the agent runs in — no
+socket, no PID→surface mapping. The wire format and event vocabulary match the
+macOS source (`SupacodeSettingsShared/BusinessLogic/AgentPresenceOSC.swift`) so
+the same hooks are compatible with both apps.
+
+## How it just works
+
+supacode-linux **auto-installs agent hooks on first launch** (toggle in
+`~/.supacode/hooks.json`, `"enabled": true` by default). For every supported
+agent it writes a `# supacode-managed-hook` guarded block into the agent's
+native config:
+
+| agent     | config file                                          |
+|-----------|------------------------------------------------------|
+| Claude    | `~/.claude/settings.json` (`hooks`)                  |
+| Codex     | `~/.codex/hooks.json`                                |
+| Kiro      | `~/.kiro/agents/kiro_default.json` (`hooks`)         |
+| Copilot   | `~/.copilot/hooks/supacode.json`                     |
+| OpenCode  | `~/.config/opencode/plugins/supacode-presence.js`   |
+| Pi        | `~/.pi/agent/extensions/supacode/index.ts`          |
+
+Each block is guarded on `[ -n "${SUPACODE_SURFACE_ID:-}" ]` (an env var
+supacode-linux injects into every surface), so it is **inert outside a Supacode
+surface** — safe to leave installed anywhere. Install/uninstall are idempotent
+and key ONLY off the `# supacode-managed-hook` sentinel, so user-authored hooks
+in the same file are never touched.
+
+To turn it off: set `"enabled": false` in `~/.supacode/hooks.json` (the app
+will uninstall the managed blocks on the next toggle).
 
 ## The protocol
 
-Two sequences, written to the tty (`ESC` = `\033`, `BEL` = `\007`):
+The hook resolves the agent's controlling tty (`ps -o tty= -p $PPID`) and writes
+one OSC-3008 sequence per lifecycle event (`ESC` = `\033`, `ST` = `\033\`):
 
 ```
-# Presence / attention start:
-ESC ] 3008 ; start=<id> ; agent=<name> [ ; attention=1 ] [ ; comm=<detail> ] BEL
-
-# Clear:
-ESC ] 3008 ; end=<id> BEL
+ESC ] 3008 ; <action>=<agent> ; event=<event> [ ; pid=<pid> ] ST
 ```
 
-Fields (all after the context id are optional `key=value`, `;`-separated):
+- `<action>` is `start` for every event except `session_end` (which uses
+  `end`). The app keys off `event=`, not the action byte.
+- `<agent>` is the agent name (the OSC context id): `claude`, `codex`, `kiro`,
+  `copilot`, `opencode`, `pi`.
+- `event` ∈ `session_start | session_end | busy | awaiting_input | idle`:
+  - `session_start` / `session_end` → presence on/off (tab icon + Active),
+  - `busy` / `idle` → working vs waiting,
+  - `awaiting_input` → needs-you (banner + bell).
+- `pid` is the agent's local process id (gated on `SUPACODE_SOCKET_PATH`, which
+  supacode-linux also injects); it feeds the liveness sweep that reaps a crashed
+  local agent. Omitted over SSH.
 
-| field       | meaning                                                             |
-|-------------|---------------------------------------------------------------------|
-| `agent`     | agent name. Recognized: `claude`/`claude-code`, `codex`, `pi`, `kiro`. Anything else → a generic agent icon. |
-| `attention` | `1`/`true` → raise the top banner + notification + sidebar bell. Omit for presence-only (just the tab icon). |
-| `comm`      | short free-text detail shown in the banner (e.g. the last assistant message). |
+The rich-notification leg (the last assistant message) is a second shape:
 
-`<id>` is any 1–64 char ASCII string; use a stable per-process id so `start`
-and `end` pair up.
+```
+ESC ] 3008 ; start=<agent> ; kind=notify ; title=<base64> ; body=<base64> ST
+```
 
-**Presence vs attention are distinct on purpose.** A bare `start` with an
-`agent` field only sets the tab icon (long-lived). `attention=1` is the
-momentary "I need you" signal. Clearing attention must never drop the icon, so
-they are separate — only `end` (or surface teardown) removes the icon.
+## Manual install / test
 
-## Quick test
+`supacode-signal` is a small helper that emits the sequences by hand (writes to
+`/dev/tty`, so it works even when stdout is redirected):
 
 ```bash
-# Light up the current tab with the Claude icon:
-dist/linux/supacode/supacode-signal start --agent claude
+# Presence on (tab icon appears):
+SUPACODE_SURFACE_ID=test dist/linux/supacode/supacode-signal session_start --agent claude
 
-# Ask for attention with a message (banner + notification + bell):
-dist/linux/supacode/supacode-signal start --agent claude --attention "review the failing test"
+# Working / waiting:
+SUPACODE_SURFACE_ID=test dist/linux/supacode/supacode-signal busy --agent claude
+SUPACODE_SURFACE_ID=test dist/linux/supacode/supacode-signal idle --agent claude
 
-# Clear it:
-dist/linux/supacode/supacode-signal end
+# Needs you:
+SUPACODE_SURFACE_ID=test dist/linux/supacode/supacode-signal awaiting_input --agent claude
+
+# Presence off:
+SUPACODE_SURFACE_ID=test dist/linux/supacode/supacode-signal session_end --agent claude
 ```
-
-`supacode-signal` writes to `/dev/tty`, so it works even when stdout is
-redirected. Install it on `$PATH` for use from agent hooks.
-
-## Wiring real agents
-
-### Pi
-
-Copy `pi-extension/index.ts` to `~/.pi/agent/extensions/supacode/index.ts`.
-It announces presence on load, refreshes it per turn, raises attention on
-`agent_end` (carrying the last assistant message), and clears on shutdown/exit.
-
-### Claude Code
-
-Add hooks to `~/.claude/settings.json` that shell out to `supacode-signal`:
-
-```json
-{
-  "hooks": {
-    "SessionStart": [{ "hooks": [{ "type": "command", "command": "supacode-signal start --agent claude" }] }],
-    "Stop":         [{ "hooks": [{ "type": "command", "command": "supacode-signal start --agent claude --attention" }] }],
-    "SessionEnd":   [{ "hooks": [{ "type": "command", "command": "supacode-signal end" }] }]
-  }
-}
-```
-
-### Codex
-
-In `~/.codex/config.toml` enable hooks (`codex_hooks = true`) and point the
-session lifecycle hooks at `supacode-signal start --agent codex` /
-`--attention` / `end`, mirroring the Claude wiring above.
 
 ## Implementation pointers (in this repo)
 
-- `src/terminal/osc/parsers/context_signal.zig` — OSC-3008 parser.
+- `src/terminal/osc/parsers/context_signal.zig` — OSC-3008 parser + HookEvent.
+- `src/apprt/gtk/class/agent_hooks.zig` — the hook shell-command builder
+  (`compositeCommand` / `emitShell` / `emitNotifyShell` /
+  `tty_resolve_snippet`), a byte-for-byte port of macOS
+  `AgentHookSettingsCommand` + `AgentPresenceOSC`.
+- `src/apprt/gtk/class/agent_hook_installer.zig` — per-agent canonical hook
+  maps + idempotent install/uninstall + first-run reconcile.
 - `src/apprt/gtk/class/agent.zig` — agent name → embedded symbolic icon.
-- `src/apprt/gtk/class/application.zig` `contextSignal` — splits presence from
-  attention, drives icon + banner + notification + sidebar bell.
-- `src/apprt/gtk/class/window.zig` — `setSurfaceAgent`/`refreshTabAgentIcon`
-  (tab indicator) and `showAgentBanner` (top banner with teleport-on-open).
+- `src/apprt/gtk/class/application.zig` `contextSignal` — maps the event
+  vocabulary to presence / activity / attention.
+- `src/apprt/gtk/class/window.zig` — `setSurfaceAgent` / `setSurfaceActivity` /
+  `livenessSweep` (presence + liveness) and `showAgentBanner` (top banner).

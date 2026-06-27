@@ -37,6 +37,7 @@ const Config = @import("config.zig").Config;
 const Surface = @import("surface.zig").Surface;
 const SplitTree = @import("split_tree.zig").SplitTree;
 const agentpkg = @import("agent.zig");
+const agent_hook_installer = @import("agent_hook_installer.zig");
 const context_signal = @import("../../../terminal/osc/parsers/context_signal.zig");
 const Window = @import("window.zig").Window;
 const Tab = @import("tab.zig").Tab;
@@ -1328,6 +1329,26 @@ pub const Application = extern struct {
         // modal (not to any specific window) because we don't even
         // know if the window will load.
         self.showConfigErrorsDialog();
+
+        // Supacode: reconcile agent-presence hooks on launch. Installs the
+        // `# supacode-managed-hook` blocks into each agent's native config so
+        // agents emit OSC-3008 presence to their tty. Idempotent + best-effort
+        // (never blocks startup); gated on a settings toggle (default on).
+        // Runs on a detached thread so filesystem I/O never stalls the UI.
+        self.startupAgentHooks();
+    }
+
+    /// Spawn a detached thread that reconciles the agent-presence hook install.
+    /// Best-effort: a spawn failure just skips the install for this launch. The
+    /// installer uses a process-global allocator internally, so the detached
+    /// thread is safe even if the app shuts down before it finishes.
+    fn startupAgentHooks(self: *Self) void {
+        _ = self;
+        const thread = std.Thread.spawn(.{}, agent_hook_installer.reconcileOnLaunch, .{}) catch |err| {
+            log.warn("supacode: failed to spawn agent-hook installer thread: {}", .{err});
+            return;
+        };
+        thread.detach();
     }
 
     /// Configure libxev to use a specific backend.
@@ -3397,4 +3418,9 @@ fn findActiveWindow(data: ?*const anyopaque, _: ?*const anyopaque) callconv(.c) 
     // but we want to return 0 to indicate equality.
     // Abusing integers to be enums and booleans is a terrible idea, C.
     return if (window.isActive() != 0) 0 else -1;
+}
+
+test {
+    @import("std").testing.refAllDecls(@import("agent_hook_installer.zig"));
+    @import("std").testing.refAllDecls(@import("agent_hooks.zig"));
 }
