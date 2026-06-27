@@ -1,7 +1,7 @@
 # supacode-linux ↔ macOS supacode source parity (issue #25)
 
 Comparison of the merged Linux agent-presence implementation against the
-authoritative macOS source (`/home/nvidia/git/supacode/`, supabitapp/supacode
+authoritative macOS source (the supabitapp/supacode
 v0.10.4). For each dimension: **MATCHES** / **DIFFERS(why)** vs the cited macOS
 file:line.
 

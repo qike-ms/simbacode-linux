@@ -21,6 +21,15 @@
   </p>
 </p>
 
+> [!NOTE]
+>
+> **supacode-linux** is a fork of [Ghostty](https://ghostty.org) that adds a
+> worktree sidebar and AI coding-agent integration to the GTK (Linux) app.
+> It is inspired by [supacode](https://github.com/supabitapp/supacode), bringing
+> its agent-presence experience to Linux. See [SETUP.md](SETUP.md) for build and
+> run instructions, and [HANDOFF.md](HANDOFF.md) for design notes. The rest of
+> this README is the upstream Ghostty documentation.
+
 ## About
 
 Ghostty is a terminal emulator that differentiates itself by being
