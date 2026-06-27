@@ -990,6 +990,21 @@ const Subprocess = struct {
             }
         } else null;
 
+        // Supacode: inject the slave pty device path as SUPACODE_TTY so agent
+        // presence hooks have a bulletproof, always-correct target for their
+        // OSC-3008 emits (the `ps -o tty=` heuristic fails for agents that run
+        // hooks with no controlling terminal). The pty is now open, so its
+        // slave name is known; the env is still alive (consumed at exec).
+        if (comptime builtin.os.tag != .windows) {
+            if (self.env) |*env| {
+                if (env.get("SUPACODE_SURFACE_ID") != null) {
+                    if (pty.getProcessInfo(.tty_name)) |tty| {
+                        env.put("SUPACODE_TTY", tty) catch {};
+                    }
+                }
+            }
+        }
+
         // In flatpak, we use the HostCommand to execute our shell.
         if (internal_os.isFlatpak()) flatpak: {
             if (comptime !build_config.flatpak) {

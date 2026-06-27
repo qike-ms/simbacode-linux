@@ -34,6 +34,7 @@ pub const Agent = enum {
     codex,
     pi,
     kiro,
+    hermes,
     generic,
 
     /// Parse an agent name (case-insensitive, tolerant of common aliases) into
@@ -49,6 +50,7 @@ pub const Agent = enum {
         if (contains(lower, "claude")) return .claude;
         if (contains(lower, "codex")) return .codex;
         if (contains(lower, "kiro")) return .kiro;
+        if (contains(lower, "hermes")) return .hermes;
         // Match "pi" exactly or as a path component to avoid false positives
         // (e.g. "api"). Accept the standalone token only.
         if (std.mem.eql(u8, lower, "pi")) return .pi;
@@ -66,6 +68,7 @@ pub const Agent = enum {
             .codex => @embedFile("agent-icons/agent-codex-symbolic.svg"),
             .pi => @embedFile("agent-icons/agent-pi-symbolic.svg"),
             .kiro => @embedFile("agent-icons/agent-kiro-symbolic.svg"),
+            .hermes => @embedFile("agent-icons/agent-hermes-symbolic.svg"),
             .generic => @embedFile("agent-icons/agent-generic-symbolic.svg"),
         };
     }
@@ -77,6 +80,7 @@ pub const Agent = enum {
             .codex => "Codex",
             .pi => "Pi",
             .kiro => "Kiro",
+            .hermes => "Hermes",
             .generic => "Agent",
         };
     }
@@ -99,6 +103,7 @@ test "Agent.parse known agents" {
     try testing.expectEqual(Agent.claude, Agent.parse("Claude Code").?);
     try testing.expectEqual(Agent.codex, Agent.parse("codex").?);
     try testing.expectEqual(Agent.kiro, Agent.parse("kiro").?);
+    try testing.expectEqual(Agent.hermes, Agent.parse("hermes").?);
     try testing.expectEqual(Agent.pi, Agent.parse("pi").?);
     try testing.expectEqual(Agent.generic, Agent.parse("aider").?);
     try testing.expect(Agent.parse("") == null);

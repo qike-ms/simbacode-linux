@@ -2538,13 +2538,18 @@ const Action = struct {
 
         // Attention start: raise an in-app top banner + desktop notification
         // pointing at this surface. Presence-only starts do nothing further.
+        // Skip the banner + desktop toast when the user is already looking at
+        // this surface (#1) — only log it to the bell history.
         if (wants_attention) {
+            const foreground = if (window) |win| win.surfaceIsForeground(surface) else false;
             if (window) |win| {
                 const title = if (agent) |a| a.label() else "Agent";
-                win.showAgentBanner(surface, title, comm);
+                if (!foreground) win.showAgentBanner(surface, title, comm);
                 // Also log it to the persistent notification bell (#11).
                 win.pushNotification(surface, title, comm);
             }
+
+            if (foreground) return true;
 
             const notif = gio.Notification.new("Agent needs attention");
             defer notif.unref();
@@ -2647,12 +2652,15 @@ const Action = struct {
                 // which carries the actual message body. Mirrors the macOS
                 // split: awaiting_input is the activity/attention state, the
                 // notify leg is the toast (so they don't double up).
+                // Skip the banner when the user is already on this surface (#1).
                 if (window) |win| {
                     if (!win.surfaceHasAgent(surface)) win.setSurfaceAgent(surface, agent);
                     if (local_pid != null) win.setSurfaceAgentPid(surface, local_pid);
                     win.setSurfaceActivity(surface, .awaiting_input);
-                    if (surface.getPwd()) |spwd| win.setSurfaceAttention(surface, spwd, true);
-                    win.showAgentBanner(surface, agent.label(), "");
+                    if (!win.surfaceIsForeground(surface)) {
+                        if (surface.getPwd()) |spwd| win.setSurfaceAttention(surface, spwd, true);
+                        win.showAgentBanner(surface, agent.label(), "");
+                    }
                 }
             },
         }
@@ -2710,21 +2718,39 @@ const Action = struct {
         title: []const u8,
         detail: []const u8,
     ) void {
+        // If the user is already looking at this surface (its window is focused
+        // and its tab is the selected/foreground tab), the agent has the user's
+        // attention already — skip the intrusive banner + desktop notification.
+        // We still record the event to the sidebar bell history so there's a
+        // trace, but nothing pops up (#1).
+        const foreground = if (window) |win| win.surfaceIsForeground(surface) else false;
+
         if (window) |win| {
-            if (surface.getPwd()) |spwd| win.setSurfaceAttention(surface, spwd, true);
-            win.showAgentBanner(surface, title, detail);
+            if (!foreground) {
+                if (surface.getPwd()) |spwd| win.setSurfaceAttention(surface, spwd, true);
+                win.showAgentBanner(surface, title, detail);
+            }
             win.pushNotification(surface, title, detail);
         }
+
+        if (foreground) return;
 
         const notif = gio.Notification.new("Agent needs attention");
         defer notif.unref();
         const alloc = self.allocator();
-        // Use the decoded title for the desktop notification too.
+        // Desktop notification title: prefix the agent label with the repo/
+        // worktree context (#2), so the toast reads "<repo> \u00b7 <agent>".
+        var ctx_buf: [256]u8 = undefined;
+        const ctx: ?[]const u8 = if (window) |win| win.contextLabelForSurface(surface, &ctx_buf) else null;
         if (title.len > 0) {
-            if (alloc.dupeZ(u8, title)) |t| {
+            const composed: ?[:0]u8 = if (ctx) |c|
+                (std.fmt.allocPrintSentinel(alloc, "{s} \u{00b7} {s}", .{ c, title }, 0) catch null)
+            else
+                (alloc.dupeZ(u8, title) catch null);
+            if (composed) |t| {
                 defer alloc.free(t);
                 notif.setTitle(t.ptr);
-            } else |_| {}
+            }
         }
         if (detail.len > 0) {
             if (alloc.dupeZ(u8, detail)) |body| {

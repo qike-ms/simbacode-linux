@@ -130,6 +130,7 @@ pub fn installAll(alloc: Allocator) void {
     installOne(alloc, home, .copilot) catch |err| logErr(.copilot, "install", err);
     installOne(alloc, home, .opencode) catch |err| logErr(.opencode, "install", err);
     installOne(alloc, home, .pi) catch |err| logErr(.pi, "install", err);
+    installOne(alloc, home, .hermes) catch |err| logErr(.hermes, "install", err);
 }
 
 /// Uninstall the agent-presence hooks for every supported agent. Removes only
@@ -142,6 +143,7 @@ pub fn uninstallAll(alloc: Allocator) void {
     uninstallOne(alloc, home, .copilot) catch |err| logErr(.copilot, "uninstall", err);
     uninstallOne(alloc, home, .opencode) catch |err| logErr(.opencode, "uninstall", err);
     uninstallOne(alloc, home, .pi) catch |err| logErr(.pi, "uninstall", err);
+    uninstallOne(alloc, home, .hermes) catch |err| logErr(.hermes, "uninstall", err);
 }
 
 fn logErr(agent: Agent, op: []const u8, err: anyerror) void {
@@ -161,6 +163,7 @@ fn installOne(alloc: Allocator, home: []const u8, agent: Agent) !void {
         .copilot => try installOwnFile(alloc, home, ".copilot/hooks/supacode.json", try copilotFileSource(alloc), agent),
         .opencode => try installOwnFile(alloc, home, ".config/opencode/plugins/supacode-presence.js", try openCodePluginSource(alloc), agent),
         .pi => try installOwnFile(alloc, home, ".pi/agent/extensions/supacode/index.ts", try piExtensionSource(alloc), agent),
+        .hermes => try installHermes(alloc, home),
     }
 }
 
@@ -175,6 +178,7 @@ fn uninstallOne(alloc: Allocator, home: []const u8, agent: Agent) !void {
         .copilot => try uninstallOwnFile(alloc, home, ".copilot/hooks/supacode.json"),
         .opencode => try uninstallOwnFile(alloc, home, ".config/opencode/plugins/supacode-presence.js"),
         .pi => try uninstallOwnFile(alloc, home, ".pi/agent/extensions/supacode/index.ts"),
+        .hermes => try uninstallHermes(alloc, home),
     }
 }
 
@@ -221,6 +225,278 @@ fn writeFileAtomic(alloc: Allocator, path: []const u8, content: []const u8) !voi
         try file.writeAll(content);
     }
     try std.fs.cwd().rename(tmp, path);
+}
+
+/// Write `content` to `path` atomically and mark it executable (0o755). Used
+/// for the Hermes presence script, which Hermes runs as a subprocess.
+fn writeExecutableAtomic(alloc: Allocator, path: []const u8, content: []const u8) !void {
+    try ensureParentDir(path);
+    const tmp = try std.fmt.allocPrint(alloc, "{s}.supacode.tmp", .{path});
+    defer alloc.free(tmp);
+    {
+        const file = try std.fs.cwd().createFile(tmp, .{ .truncate = true, .mode = 0o755 });
+        defer file.close();
+        try file.writeAll(content);
+    }
+    try std.fs.cwd().rename(tmp, path);
+    // createFile's mode is masked by umask; force the exec bits explicitly.
+    if (std.fs.cwd().openFile(path, .{})) |f| {
+        defer f.close();
+        f.chmod(0o755) catch {};
+    } else |_| {}
+}
+
+// ===========================================================================
+// Hermes installer.
+//
+// Hermes (nous-research) reads shell hooks from `~/.hermes/config.yaml` under a
+// `hooks:` block and runs each `command` via `shlex.split` with shell=False
+// (so no inline pipeline) — we therefore ship a managed presence SCRIPT and
+// point the config at it. Each (event, command) pair needs a consent entry in
+// `~/.hermes/shell-hooks-allowlist.json` or it stays inert, so we add that too.
+//
+// Hermes events we map (see website/docs/user-guide/features/hooks.md):
+//   on_session_start -> session_start, pre_tool_call/pre_llm_call -> busy,
+//   post_tool_call -> idle, on_session_end -> session_end+idle.
+// The script reads `hook_event_name` from the stdin JSON to pick the OSC event,
+// and always prints `{}` so Hermes never treats it as a block/inject decision.
+// ===========================================================================
+
+const hermes_script_rel = ".hermes/agent-hooks/supacode-presence.sh";
+const hermes_config_rel = ".hermes/config.yaml";
+const hermes_allowlist_rel = ".hermes/shell-hooks-allowlist.json";
+
+/// Hermes hook events we register the presence script for. Each maps (in the
+/// script) to an OSC presence event by `hook_event_name`.
+const hermes_events = [_][]const u8{
+    "on_session_start",
+    "pre_tool_call",
+    "post_tool_call",
+    "on_session_end",
+};
+
+fn installHermes(alloc: Allocator, home: []const u8) !void {
+    // 1. The presence script (idempotent own-file, sentinel-guarded).
+    const script_path = try joinHome(alloc, home, hermes_script_rel);
+    defer alloc.free(script_path);
+    const script = try hermesScriptSource(alloc);
+    defer alloc.free(script);
+    if (try readFileAlloc(alloc, script_path)) |existing| {
+        defer alloc.free(existing);
+        if (std.mem.indexOf(u8, existing, hooks.ownership_marker) == null) {
+            log.warn("supacode: {s} exists but is not Supacode-managed; skipping hermes", .{hermes_script_rel});
+            return;
+        }
+    }
+    try writeExecutableAtomic(alloc, script_path, script);
+
+    // 2. The config.yaml `hooks:` block (only patch an empty `hooks: {}` or a
+    //    missing block; never touch a user-populated hooks map).
+    try patchHermesConfig(alloc, home, script_path, true);
+
+    // 3. The consent allowlist so the hooks are not silently skipped.
+    try patchHermesAllowlist(alloc, home, script_path, true);
+    log.info("supacode: installed hermes presence hooks", .{});
+}
+
+fn uninstallHermes(alloc: Allocator, home: []const u8) !void {
+    const script_path = try joinHome(alloc, home, hermes_script_rel);
+    defer alloc.free(script_path);
+    try patchHermesConfig(alloc, home, script_path, false);
+    try patchHermesAllowlist(alloc, home, script_path, false);
+    try uninstallOwnFile(alloc, home, hermes_script_rel);
+}
+
+/// The Hermes presence script: read the hook JSON on stdin, pick an OSC event
+/// from `hook_event_name`, resolve the tty, emit the OSC 3008 presence
+/// sequence, and print `{}`. Guarded on SUPACODE_SURFACE_ID so it is inert
+/// outside a Supacode surface. Caller owns the result.
+fn hermesScriptSource(alloc: Allocator) ![]u8 {
+    // Reuse the shared tty-resolve snippet so behavior matches every other
+    // agent's hook (SUPACODE_TTY -> /proc fd -> ps).
+    return std.fmt.allocPrint(alloc,
+        \\#!/bin/sh
+        \\# {s}
+        \\# Supacode agent-presence bridge for Hermes. Generated — do not edit.
+        \\__in=$(cat 2>/dev/null)
+        \\[ -n "${{SUPACODE_SURFACE_ID:-}}" ] || {{ printf '{{}}\n'; exit 0; }}
+        \\__ev=$(printf '%s' "$__in" | sed -n 's/.*"hook_event_name"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | head -n1)
+        \\case "$__ev" in
+        \\  on_session_start) __osc=session_start; __act=start;;
+        \\  pre_tool_call|pre_llm_call) __osc=busy; __act=start;;
+        \\  post_tool_call) __osc=idle; __act=start;;
+        \\  on_session_end|on_session_finalize) __osc=session_end; __act=end;;
+        \\  *) printf '{{}}\n'; exit 0;;
+        \\esac
+        \\{{ {s}; __sp=""; [ -n "${{SUPACODE_SOCKET_PATH:-}}" ] && __sp=";pid=$PPID"; printf '\033]3008;%s=hermes;event=%s%s\033\\' "$__act" "$__osc" "$__sp" > "$__tty"; }} >/dev/null 2>&1 || true
+        \\printf '{{}}\n'
+        \\
+    , .{ hooks.ownership_marker, hooks.tty_resolve_snippet });
+}
+
+/// Patch the Hermes `hooks:` block in config.yaml. To avoid corrupting a
+/// hand-written YAML map we ONLY touch the safe cases: a literal `hooks: {}`
+/// (empty map) or no `hooks:` key at all. A user-populated `hooks:` block is
+/// left untouched (logged), so we never clobber existing hooks. On uninstall we
+/// restore `hooks: {}` only when the current block is the one we wrote (keyed
+/// by the managed script path).
+fn patchHermesConfig(alloc: Allocator, home: []const u8, script_path: []const u8, enable: bool) !void {
+    const path = try joinHome(alloc, home, hermes_config_rel);
+    defer alloc.free(path);
+    const original = (try readFileAlloc(alloc, path)) orelse {
+        if (!enable) return;
+        // No config yet: nothing safe to anchor to; skip (Hermes will write its
+        // own config on first run, and the next install will patch it).
+        log.warn("supacode: ~/.hermes/config.yaml missing; skipping hermes hooks block", .{});
+        return;
+    };
+    defer alloc.free(original);
+
+    const block = try hermesHooksBlock(alloc, script_path);
+    defer alloc.free(block);
+
+    var out: std.ArrayListUnmanaged(u8) = .empty;
+    errdefer out.deinit(alloc);
+
+    // Find an `hooks:` top-level key (column 0). We handle two managed shapes:
+    //   `hooks: {}`            -> empty, safe to replace
+    //   `hooks:` + managed body -> our previously-written block (has sentinel)
+    var it = std.mem.splitScalar(u8, original, '\n');
+    var first = true;
+    var handled = false;
+    while (it.next()) |line| {
+        const is_hooks_key = std.mem.startsWith(u8, line, "hooks:");
+        if (is_hooks_key and !handled) {
+            const after = std.mem.trim(u8, line["hooks:".len..], " \t\r");
+            const is_empty_map = std.mem.eql(u8, after, "{}");
+            // Our managed block spans this `hooks:` line plus indented lines
+            // until the next column-0 key. Detect ours by the sentinel inside.
+            const our_block = !is_empty_map and blockIsSupacodeManaged(original, line);
+            if (is_empty_map or our_block) {
+                handled = true;
+                if (enable) {
+                    if (!first) try out.append(alloc, '\n');
+                    try out.appendSlice(alloc, block);
+                    first = false;
+                } else {
+                    if (!first) try out.append(alloc, '\n');
+                    try out.appendSlice(alloc, "hooks: {}");
+                    first = false;
+                }
+                // Skip the rest of our previous managed block's indented body.
+                if (our_block) skipIndentedBody(&it);
+                continue;
+            }
+            // User-populated hooks map: do not touch.
+            log.warn("supacode: ~/.hermes/config.yaml has a user hooks block; skipping", .{});
+            return;
+        }
+        if (!first) try out.append(alloc, '\n');
+        try out.appendSlice(alloc, line);
+        first = false;
+    }
+
+    // No `hooks:` key found: append our block (enable) or nothing (disable).
+    if (!handled and enable) {
+        if (out.items.len > 0 and out.items[out.items.len - 1] != '\n') try out.append(alloc, '\n');
+        try out.appendSlice(alloc, block);
+        try out.append(alloc, '\n');
+    }
+
+    const rewritten = try out.toOwnedSlice(alloc);
+    defer alloc.free(rewritten);
+    if (std.mem.eql(u8, rewritten, original)) return;
+    try writeFileAtomic(alloc, path, rewritten);
+}
+
+/// Build the managed `hooks:` YAML block that registers the presence script for
+/// every Hermes event. Carries the ownership sentinel in a comment so we can
+/// recognize it later. Caller owns the result.
+fn hermesHooksBlock(alloc: Allocator, script_path: []const u8) ![]u8 {
+    var out: std.ArrayListUnmanaged(u8) = .empty;
+    errdefer out.deinit(alloc);
+    try out.appendSlice(alloc, "hooks: # ");
+    try out.appendSlice(alloc, hooks.ownership_marker);
+    for (hermes_events) |ev| {
+        try out.append(alloc, '\n');
+        try out.writer(alloc).print(
+            "  {s}:\n    - command: \"{s}\"\n      timeout: 5",
+            .{ ev, script_path },
+        );
+    }
+    return try out.toOwnedSlice(alloc);
+}
+
+/// True when the managed sentinel appears on the `hooks:` header line (our
+/// block writes `hooks: # <sentinel>`).
+fn blockIsSupacodeManaged(_: []const u8, hooks_line: []const u8) bool {
+    return std.mem.indexOf(u8, hooks_line, hooks.ownership_marker) != null;
+}
+
+/// Advance `it` past lines that are part of an indented YAML block body (lines
+/// starting with a space/tab), stopping before the next column-0 line. Peeks
+/// without consuming the terminator by using an index-restoring split is not
+/// possible with SplitIterator, so we consume only indented/blank lines.
+fn skipIndentedBody(it: *std.mem.SplitIterator(u8, .scalar)) void {
+    while (true) {
+        const save = it.index;
+        const next = it.next() orelse return;
+        if (next.len == 0 or next[0] == ' ' or next[0] == '\t') continue;
+        // Not part of the body: rewind so the caller's loop re-reads it.
+        it.index = save;
+        return;
+    }
+}
+
+/// Add (or remove) the Hermes consent allowlist entries for our presence
+/// script, so the hooks are not silently skipped on a non-TTY run. The file is
+/// `~/.hermes/shell-hooks-allowlist.json` with an `approvals` array of
+/// `{event, command}`. We add one entry per event; on uninstall we strip every
+/// approval whose command equals our script path.
+fn patchHermesAllowlist(alloc: Allocator, home: []const u8, script_path: []const u8, enable: bool) !void {
+    const path = try joinHome(alloc, home, hermes_allowlist_rel);
+    defer alloc.free(path);
+
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    defer arena.deinit();
+    const aa = arena.allocator();
+
+    var approvals: std.json.Array = .init(aa);
+    if (try readFileAlloc(aa, path)) |existing| {
+        const parsed = std.json.parseFromSliceLeaky(std.json.Value, aa, existing, .{}) catch null;
+        if (parsed) |root| {
+            if (root == .object) {
+                if (root.object.get("approvals")) |a| {
+                    if (a == .array) {
+                        // Carry over every approval that is NOT ours.
+                        for (a.array.items) |item| {
+                            if (item == .object) {
+                                if (item.object.get("command")) |c| {
+                                    if (c == .string and std.mem.eql(u8, c.string, script_path)) continue;
+                                }
+                            }
+                            try approvals.append(item);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    if (enable) {
+        for (hermes_events) |ev| {
+            var obj: std.json.ObjectMap = .init(aa);
+            try obj.put("event", .{ .string = ev });
+            try obj.put("command", .{ .string = script_path });
+            try approvals.append(.{ .object = obj });
+        }
+    }
+
+    var root: std.json.ObjectMap = .init(aa);
+    try root.put("approvals", .{ .array = approvals });
+    const out = try std.json.Stringify.valueAlloc(alloc, std.json.Value{ .object = root }, .{ .whitespace = .indent_2 });
+    defer alloc.free(out);
+    try writeFileAtomic(alloc, path, out);
 }
 
 /// Install (idempotent) the canonical hook map into a JSON settings file.
@@ -1200,4 +1476,90 @@ test "codex install writes config.toml flag" {
     const after = (try readFileAlloc(alloc, path)).?;
     defer alloc.free(after);
     try testing.expect(std.mem.indexOf(u8, after, "hooks = true") == null);
+}
+
+test "hermes install: script + config block + allowlist, then uninstall" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const home = try tmp.dir.realpathAlloc(alloc, ".");
+    defer alloc.free(home);
+
+    // Seed a config.yaml with an empty hooks map (the safe-to-patch shape).
+    {
+        const cfg = try joinHome(alloc, home, hermes_config_rel);
+        defer alloc.free(cfg);
+        try writeFileAtomic(alloc, cfg, "model:\n  default: x\nhooks: {}\nsecurity:\n  redact_secrets: true\n");
+    }
+
+    try installHermes(alloc, home);
+
+    // Script exists, is sentinel-guarded, and emits the OSC.
+    const script_path = try joinHome(alloc, home, hermes_script_rel);
+    defer alloc.free(script_path);
+    const script = (try readFileAlloc(alloc, script_path)).?;
+    defer alloc.free(script);
+    try testing.expect(std.mem.indexOf(u8, script, hooks.ownership_marker) != null);
+    try testing.expect(std.mem.indexOf(u8, script, "=hermes;event=") != null);
+    try testing.expect(std.mem.indexOf(u8, script, "hook_event_name") != null);
+
+    // config.yaml: empty map replaced by our managed block, user keys intact.
+    const cfg_path = try joinHome(alloc, home, hermes_config_rel);
+    defer alloc.free(cfg_path);
+    const cfg = (try readFileAlloc(alloc, cfg_path)).?;
+    defer alloc.free(cfg);
+    try testing.expect(std.mem.indexOf(u8, cfg, "hooks: # " ++ "") != null);
+    try testing.expect(std.mem.indexOf(u8, cfg, "on_session_start:") != null);
+    try testing.expect(std.mem.indexOf(u8, cfg, "redact_secrets: true") != null); // user key survives
+    try testing.expect(std.mem.indexOf(u8, cfg, "hooks: {}") == null);
+
+    // allowlist: one approval per event, all pointing at our script.
+    const allow_path = try joinHome(alloc, home, hermes_allowlist_rel);
+    defer alloc.free(allow_path);
+    const allow = (try readFileAlloc(alloc, allow_path)).?;
+    defer alloc.free(allow);
+    try testing.expect(std.mem.indexOf(u8, allow, "on_session_start") != null);
+    try testing.expect(std.mem.indexOf(u8, allow, script_path) != null);
+
+    // Idempotent: a second install does not duplicate the block.
+    try installHermes(alloc, home);
+    const cfg2 = (try readFileAlloc(alloc, cfg_path)).?;
+    defer alloc.free(cfg2);
+    var count: usize = 0;
+    var it = std.mem.splitSequence(u8, cfg2, "on_session_start:");
+    while (it.next()) |_| count += 1;
+    try testing.expectEqual(@as(usize, 2), count); // N+1 splits for N occurrences
+
+    // Uninstall: config restored to empty map, script gone.
+    try uninstallHermes(alloc, home);
+    const cfg3 = (try readFileAlloc(alloc, cfg_path)).?;
+    defer alloc.free(cfg3);
+    try testing.expect(std.mem.indexOf(u8, cfg3, "hooks: {}") != null);
+    try testing.expect(std.mem.indexOf(u8, cfg3, "on_session_start:") == null);
+    try testing.expect((try readFileAlloc(alloc, script_path)) == null);
+}
+
+test "hermes config: user-populated hooks block is left untouched" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const home = try tmp.dir.realpathAlloc(alloc, ".");
+    defer alloc.free(home);
+
+    const cfg = try joinHome(alloc, home, hermes_config_rel);
+    defer alloc.free(cfg);
+    const user = "hooks:\n  pre_tool_call:\n    - command: \"/usr/bin/true\"\n";
+    try writeFileAtomic(alloc, cfg, user);
+
+    const script_path = try joinHome(alloc, home, hermes_script_rel);
+    defer alloc.free(script_path);
+    try patchHermesConfig(alloc, home, script_path, true);
+
+    const after = (try readFileAlloc(alloc, cfg)).?;
+    defer alloc.free(after);
+    try testing.expectEqualStrings(user, after); // unchanged
 }

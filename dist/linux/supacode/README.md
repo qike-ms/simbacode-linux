@@ -31,6 +31,7 @@ native config:
 | Copilot   | `~/.copilot/hooks/supacode.json`                     |
 | OpenCode  | `~/.config/opencode/plugins/supacode-presence.js`   |
 | Pi        | `~/.pi/agent/extensions/supacode/index.ts`          |
+| Hermes    | `~/.hermes/agent-hooks/supacode-presence.sh` + `~/.hermes/config.yaml` `hooks:` + allowlist |
 
 Each block is guarded on `[ -n "${SUPACODE_SURFACE_ID:-}" ]` (an env var
 supacode-linux injects into every surface), so it is **inert outside a Supacode
@@ -43,8 +44,14 @@ will uninstall the managed blocks on the next toggle).
 
 ## The protocol
 
-The hook resolves the agent's controlling tty (`ps -o tty= -p $PPID`) and writes
-one OSC-3008 sequence per lifecycle event (`ESC` = `\033`, `ST` = `\033\`):
+The hook resolves the agent's controlling tty and writes
+one OSC-3008 sequence per lifecycle event (`ESC` = `\033`, `ST` = `\033\`).
+
+The tty is resolved most-reliable-first: `$SUPACODE_TTY` (the surface's real
+pts path, injected by the emulator) → `/proc/$PPID/fd/{0,1,2}` (the agent's std
+fds, which point at the pts even with no controlling terminal — the case that
+breaks `ps` for agents like Codex) → `ps -o tty= -p $PPID` (the portable
+fallback). Each candidate is validated with `[ -w ]` before use.
 
 ```
 ESC ] 3008 ; <action>=<agent> ; event=<event> [ ; pid=<pid> ] ST

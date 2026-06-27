@@ -59,8 +59,13 @@ identical; only the gating value differs.
 
 - Guard: `[ -n "${SUPACODE_SURFACE_ID:-}" ]` (agent_hooks `osc_guard_expr`) ==
   `oscGuardExpr` (`AgentHookSettingsCommand.swift:69`).
-- tty resolve: `ps -o tty= -p "$PPID" ... case ... /dev/...` — byte-identical to
-  `ttyResolveSnippet`.
+- tty resolve: **DIVERGES (intentional, Linux robustness)**. macOS
+  `ttyResolveSnippet` is `ps -o tty= -p "$PPID"` only. On Linux that fails for
+  agents that run hooks with no controlling terminal (e.g. Codex), so the
+  snippet now resolves most-reliable-first: `$SUPACODE_TTY` (the surface's real
+  pts path, injected by the emulator in `termio/Exec.zig`) → `/proc/$PPID/fd/
+  {0,1,2}` → `ps -o tty=` (the original, as fallback). Each candidate is
+  validated with `[ -w ]`. The OSC wire payload is unchanged.
 - Brace group, output suppression `>/dev/null 2>&1 || true`, trailing
   `# supacode-managed-hook` sentinel — all identical.
 - Notify awk: `agent_hooks.notify_extract_awk` was verified **byte-identical**
@@ -105,6 +110,16 @@ DIFFERS(intentional, Linux-appropriate):
 | copilot | `.copilot/hooks/supacode.json` own file | same | `CopilotHooksInstaller.swift`, `CopilotHookSettings.swift` |
 | opencode | `.config/opencode/plugins/*.js` plugin | `supacode-presence.js` | `OpenCodePluginContent.swift`, `OpenCodePluginInstaller.swift:61` |
 | pi | `.pi/agent/extensions/supacode/index.ts` | same | `PiExtensionContent.swift`, `PiSettingsInstaller.swift:105` |
+| hermes | `.hermes/agent-hooks/supacode-presence.sh` + `config.yaml` `hooks:` + `shell-hooks-allowlist.json` | **Linux-only, no macOS source** | `installHermes` / `patchHermesConfig` / `patchHermesAllowlist` |
+
+**Hermes** has no macOS counterpart (it is a Linux-only agent). Its shell hooks
+run via `shlex.split` with `shell=False`, so an inline pipeline is impossible;
+instead Supacode ships a managed presence SCRIPT and points `config.yaml`'s
+`hooks:` block at it, plus a consent allowlist entry per event (otherwise the
+hook is silently skipped). The config patch only touches a literal `hooks: {}`
+or a previously-managed block (sentinel-keyed); a user-populated `hooks:` map is
+left untouched. The script emits the same OSC-3008 presence wire as every other
+agent (`start=hermes;event=<event>`).
 
 - Canonical hook maps match the macOS `*HookSettings` event→event mappings:
   Claude tool-level (SessionStart session_start, UserPromptSubmit busy,

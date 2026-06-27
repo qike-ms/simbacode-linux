@@ -2030,6 +2030,11 @@ pub const Window = extern struct {
         label.setEllipsize(.end);
         box.append(label.as(gtk.Widget));
 
+        // Agent presence icon (#4): a generic bot mark on the repo header when
+        // any worktree in this group has a running agent (so a collapsed repo
+        // still signals "agents running here").
+        if (self.groupHasAgent(group)) appendAgentIcon(box, .generic);
+
         // Badge label (right): aggregated diff stat + attention bell. Fixed
         // size, right-aligned, so counters never get clipped by long names.
         var badge_buf: [320]u8 = undefined;
@@ -2168,6 +2173,10 @@ pub const Window = extern struct {
         label.as(gtk.Widget).setHexpand(@intFromBool(true));
         label.setEllipsize(.end);
         box.append(label.as(gtk.Widget));
+
+        // Agent presence icon (#4): a small bot/agent mark when an agent runs
+        // in this worktree. Drawn between the branch name and the diff badges.
+        if (self.agentForPath(st.path)) |a| appendAgentIcon(box, a);
 
         // Badge label (right): fixed size, right-aligned, never clipped.
         if (badges.len > 0) {
@@ -2315,6 +2324,8 @@ pub const Window = extern struct {
         }
 
         self.refreshTabAgentIcon(surface);
+        // Agent presence affects the sidebar bot icons (#4); rebuild rows.
+        self.rebuildSidebarRows();
     }
 
     /// Remove a surface's agent entry. Returns true if an entry was present.
@@ -2331,6 +2342,7 @@ pub const Window = extern struct {
     pub fn clearSurfaceAgent(self: *Window, surface: *Surface) void {
         if (self.removeSurfaceAgent(surface)) {
             self.refreshTabAgentIcon(surface);
+            self.rebuildSidebarRows();
         }
     }
 
@@ -2340,6 +2352,64 @@ pub const Window = extern struct {
     /// AgentPresenceFeature.applyActivity's pid-less auto-seed).
     pub fn surfaceHasAgent(self: *Window, surface: *Surface) bool {
         return self.private().surface_agents.contains(surface);
+    }
+
+    /// Whether `surface` is currently "in the user's face": its window is the
+    /// active (focused) window AND its tab is the selected tab of the visible
+    /// worktree view. Used to suppress redundant attention notifications when
+    /// the user is already looking at the agent that wants them (#1).
+    pub fn surfaceIsForeground(self: *Window, surface: *Surface) bool {
+        // Window must be the focused top-level.
+        if (self.as(gtk.Window).isActive() == 0) return false;
+
+        // The surface's tab must be the selected tab of its OWN view, and that
+        // view must be the one currently visible in the worktree stack.
+        const tab = ext.getAncestor(Tab, surface.as(gtk.Widget)) orelse return false;
+        const view = self.viewForTab(tab);
+        if (view != self.activeTabView()) return false;
+        const selected = view.getSelectedPage() orelse return false;
+        if (selected.getChild() != tab.as(gtk.Widget)) return false;
+
+        // Finally, this surface must be the tab's focused surface (handles
+        // splits: only the focused pane is "foreground").
+        return tab.getActiveSurface() == surface;
+    }
+
+    /// A short human-readable context name for the repo/worktree a surface
+    /// lives in, used to prefix agent notifications (#2). Resolves the
+    /// surface's pwd against the sidebar worktree statuses: prefers an exact
+    /// worktree match ("repo/branch"), else the longest path-prefix repo match
+    /// ("repo"), else the pwd basename. Writes into `buf` and returns the
+    /// slice, or null when no pwd is known.
+    pub fn contextLabelForSurface(self: *Window, surface: *Surface, buf: []u8) ?[]const u8 {
+        const pwd = surface.getPwd() orelse return null;
+        if (pwd.len == 0) return null;
+        const priv = self.private();
+
+        // Exact worktree match -> "repo/branch" (or just "repo" for the main
+        // checkout whose branch we still show for context).
+        var best_repo: ?[]const u8 = null;
+        var best_repo_len: usize = 0;
+        for (priv.sidebar_statuses) |*st| {
+            if (std.mem.eql(u8, st.path, pwd)) {
+                return std.fmt.bufPrint(buf, "{s}/{s}", .{ st.repo_name, st.branch }) catch st.repo_name;
+            }
+            // Track the longest repo_root that is a path-prefix of pwd.
+            if (pwd.len >= st.repo_root.len and
+                std.mem.startsWith(u8, pwd, st.repo_root) and
+                (pwd.len == st.repo_root.len or pwd[st.repo_root.len] == '/'))
+            {
+                if (st.repo_root.len > best_repo_len) {
+                    best_repo_len = st.repo_root.len;
+                    best_repo = st.repo_name;
+                }
+            }
+        }
+        if (best_repo) |r| return r;
+
+        // Fallback: basename of the pwd.
+        const base = std.fs.path.basename(pwd);
+        return if (base.len > 0) base else null;
     }
 
     /// Set the activity state for an agent attached to `surface`. No-op if no
@@ -2362,6 +2432,53 @@ pub const Window = extern struct {
         const priv = self.private();
         const entry = priv.surface_agents.getPtr(surface) orelse return;
         entry.pid = pid;
+    }
+
+    /// Find a representative agent running in (or under) a worktree `path`, by
+    /// scanning the recorded agent surfaces and matching each surface's pwd
+    /// against the path. Returns the focused/first match, preferring a busy or
+    /// awaiting_input agent so the sidebar reflects active work. Used to draw a
+    /// bot icon next to the worktree/branch in the sidebar (#4). `null` when no
+    /// agent runs there.
+    fn agentForPath(self: *Window, path: []const u8) ?agentpkg.Agent {
+        const priv = self.private();
+        var fallback: ?agentpkg.Agent = null;
+        var it = priv.surface_agents.iterator();
+        while (it.next()) |entry| {
+            const s = entry.key_ptr.*;
+            const spwd = s.getPwd() orelse continue;
+            // Match the surface to this worktree: exact, or pwd is nested under
+            // the worktree path (a subdir the agent cd'd into).
+            const match = std.mem.eql(u8, spwd, path) or
+                (spwd.len > path.len and std.mem.startsWith(u8, spwd, path) and spwd[path.len] == '/');
+            if (!match) continue;
+            // Prefer an actively-working/waiting agent over an idle one.
+            if (entry.value_ptr.activity != .idle) return entry.value_ptr.agent;
+            if (fallback == null) fallback = entry.value_ptr.agent;
+        }
+        return fallback;
+    }
+
+    /// Whether any agent runs in (or under) any worktree in `group` (a repo's
+    /// contiguous worktree run). Drives the repo-header bot icon (#4).
+    fn groupHasAgent(self: *Window, group: []const sidebar.WorktreeStatus) bool {
+        for (group) |*st| {
+            if (self.agentForPath(st.path) != null) return true;
+        }
+        return false;
+    }
+
+    /// Append a small agent icon (Gtk.Image from the agent's GIcon) to `box`,
+    /// sized for a sidebar row. Falls back to the generic bot when `agent` is
+    /// the generic/unknown mark. No-op on allocation failure (#4).
+    fn appendAgentIcon(box: *gtk.Box, agent: agentpkg.Agent) void {
+        const icon = agent.newIcon() orelse return;
+        defer icon.unref();
+        const image = gtk.Image.newFromGicon(icon);
+        image.setPixelSize(14);
+        image.as(gtk.Widget).setValign(.center);
+        image.as(gtk.Widget).setTooltipText(agent.label().ptr);
+        box.append(image.as(gtk.Widget));
     }
 
     /// Recompute and apply the indicator icon for the tab that owns `surface`.
@@ -2419,6 +2536,14 @@ pub const Window = extern struct {
 
         priv.agent_banner_surface = surface;
 
+        // Prefix the agent label with the repo/worktree context (#2).
+        var ctx_buf: [256]u8 = undefined;
+        var title_buf: [320]u8 = undefined;
+        const display_title: []const u8 = if (self.contextLabelForSurface(surface, &ctx_buf)) |ctx|
+            (std.fmt.bufPrint(&title_buf, "{s} \u{00b7} {s}", .{ ctx, title }) catch title)
+        else
+            title;
+
         // The banner title is parsed as Pango markup, so escape the detail
         // (assistant text may contain < & etc.) before composing (trio m1).
         const trimmed = trimFirstLine(detail);
@@ -2431,14 +2556,14 @@ pub const Window = extern struct {
                 break :blk std.fmt.allocPrintSentinel(
                     alloc,
                     "{s} \u{2014} {s}",
-                    .{ title, std.mem.sliceTo(esc, 0) },
+                    .{ display_title, std.mem.sliceTo(esc, 0) },
                     0,
                 ) catch null;
             }
             break :blk std.fmt.allocPrintSentinel(
                 alloc,
                 "{s} needs attention",
-                .{title},
+                .{display_title},
                 0,
             ) catch null;
         } orelse (alloc.dupeZ(u8, "Agent needs attention") catch return);
@@ -2479,14 +2604,22 @@ pub const Window = extern struct {
         const pwd = surface.getPwd() orelse "";
         const path = alloc.dupeZ(u8, pwd) catch return;
 
-        // Compose "<agent> — <first line>" (or "<agent> needs attention").
+        // Prefix with the repo/worktree context (#2): "<repo> \u00b7 <agent>".
+        var ctx_buf: [256]u8 = undefined;
+        var title_buf: [320]u8 = undefined;
+        const display_title: []const u8 = if (self.contextLabelForSurface(surface, &ctx_buf)) |ctx|
+            (std.fmt.bufPrint(&title_buf, "{s} \u{00b7} {s}", .{ ctx, title }) catch title)
+        else
+            title;
+
+        // Compose "<repo> \u00b7 <agent> \u2014 <first line>".
         const trimmed = trimFirstLine(detail);
         const text: [:0]u8 = blk: {
             if (trimmed.len > 0) {
                 break :blk std.fmt.allocPrintSentinel(
                     alloc,
                     "{s} \u{2014} {s}",
-                    .{ title, trimmed },
+                    .{ display_title, trimmed },
                     0,
                 ) catch {
                     alloc.free(path);
@@ -2496,7 +2629,7 @@ pub const Window = extern struct {
             break :blk std.fmt.allocPrintSentinel(
                 alloc,
                 "{s} needs attention",
-                .{title},
+                .{display_title},
                 0,
             ) catch {
                 alloc.free(path);

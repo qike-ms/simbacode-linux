@@ -41,7 +41,8 @@ pub const surface_env_var = "SUPACODE_SURFACE_ID";
 pub const socket_path_env_var = "SUPACODE_SOCKET_PATH";
 
 /// The supported agents, with their config directory under $HOME. Ported from
-/// `SkillAgent` (macOS): claude, codex, copilot, kiro, opencode, pi.
+/// `SkillAgent` (macOS): claude, codex, copilot, kiro, opencode, pi. `hermes`
+/// is Linux-only (no macOS counterpart); it emits the same OSC presence wire.
 pub const Agent = enum {
     claude,
     codex,
@@ -49,6 +50,7 @@ pub const Agent = enum {
     kiro,
     opencode,
     pi,
+    hermes,
 
     /// The agent's rawValue used as the OSC context id (`start=<agent>`). Must
     /// match `SkillAgent.rawValue` byte-for-byte for wire compat.
@@ -60,6 +62,7 @@ pub const Agent = enum {
             .kiro => "kiro",
             .opencode => "opencode",
             .pi => "pi",
+            .hermes => "hermes",
         };
     }
 
@@ -72,6 +75,7 @@ pub const Agent = enum {
             .kiro => ".kiro",
             .opencode => ".config/opencode",
             .pi => ".pi/agent",
+            .hermes => ".hermes",
         };
     }
 };
@@ -98,12 +102,30 @@ pub const HookEvent = enum {
 };
 
 /// Shell that resolves `$__tty` to a writable terminal device for the OSC
-/// emits. Verbatim port of `AgentPresenceOSC.ttyResolveSnippet`: agents run
-/// hooks with no controlling terminal, so the hook recovers the parent agent's
-/// tty via `ps -o tty=` and prefixes `/dev/`.
+/// emits. Agents run hooks with no controlling terminal, so resolving the
+/// right pty is the load-bearing step (a wrong/empty `$__tty` is the #1 reason
+/// a presence icon never appears).
+///
+/// Resolution order, most-reliable first:
+///   1. `$SUPACODE_TTY` — the surface's real pts path, injected by the
+///      emulator into every surface's environment. Always correct when set;
+///      agents that re-exec or detach still inherit it.
+///   2. `/proc/$PPID/fd/{0,1,2}` — the parent agent's std fds, which point at
+///      the pts even when the agent has no controlling terminal (the case that
+///      breaks `ps -o tty=`, e.g. Codex). Linux-only, hence the readlink probe.
+///   3. `ps -o tty= -p $PPID` — the portable macOS-parity fallback.
+/// The chosen path is validated with `[ -w ]` before use; an unwritable or
+/// missing device falls through to the next candidate.
 pub const tty_resolve_snippet =
-    "__tty=$(ps -o tty= -p \"$PPID\" 2>/dev/null | tr -d '[:space:]'); " ++
-    "case \"$__tty\" in *[0-9]*) __tty=\"/dev/${__tty#/dev/}\";; *) __tty=\"/dev/tty\";; esac";
+    "__tty=\"\"; " ++
+    "if [ -n \"${SUPACODE_TTY:-}\" ] && [ -w \"$SUPACODE_TTY\" ]; then __tty=\"$SUPACODE_TTY\"; fi; " ++
+    "if [ -z \"$__tty\" ]; then for __fd in 0 1 2; do " ++
+    "__c=$(readlink \"/proc/$PPID/fd/$__fd\" 2>/dev/null); " ++
+    "case \"$__c\" in /dev/pts/*|/dev/tty[0-9]*) if [ -w \"$__c\" ]; then __tty=\"$__c\"; break; fi;; esac; " ++
+    "done; fi; " ++
+    "if [ -z \"$__tty\" ]; then " ++
+    "__pt=$(ps -o tty= -p \"$PPID\" 2>/dev/null | tr -d '[:space:]'); " ++
+    "case \"$__pt\" in *[0-9]*) __tty=\"/dev/${__pt#/dev/}\";; *) __tty=\"/dev/tty\";; esac; fi";
 
 /// Build the shell `printf` that emits the OSC 3008 presence sequence for
 /// `event`. Verbatim port of `AgentPresenceOSC.emitShell`: written to the
@@ -289,14 +311,15 @@ test "compositeCommand exact shape matches macOS AgentHookSettingsCommand" {
     const testing = std.testing;
     const alloc = testing.allocator;
 
-    // Byte-for-byte expected output of the macOS
-    // AgentHookSettingsCommand.compositeCommand(events:[.busy],
-    // forwardStdinAsNotification:false, agent:.claude), with the Linux
-    // socket-path gate. This locks wire/shell parity.
+    // Byte-for-byte expected output of the composite hook command for
+    // (events:[.busy], forwardStdinAsNotification:false, agent:.claude). The
+    // tty-resolve step prefers the injected SUPACODE_TTY and /proc/$PPID/fd
+    // probes before the ps fallback to fix agents that run hooks with no
+    // controlling terminal on Linux; the rest (guard, OSC payload, pid gate,
+    // suppression, sentinel) is macOS parity.
     const expected =
         "[ -n \"${SUPACODE_SURFACE_ID:-}\" ] && { " ++
-        "__tty=$(ps -o tty= -p \"$PPID\" 2>/dev/null | tr -d '[:space:]'); " ++
-        "case \"$__tty\" in *[0-9]*) __tty=\"/dev/${__tty#/dev/}\";; *) __tty=\"/dev/tty\";; esac; " ++
+        tty_resolve_snippet ++ "; " ++
         "__sp=\"\"; [ -n \"${SUPACODE_SOCKET_PATH:-}\" ] && __sp=\";pid=$PPID\"; " ++
         "printf '\\033]3008;start=claude;event=busy%s\\033\\\\' \"$__sp\" > \"$__tty\"; " ++
         "} >/dev/null 2>&1 || true # supacode-managed-hook";
