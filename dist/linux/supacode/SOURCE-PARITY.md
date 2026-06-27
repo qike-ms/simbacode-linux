@@ -107,12 +107,14 @@ DIFFERS(intentional, Linux-appropriate):
 | pi | `.pi/agent/extensions/supacode/index.ts` | same | `PiExtensionContent.swift`, `PiSettingsInstaller.swift:105` |
 
 - Canonical hook maps match the macOS `*HookSettings` event→event mappings:
-  Claude tool-level (PreToolUse busy / AskUserQuestion|ExitPlanMode
-  awaiting_input ordered after `""`, PostToolUse idle, Stop idle+notify,
-  SessionEnd session_end+idle) per `ClaudeHookSettings.swift`; Codex turn-level
-  (SessionStart/UserPromptSubmit/Stop) per `CodexHookSettings.swift`; Kiro
-  (agentSpawn/userPromptSubmit/stop) per `KiroHookSettings.swift`; Copilot
-  per-event own-file per `CopilotHookSettings.swift`.
+  Claude tool-level (SessionStart session_start, UserPromptSubmit busy,
+  PreToolUse `""` busy then AskUserQuestion|ExitPlanMode awaiting_input ordered
+  after it, PostToolUse idle, Notification awaiting_input+notify, Stop
+  idle+notify, SessionEnd session_end+idle) per `ClaudeHookSettings.swift`;
+  Codex turn-level (SessionStart/UserPromptSubmit/Stop) per
+  `CodexHookSettings.swift`; Kiro (agentSpawn/userPromptSubmit/stop) per
+  `KiroHookSettings.swift`; Copilot per-event own-file per
+  `CopilotHookSettings.swift`.
 - Idempotent `install = uninstall + append`, sentinel-only ownership
   (`AgentHookSettingsFileInstaller.swift:120`+, `AgentHookCommandOwnership.swift`).
   Verified by tests (user-hook preservation, no-duplicate re-install,
