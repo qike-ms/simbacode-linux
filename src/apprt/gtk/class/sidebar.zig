@@ -210,6 +210,132 @@ fn appendWorktreePaths(
     }
 }
 
+/// Scan a single directory `dir` as a git repository, appending its
+/// worktrees (or the main checkout) to `results`. No-op when `dir` is not a
+/// git work tree. Used by both `scan` (per discovered subdir) and
+/// `scanPaths` (per user-added root).
+fn scanRepo(
+    alloc: Allocator,
+    dir: []const u8,
+    results: *std.ArrayListUnmanaged(WorktreeStatus),
+) !void {
+    // Is this a git work tree?
+    const inside = git(alloc, dir, &.{ "git", "rev-parse", "--is-inside-work-tree" }) orelse return;
+    const is_repo = std.mem.eql(u8, std.mem.trim(u8, inside, " \t\r\n"), "true");
+    alloc.free(inside);
+    if (!is_repo) return;
+
+    // Resolve the main checkout top-level.
+    const top = git(alloc, dir, &.{ "git", "rev-parse", "--show-toplevel" }) orelse return;
+    defer alloc.free(top);
+
+    // List worktrees from the top-level.
+    var wt_paths: std.ArrayListUnmanaged([]const u8) = .empty;
+    defer {
+        for (wt_paths.items) |p| alloc.free(p);
+        wt_paths.deinit(alloc);
+    }
+    if (git(alloc, top, &.{ "git", "worktree", "list", "--porcelain" })) |porc| {
+        defer alloc.free(porc);
+        try appendWorktreePaths(alloc, porc, &wt_paths);
+    }
+
+    if (wt_paths.items.len == 0) {
+        // No worktree info; treat top as the single (main) checkout.
+        if (statusFor(alloc, top, false, top)) |s| try results.append(alloc, s);
+        return;
+    }
+
+    for (wt_paths.items) |wp| {
+        const is_linked = !std.mem.eql(u8, wp, top);
+        if (statusFor(alloc, wp, is_linked, top)) |s| try results.append(alloc, s);
+    }
+}
+
+/// Sort scan results by repo name, then main-checkout-first, then worktree
+/// name, grouping worktrees under their owning repo for the grouped sidebar.
+fn sortResults(results: []WorktreeStatus) void {
+    std.mem.sort(WorktreeStatus, results, {}, struct {
+        fn lessThan(_: void, a: WorktreeStatus, b: WorktreeStatus) bool {
+            const repo_cmp = std.mem.order(u8, a.repo_name, b.repo_name);
+            if (repo_cmp != .eq) return repo_cmp == .lt;
+            // Within a repo: main checkout (not is_worktree) sorts first.
+            if (a.is_worktree != b.is_worktree) return !a.is_worktree;
+            return std.mem.lessThan(u8, a.name, b.name);
+        }
+    }.lessThan);
+}
+
+/// Scan an explicit list of user-added project roots. Each root is treated as
+/// a repository directly when it is a git work tree; otherwise its immediate
+/// subdirectories are scanned (so adding a parent folder like `~/git` still
+/// discovers the repos beneath it). Caller owns the returned slice and must
+/// call `freeStatuses`.
+pub fn scanPaths(alloc: Allocator, roots: []const [:0]const u8) ![]WorktreeStatus {
+    var results: std.ArrayListUnmanaged(WorktreeStatus) = .empty;
+    errdefer {
+        for (results.items) |*s| s.deinit(alloc);
+        results.deinit(alloc);
+    }
+
+    for (roots) |root| {
+        // Defensive: `openDirAbsolute` below asserts (panics) on a relative
+        // path. The store already filters these on load, but guard here too so
+        // no caller can crash the scan with a relative root.
+        if (!std.fs.path.isAbsolute(root)) {
+            log.warn("sidebar: ignoring non-absolute root {s}", .{root});
+            continue;
+        }
+
+        // First try the root itself as a repository.
+        const before = results.items.len;
+        try scanRepo(alloc, root, &results);
+        if (results.items.len > before) continue;
+
+        // Not a repo itself: fall back to scanning immediate subdirectories.
+        var dir = std.fs.openDirAbsolute(root, .{ .iterate = true }) catch |err| {
+            log.warn("cannot open sidebar root {s}: {}", .{ root, err });
+            continue;
+        };
+        defer dir.close();
+        var it = dir.iterate();
+        while (try it.next()) |entry| {
+            if (entry.kind != .directory) continue;
+            if (entry.name.len > 0 and entry.name[0] == '.') continue;
+            const sub = try std.fs.path.join(alloc, &.{ root, entry.name });
+            defer alloc.free(sub);
+            try scanRepo(alloc, sub, &results);
+        }
+    }
+
+    // Deduplicate by worktree path: overlapping roots (e.g. `~/git` added
+    // alongside a child repo `~/git/foo`, or the same repo reached via two
+    // roots) would otherwise list the same worktree twice. Keep first seen.
+    // The map is pre-sized so getOrPut can't fail mid-loop — an OOM there would
+    // leave the in-place compaction half-done and make the function-wide
+    // errdefer double-free aliased survivor slots.
+    {
+        var seen: std.StringHashMapUnmanaged(void) = .empty;
+        defer seen.deinit(alloc);
+        try seen.ensureTotalCapacity(alloc, @intCast(results.items.len));
+        var w: usize = 0;
+        for (results.items) |s| {
+            const gop = seen.getOrPutAssumeCapacity(s.path);
+            if (gop.found_existing) {
+                // Drop this duplicate; free its owned strings.
+                s.deinit(alloc);
+                continue;
+            }
+            results.items[w] = s;
+            w += 1;
+        }
+        results.shrinkRetainingCapacity(w);
+    }
+
+    sortResults(results.items);
+    return results.toOwnedSlice(alloc);
+}
+
 /// Scan `root` for git repos and their worktrees. Caller owns the returned
 /// slice and must call `freeStatuses`.
 pub fn scan(alloc: Allocator, root: []const u8) ![]WorktreeStatus {
@@ -232,51 +358,12 @@ pub fn scan(alloc: Allocator, root: []const u8) ![]WorktreeStatus {
 
         const sub = try std.fs.path.join(alloc, &.{ root, entry.name });
         defer alloc.free(sub);
-
-        // Is this a git work tree?
-        const inside = git(alloc, sub, &.{ "git", "rev-parse", "--is-inside-work-tree" }) orelse continue;
-        const is_repo = std.mem.eql(u8, std.mem.trim(u8, inside, " \t\r\n"), "true");
-        alloc.free(inside);
-        if (!is_repo) continue;
-
-        // Resolve the main checkout top-level.
-        const top = git(alloc, sub, &.{ "git", "rev-parse", "--show-toplevel" }) orelse continue;
-        defer alloc.free(top);
-
-        // List worktrees from the top-level.
-        var wt_paths: std.ArrayListUnmanaged([]const u8) = .empty;
-        defer {
-            for (wt_paths.items) |p| alloc.free(p);
-            wt_paths.deinit(alloc);
-        }
-        if (git(alloc, top, &.{ "git", "worktree", "list", "--porcelain" })) |porc| {
-            defer alloc.free(porc);
-            try appendWorktreePaths(alloc, porc, &wt_paths);
-        }
-
-        if (wt_paths.items.len == 0) {
-            // No worktree info; treat top as the single (main) checkout.
-            if (statusFor(alloc, top, false, top)) |s| try results.append(alloc, s);
-            continue;
-        }
-
-        for (wt_paths.items) |wp| {
-            const is_linked = !std.mem.eql(u8, wp, top);
-            if (statusFor(alloc, wp, is_linked, top)) |s| try results.append(alloc, s);
-        }
+        try scanRepo(alloc, sub, &results);
     }
 
     // Sort by repo name, then main-checkout-first, then worktree name. This
     // groups worktrees under their owning repo for the grouped sidebar.
-    std.mem.sort(WorktreeStatus, results.items, {}, struct {
-        fn lessThan(_: void, a: WorktreeStatus, b: WorktreeStatus) bool {
-            const repo_cmp = std.mem.order(u8, a.repo_name, b.repo_name);
-            if (repo_cmp != .eq) return repo_cmp == .lt;
-            // Within a repo: main checkout (not is_worktree) sorts first.
-            if (a.is_worktree != b.is_worktree) return !a.is_worktree;
-            return std.mem.lessThan(u8, a.name, b.name);
-        }
-    }.lessThan);
+    sortResults(results.items);
 
     return results.toOwnedSlice(alloc);
 }

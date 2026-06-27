@@ -28,6 +28,16 @@ template $GhosttyWindow: Adw.ApplicationWindow {
         title-widget: Adw.WindowTitle {
           title: _("Worktrees");
         };
+
+        // Supacode (#21): add a project folder to the sidebar. Opens a
+        // Gtk.FileDialog folder picker; the chosen root is persisted to
+        // ~/.supacode/sidebar.json and scanned for worktrees.
+        [end]
+        Gtk.Button sidebar_add_button {
+          icon-name: "list-add-symbolic";
+          tooltip-text: _("Add Folder…");
+          clicked => $sidebar_add_clicked();
+        }
       }
 
       content: Gtk.ScrolledWindow {

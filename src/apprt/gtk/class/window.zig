@@ -27,6 +27,7 @@ const SplitTree = @import("split_tree.zig").SplitTree;
 const Surface = @import("surface.zig").Surface;
 const Tab = @import("tab.zig").Tab;
 const sidebar = @import("sidebar.zig");
+const sidebar_store = @import("sidebar_store.zig");
 const agentpkg = @import("agent.zig");
 const DebugWarning = @import("debug_warning.zig").DebugWarning;
 const CommandPalette = @import("command_palette.zig").CommandPalette;
@@ -285,6 +286,12 @@ pub const Window = extern struct {
         /// ListBox row index for row-activation -> open-worktree mapping.
         sidebar_statuses: []sidebar.WorktreeStatus = &.{},
 
+        /// Supacode (#21): user-curated set of project roots persisted to
+        /// `~/.supacode/sidebar.json`. The sidebar scans ONLY these roots —
+        /// never a blanket `~/git` walk. Loaded on startup; written on
+        /// add/remove. Empty on first run (no auto-import).
+        sidebar_store: sidebar_store.Store = .{},
+
         /// Surfaces currently flagged as "needs attention" by an OSC-3008
         /// attention signal, mapped to their worktree path (owned/duped). The
         /// sidebar bell for a path is shown when ANY surface with that path is
@@ -334,6 +341,7 @@ pub const Window = extern struct {
         toast_overlay: *adw.ToastOverlay,
         split_view: *adw.OverlaySplitView,
         sidebar_list: *gtk.ListBox,
+        sidebar_add_button: *gtk.Button,
         agent_banner: *adw.Banner,
 
         /// Supacode (#10): title-bar repo + user identity chip widgets.
@@ -1567,6 +1575,7 @@ pub const Window = extern struct {
             sidebar.freeStatuses(alloc, priv.sidebar_statuses);
             priv.sidebar_statuses = &.{};
         }
+        priv.sidebar_store.deinit(alloc);
         {
             var it = priv.sidebar_attention.valueIterator();
             while (it.next()) |v| alloc.free(v.*);
@@ -1682,6 +1691,10 @@ pub const Window = extern struct {
     fn initSidebar(self: *Window) void {
         const priv = self.private();
 
+        // Load the user-curated project roots (#21). Empty on first run — the
+        // sidebar starts empty and the user adds folders via the `+` button.
+        priv.sidebar_store = sidebar_store.load(Application.default().allocator());
+
         _ = gtk.ListBox.signals.row_activated.connect(
             priv.sidebar_list,
             *Window,
@@ -1702,25 +1715,23 @@ pub const Window = extern struct {
         return @intFromBool(true);
     }
 
-    /// Resolve the projects root (default: $HOME/git).
+    /// Resolve the projects root (default: $HOME/git). Retained for the
+    /// identity chip / fallbacks; the sidebar itself scans the user-curated
+    /// store (#21), not this root.
     fn projectsRoot(alloc: std.mem.Allocator) ?[]u8 {
         const home = std.posix.getenv("HOME") orelse return null;
         return std.fs.path.join(alloc, &.{ home, "git" }) catch null;
     }
 
-    /// Rescan the projects root and rebuild the sidebar rows.
+    /// Rescan the user-curated project roots and rebuild the sidebar rows.
+    /// Issue #21: scans ONLY the persisted roots in `sidebar_store`, never a
+    /// blanket `~/git` walk. An empty store yields an empty sidebar.
     fn refreshSidebar(self: *Window) void {
         const priv = self.private();
         const alloc = Application.default().allocator();
 
-        const root = projectsRoot(alloc) orelse {
-            log.warn("sidebar: cannot resolve projects root ($HOME unset)", .{});
-            return;
-        };
-        defer alloc.free(root);
-
-        const statuses = sidebar.scan(alloc, root) catch |err| {
-            log.warn("sidebar: scan failed root={s} err={}", .{ root, err });
+        const statuses = sidebar.scanPaths(alloc, priv.sidebar_store.roots.items) catch |err| {
+            log.warn("sidebar: scan failed err={}", .{err});
             return;
         };
 
@@ -1733,6 +1744,87 @@ pub const Window = extern struct {
         self.rebuildSidebarRows();
         // Refresh the identity chip now that branch/repo labels are available (#10).
         self.updateIdentityChip();
+    }
+
+    /// Handler for the sidebar header `+` button: present a folder picker and,
+    /// on selection, add the chosen path to the persisted store and rescan.
+    fn sidebarAddClicked(_: *gtk.Button, self: *Window) callconv(.c) void {
+        const dialog = gtk.FileDialog.new();
+        // The dialog holds its own ref while presented; release ours after.
+        defer dialog.unref();
+        dialog.setTitle("Add Folder");
+        dialog.setModal(@intFromBool(true));
+
+        // Keep the window alive across the async callback.
+        _ = self.ref();
+        const root = self.as(gtk.Widget).getRoot();
+        const parent: ?*gtk.Window = if (root) |r|
+            gobject.ext.cast(gtk.Window, r)
+        else
+            null;
+        dialog.selectFolder(parent, null, sidebarAddFolderFinish, self);
+    }
+
+    fn sidebarAddFolderFinish(
+        source: ?*gobject.Object,
+        res: *gio.AsyncResult,
+        ud: ?*anyopaque,
+    ) callconv(.c) void {
+        const self: *Window = @ptrCast(@alignCast(ud orelse return));
+        defer self.unref();
+        const dialog = gobject.ext.cast(gtk.FileDialog, source orelse return) orelse return;
+
+        var gerr: ?*glib.Error = null;
+        const file = dialog.selectFolderFinish(res, &gerr) orelse {
+            if (gerr) |err| {
+                defer err.free();
+                // DISMISSED (user cancelled) is expected and not worth a warning.
+                log.debug("sidebar: folder picker closed: {s}", .{err.f_message orelse "(dismissed)"});
+            }
+            return;
+        };
+        defer file.unref();
+
+        const cpath = file.getPath() orelse return;
+        defer glib.free(cpath);
+        const raw_path = std.mem.sliceTo(cpath, 0);
+
+        const alloc = Application.default().allocator();
+        const priv = self.private();
+
+        // Canonicalize so the stored entry matches git's `--show-toplevel`
+        // (which is realpath'd): this keeps the per-repo remove (✕) button's
+        // `contains()` check true for symlinked / trailing-slash picks. Fall
+        // back to the raw path if realpath fails (e.g. permissions).
+        var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+        const path = std.fs.cwd().realpath(raw_path, &path_buf) catch raw_path;
+
+        const added = priv.sidebar_store.add(alloc, path) catch |err| {
+            log.warn("sidebar: cannot add root {s}: {}", .{ path, err });
+            return;
+        };
+        if (!added) return; // already present
+
+        sidebar_store.save(alloc, &priv.sidebar_store) catch |err| {
+            log.warn("sidebar: cannot persist after add: {}", .{err});
+        };
+        self.refreshSidebar();
+    }
+
+    /// Remove a project root from the sidebar store and rescan. Used by the
+    /// repo-header remove (✕) button, which only appears for repos whose root
+    /// is an exact store entry (#21 removal). An exact match is therefore the
+    /// only case we need to handle.
+    fn removeSidebarRoot(self: *Window, repo_root: []const u8) void {
+        const alloc = Application.default().allocator();
+        const priv = self.private();
+
+        if (!priv.sidebar_store.remove(alloc, repo_root)) return;
+
+        sidebar_store.save(alloc, &priv.sidebar_store) catch |err| {
+            log.warn("sidebar: cannot persist after remove: {}", .{err});
+        };
+        self.refreshSidebar();
     }
 
     /// Rebuild the ListBox rows from `sidebar_statuses`, grouping worktrees
@@ -1974,8 +2066,56 @@ pub const Window = extern struct {
             box.append(badge_label.as(gtk.Widget));
         }
 
+        // Remove (✕) button (#21): drops this repo's folder from the curated
+        // sidebar store. Only shown when this repo's root is itself an exact
+        // store entry — repos discovered via a parent folder (e.g. a `~/git`
+        // root) are not individually removable, so clicking ✕ can never
+        // silently drop a whole parent folder of sibling repos. The repo_root
+        // is attached as glib-owned data so the handler knows which root to
+        // remove without index bookkeeping.
+        const repo_root_str = if (group.len > 0) group[0].repo_root else "";
+        if (repo_root_str.len > 0 and self.private().sidebar_store.contains(repo_root_str)) {
+            const remove_btn = gtk.Button.new();
+            remove_btn.setIconName("window-close-symbolic");
+            remove_btn.as(gtk.Widget).addCssClass("flat");
+            remove_btn.as(gtk.Widget).setValign(.center);
+            remove_btn.as(gtk.Widget).setTooltipText("Remove Folder");
+            const root_z = alloc.dupeZ(u8, repo_root_str) catch return row;
+            defer alloc.free(root_z);
+            remove_btn.as(gobject.Object).setDataFull(
+                "supacode-repo-root",
+                glib.strdup(root_z.ptr),
+                glibFreeData,
+            );
+            _ = gtk.Button.signals.clicked.connect(
+                remove_btn,
+                *Window,
+                sidebarRemoveClicked,
+                self,
+                .{},
+            );
+            box.append(remove_btn.as(gtk.Widget));
+        }
+
         row.setChild(box.as(gtk.Widget));
         return row;
+    }
+
+    /// GDestroyNotify that frees a glib-allocated blob attached via setDataFull.
+    fn glibFreeData(ptr: ?*anyopaque) callconv(.c) void {
+        if (ptr) |p| glib.free(p);
+    }
+
+    /// Click handler for a repo header's remove (✕) button. Dupes the path
+    /// before calling `removeSidebarRoot`, because that rebuilds the sidebar
+    /// (destroying this button and the glib-owned data behind `cstr`).
+    fn sidebarRemoveClicked(btn: *gtk.Button, self: *Window) callconv(.c) void {
+        const data = btn.as(gobject.Object).getData("supacode-repo-root") orelse return;
+        const cstr: [*:0]const u8 = @ptrCast(data);
+        const alloc = Application.default().allocator();
+        const path = alloc.dupe(u8, std.mem.sliceTo(cstr, 0)) catch return;
+        defer alloc.free(path);
+        self.removeSidebarRoot(path);
     }
 
     /// Build one ListBoxRow widget for a worktree status (leaf under a repo).
@@ -3418,6 +3558,7 @@ pub const Window = extern struct {
             class.bindTemplateChildPrivate("toast_overlay", .{});
             class.bindTemplateChildPrivate("split_view", .{});
             class.bindTemplateChildPrivate("sidebar_list", .{});
+            class.bindTemplateChildPrivate("sidebar_add_button", .{});
             class.bindTemplateChildPrivate("agent_banner", .{});
             class.bindTemplateChildPrivate("identity_chip", .{});
             class.bindTemplateChildPrivate("identity_avatar", .{});
@@ -3430,6 +3571,7 @@ pub const Window = extern struct {
 
             // Template Callbacks
             class.bindTemplateCallback("realize", &windowRealize);
+            class.bindTemplateCallback("sidebar_add_clicked", &sidebarAddClicked);
             class.bindTemplateCallback("agent_banner_clicked", &agentBannerClicked);
             class.bindTemplateCallback("notification_row_activated", &notificationRowActivated);
             class.bindTemplateCallback("notification_clear_clicked", &notificationClearClicked);
