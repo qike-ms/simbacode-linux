@@ -2132,6 +2132,11 @@ pub const Window = extern struct {
         else
             "#98c379";
 
+        // When this worktree has an unclicked notification, the leading marker
+        // becomes a bell instead of the status dot (clicking the row jumps to
+        // the notifying tab). Otherwise it stays the git-status dot.
+        const has_attention = self.pathHasAttention(st.path);
+
         const branch_z = alloc.dupeZ(u8, st.branch) catch return row;
         defer alloc.free(branch_z);
         const branch_esc = glib.markupEscapeText(branch_z.ptr, -1);
@@ -2153,18 +2158,25 @@ pub const Window = extern struct {
             if (st.added > 0 or st.removed > 0) {
                 w.print("<small><span foreground='#98c379'>+{d}</span> <span foreground='#e06c75'>-{d}</span></small>", .{ st.added, st.removed }) catch {};
             }
-            // Attention badge (OSC-3008): bell glyph in red.
-            if (self.pathHasAttention(st.path)) w.print(" <span foreground='#e06c75'>\u{1F514}</span>", .{}) catch {};
             break :blk std.mem.trim(u8, stream.getWritten(), " ");
         };
 
-        // Name label (left): status dot + branch, expanding/ellipsizing.
-        const markup = std.fmt.allocPrintSentinel(
-            alloc,
-            "<span foreground='{s}'>\u{25CF}</span> <span foreground='#bbb'>{s}</span>",
-            .{ dot_color, branch_esc },
-            0,
-        ) catch return row;
+        // Name label (left): a leading bell (attention) or git-status dot, then
+        // the branch, expanding/ellipsizing.
+        const markup = if (has_attention)
+            std.fmt.allocPrintSentinel(
+                alloc,
+                "<span foreground='#e06c75'>\u{1F514}</span> <span foreground='#bbb'>{s}</span>",
+                .{branch_esc},
+                0,
+            ) catch return row
+        else
+            std.fmt.allocPrintSentinel(
+                alloc,
+                "<span foreground='{s}'>\u{25CF}</span> <span foreground='#bbb'>{s}</span>",
+                .{ dot_color, branch_esc },
+                0,
+            ) catch return row;
         defer alloc.free(markup);
 
         const label = gtk.Label.new(null);
@@ -2241,6 +2253,12 @@ pub const Window = extern struct {
     /// set of terminal tabs (Worktree.ID -> [TerminalTabID]); the user can open
     /// many tabs/splits under one folder, not just one.
     fn openWorktree(self: *Window, st: *const sidebar.WorktreeStatus) void {
+        // If this worktree has an unclicked notification, jump straight to the
+        // (most recent) notifying surface/tab instead of just switching views.
+        if (self.pathHasAttention(st.path)) {
+            if (self.focusAttentionSurfaceForPath(st.path)) return;
+        }
+
         const view = self.ensureWorktreeView(st.path);
         const had_tabs = view.getNPages() > 0;
         self.switchToWorktreeView(view);
@@ -2251,6 +2269,31 @@ pub const Window = extern struct {
         }
     }
 
+    /// Focus the surface (and its tab/worktree view) that holds attention for
+    /// `path`. When several surfaces under the same worktree have attention we
+    /// pick the last one recorded (most recent). Returns true if a surface was
+    /// focused. Navigating there clears the tab's attention (the "seen it"
+    /// signal), dropping its bell.
+    fn focusAttentionSurfaceForPath(self: *Window, path: []const u8) bool {
+        const priv = self.private();
+        // Iterate in insertion-ish order; keep the last match as "most recent".
+        var chosen: ?*Surface = null;
+        var it = priv.sidebar_attention.iterator();
+        while (it.next()) |entry| {
+            if (std.mem.eql(u8, entry.value_ptr.*, path)) chosen = entry.key_ptr.*;
+        }
+        const surface = chosen orelse return false;
+        const tab = ext.getAncestor(Tab, surface.as(gtk.Widget)) orelse return false;
+        const view = self.viewForTab(tab);
+        const page = view.getPage(tab.as(gtk.Widget));
+        self.switchToWorktreeView(view);
+        view.setSelectedPage(page);
+        _ = surface.as(gtk.Widget).grabFocus();
+        // The user has now seen it: clear this tab's attention + bells.
+        self.clearTabAttention(surface);
+        return true;
+    }
+
     /// Whether any surface flagged for attention maps to `path`. Drives the
     /// sidebar bell so two surfaces sharing a worktree aggregate correctly.
     fn pathHasAttention(self: *Window, path: []const u8) bool {
@@ -2259,6 +2302,11 @@ pub const Window = extern struct {
             if (std.mem.eql(u8, v.*, path)) return true;
         }
         return false;
+    }
+
+    /// Whether a specific surface currently holds (unclicked) attention.
+    fn pathHasSurfaceAttention(self: *Window, surface: *Surface) bool {
+        return self.private().sidebar_attention.contains(surface);
     }
 
     /// Flag (or clear) a surface as needing attention, recording its worktree
@@ -2287,6 +2335,14 @@ pub const Window = extern struct {
             } else return;
         }
 
+        // Drive the per-tab bell (Adw.TabPage needs-attention + the indicator
+        // bell emblem) for the surface's tab. On set, mark it; on clear, only
+        // drop it when no OTHER surface in the tab still holds attention.
+        if (ext.getAncestor(Tab, surface.as(gtk.Widget))) |tab| {
+            self.setTabNeedsAttention(tab, if (active) true else self.tabHasAttention(tab));
+            self.refreshTabAgentIcon(surface);
+        }
+
         self.rebuildSidebarRows();
     }
 
@@ -2298,6 +2354,60 @@ pub const Window = extern struct {
         if (priv.sidebar_attention.fetchRemove(surface)) |kv| {
             alloc.free(kv.value);
             return true;
+        }
+        return false;
+    }
+
+    /// Clear attention (the "unclicked notification" mark) for every surface in
+    /// the tab that owns `surface`. Called when the user navigates to a tab,
+    /// which is the natural "I've seen it" signal: it drops the tab's bell
+    /// indicator and the sidebar bell for that worktree. Refreshes the tab icon
+    /// and sidebar so the bells disappear immediately.
+    fn clearTabAttention(self: *Window, surface: *Surface) void {
+        const priv = self.private();
+        const tab = ext.getAncestor(Tab, surface.as(gtk.Widget)) orelse {
+            // No owning tab (shouldn't happen): just clear this surface.
+            if (self.clearSurfaceAttention(surface)) {
+                self.refreshTabAgentIcon(surface);
+                self.rebuildSidebarRows();
+            }
+            return;
+        };
+
+        // Collect surfaces in this tab that currently hold attention, then
+        // clear them (mutating the map while iterating is unsafe).
+        var to_clear: std.ArrayListUnmanaged(*Surface) = .empty;
+        defer to_clear.deinit(Application.default().allocator());
+        var it = priv.sidebar_attention.keyIterator();
+        while (it.next()) |k| {
+            const s = k.*;
+            if (ext.getAncestor(Tab, s.as(gtk.Widget))) |t| {
+                if (t == tab) to_clear.append(Application.default().allocator(), s) catch {};
+            }
+        }
+        if (to_clear.items.len == 0) return;
+        for (to_clear.items) |s| _ = self.clearSurfaceAttention(s);
+
+        self.refreshTabAgentIcon(surface);
+        self.setTabNeedsAttention(tab, false);
+        self.rebuildSidebarRows();
+    }
+
+    /// Set the Adw.TabPage `needs-attention` flag for `tab`'s page. This is the
+    /// built-in unselected-tab highlight; we pair it with the bell emblem on
+    /// the indicator icon so an attention tab is obvious even when selected.
+    fn setTabNeedsAttention(self: *Window, tab: *Tab, needs: bool) void {
+        const page = self.viewForTab(tab).getPage(tab.as(gtk.Widget));
+        page.setNeedsAttention(@intFromBool(needs));
+    }
+
+    /// Whether any surface in `tab` currently holds (unclicked) attention.
+    fn tabHasAttention(self: *Window, tab: *Tab) bool {
+        var it = self.private().sidebar_attention.keyIterator();
+        while (it.next()) |k| {
+            if (ext.getAncestor(Tab, k.*.as(gtk.Widget))) |t| {
+                if (t == tab) return true;
+            }
         }
         return false;
     }
@@ -2513,8 +2623,31 @@ pub const Window = extern struct {
         if (chosen) |a| {
             if (a.newIcon()) |icon| {
                 defer icon.unref();
+                // Overlay a bell emblem when this tab holds unclicked attention
+                // (a notification the user hasn't navigated to yet), so the tab
+                // shows "<agent> + bell" in its title bar.
+                if (self.tabHasAttention(tab)) {
+                    if (agentpkg.newBellIcon()) |bell| {
+                        defer bell.unref();
+                        const emblem = gio.Emblem.new(bell);
+                        defer emblem.unref();
+                        const emblemed = gio.EmblemedIcon.new(icon, emblem);
+                        defer emblemed.unref();
+                        page.setIndicatorIcon(emblemed.as(gio.Icon));
+                        page.setIndicatorTooltip(a.label().ptr);
+                        return;
+                    }
+                }
                 page.setIndicatorIcon(icon);
                 page.setIndicatorTooltip(a.label().ptr);
+            }
+        } else if (self.tabHasAttention(tab)) {
+            // No agent, but the tab has an unclicked notification: show a bare
+            // bell so the tab still signals attention.
+            if (agentpkg.newBellIcon()) |bell| {
+                defer bell.unref();
+                page.setIndicatorIcon(bell);
+                page.setIndicatorTooltip("Notification");
             }
         } else {
             page.setIndicatorIcon(null);
@@ -2977,6 +3110,15 @@ pub const Window = extern struct {
         // active page's attention (#7 review: emitting-view awareness).
         if (view != self.activeTabView()) return;
         self.refreshActiveTabBinding();
+
+        // The user navigated to this tab: treat it as "seen", clearing any
+        // unclicked notification on it (drops the tab bell + sidebar bell).
+        if (view.getSelectedPage()) |page| {
+            const child = page.getChild();
+            if (gobject.ext.cast(Tab, child)) |tab| {
+                if (tab.getActiveSurface()) |s| self.clearTabAttention(s);
+            }
+        }
     }
 
     fn tabViewPageAttached(
@@ -3326,6 +3468,14 @@ pub const Window = extern struct {
     ) callconv(.c) void {
         const surface = tab.getActiveSurface() orelse return;
         self.refreshTabAgentIcon(surface);
+        // Focusing a pane within the tab that is the active worktree view also
+        // counts as "seen": clear that surface's attention so a split's bell
+        // drops when the user lands on the notifying pane.
+        if (self.as(gtk.Window).isActive() != 0 and
+            self.viewForTab(tab) == self.activeTabView())
+        {
+            if (self.pathHasSurfaceAttention(surface)) self.clearTabAttention(surface);
+        }
     }
 
     fn tabSplitTreeChanged(

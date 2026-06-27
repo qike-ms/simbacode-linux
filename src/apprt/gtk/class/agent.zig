@@ -96,6 +96,17 @@ pub const Agent = enum {
     }
 };
 
+/// Build a standalone bell `gio.Icon` (BytesIcon), used as the
+/// unclicked-notification mark in the sidebar and as a tab-indicator emblem.
+/// Caller owns a reference and must `unref` it.
+pub fn newBellIcon() ?*gio.Icon {
+    const data = @embedFile("agent-icons/bell-symbolic.svg");
+    const bytes = glib.Bytes.new(data.ptr, data.len);
+    defer bytes.unref();
+    const icon = gio.BytesIcon.new(bytes);
+    return icon.as(gio.Icon);
+}
+
 test "Agent.parse known agents" {
     const testing = std.testing;
     try testing.expectEqual(Agent.claude, Agent.parse("claude").?);
