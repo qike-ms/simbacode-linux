@@ -41,6 +41,23 @@ pub const Command = struct {
     ) option.Type() {
         return option.read(self.metadata);
     }
+
+    /// The Supacode agent-presence hook event carried in `event=`, or null if
+    /// the field is absent or carries an unknown value. This is the
+    /// authoritative presence signal (AgentPresenceOSC.parse keys off it);
+    /// the OSC start/end action byte is descriptive only.
+    pub fn hookEvent(self: Command) ?HookEvent {
+        const raw = self.readOption(.event) orelse return null;
+        return HookEvent.parse(raw);
+    }
+
+    /// True when the metadata carries `kind=notify` (the rich-notification
+    /// leg). Cheap routing check that inspects the `kind` field, not a raw
+    /// substring, mirroring AgentPresenceOSC.isNotifyMetadata.
+    pub fn isNotify(self: Command) bool {
+        const kind = self.readOption(.kind) orelse return false;
+        return std.mem.eql(u8, kind, "notify");
+    }
 };
 
 /// Context types defined by the specification.
@@ -75,6 +92,30 @@ pub const ExitStatus = enum {
     }
 };
 
+/// Supacode agent-presence hook events carried in the `event=` metadata field.
+/// This is the authoritative event vocabulary ported verbatim from the macOS
+/// source (`AgentHookSettingsCommand.HookEvent` /
+/// `AgentPresenceFeature.Activity`): the wire `event=` rawValues must match
+/// byte-for-byte so the same agent hooks emit compatibly to both apps.
+///
+///   session_start / session_end -> presence on/off (Active membership + icon)
+///   busy / idle                 -> activity (working spinner vs waiting)
+///   awaiting_input              -> attention (needs-you banner / bell)
+///
+/// `event=` is authoritative; the OSC `start=`/`end=` action byte is
+/// descriptive only (the app keys off `event=`, mirroring AgentPresenceOSC).
+pub const HookEvent = enum {
+    session_start,
+    session_end,
+    busy,
+    awaiting_input,
+    idle,
+
+    pub fn parse(value: []const u8) ?HookEvent {
+        return std.meta.stringToEnum(HookEvent, value);
+    }
+};
+
 /// Metadata fields that can appear in OSC 3008 sequences.
 /// Fields are read lazily from the raw string using the `read` method.
 pub const Field = enum {
@@ -100,6 +141,14 @@ pub const Field = enum {
     status,
     signal,
 
+    // Supacode agent-presence fields (OSC 3008 metadata, AgentPresenceOSC).
+    // `event` carries a HookEvent rawValue; `pid` (above) is the agent's local
+    // process id for the liveness sweep. The notify leg uses kind/title/body.
+    event,
+    kind,
+    title,
+    body,
+
     pub fn Type(comptime self: Field) type {
         return switch (self) {
             .type => ?ContextType,
@@ -120,6 +169,10 @@ pub const Field = enum {
             .targethost,
             .sessionid,
             .signal,
+            .event,
+            .kind,
+            .title,
+            .body,
             => ?[]const u8,
         };
     }
@@ -186,6 +239,10 @@ pub const Field = enum {
                 .targethost,
                 .sessionid,
                 .signal,
+                .event,
+                .kind,
+                .title,
+                .body,
                 => if (value.len > 0) value else null,
             };
         }
@@ -538,4 +595,108 @@ test "OSC 3008: start command with no fields" {
     try testing.expect(cmd.context_signal.readOption(.type) == null);
     try testing.expect(cmd.context_signal.readOption(.user) == null);
     try testing.expect(cmd.context_signal.readOption(.exit) == null);
+}
+
+// ============================================================================
+// Supacode agent-presence event vocabulary tests
+// ============================================================================
+
+test "OSC 3008: agent-presence session_start event" {
+    const testing = std.testing;
+
+    var p: Parser = .init(null);
+    // Wire shape: OSC 3008 ; start=<agent> ; event=session_start ; pid=<pid> ST
+    const input = "3008;start=pi;event=session_start;pid=4242";
+    for (input) |ch| p.next(ch);
+
+    const cmd = p.end(null).?.*;
+    try testing.expect(cmd == .context_signal);
+    try testing.expect(cmd.context_signal.action == .start);
+    try testing.expectEqualStrings("pi", cmd.context_signal.id);
+    try testing.expect(cmd.context_signal.hookEvent().? == .session_start);
+    try testing.expectEqual(@as(u64, 4242), cmd.context_signal.readOption(.pid).?);
+}
+
+test "OSC 3008: agent-presence session_end uses end action" {
+    const testing = std.testing;
+
+    var p: Parser = .init(null);
+    const input = "3008;end=claude;event=session_end";
+    for (input) |ch| p.next(ch);
+
+    const cmd = p.end(null).?.*;
+    try testing.expect(cmd == .context_signal);
+    try testing.expect(cmd.context_signal.action == .end);
+    try testing.expectEqualStrings("claude", cmd.context_signal.id);
+    try testing.expect(cmd.context_signal.hookEvent().? == .session_end);
+    // pid is omitted over SSH.
+    try testing.expect(cmd.context_signal.readOption(.pid) == null);
+}
+
+test "OSC 3008: agent-presence busy/idle/awaiting_input events" {
+    const testing = std.testing;
+
+    const cases = [_]struct { input: []const u8, expected: HookEvent }{
+        .{ .input = "3008;start=codex;event=busy", .expected = .busy },
+        .{ .input = "3008;start=codex;event=idle", .expected = .idle },
+        .{ .input = "3008;start=codex;event=awaiting_input", .expected = .awaiting_input },
+    };
+
+    for (cases) |c| {
+        var p: Parser = .init(null);
+        for (c.input) |ch| p.next(ch);
+        const cmd = p.end(null).?.*;
+        try testing.expect(cmd == .context_signal);
+        try testing.expect(cmd.context_signal.hookEvent().? == c.expected);
+    }
+}
+
+test "OSC 3008: unknown event value yields null hookEvent" {
+    const testing = std.testing;
+
+    var p: Parser = .init(null);
+    const input = "3008;start=pi;event=bogus_event";
+    for (input) |ch| p.next(ch);
+
+    const cmd = p.end(null).?.*;
+    try testing.expect(cmd == .context_signal);
+    try testing.expect(cmd.context_signal.hookEvent() == null);
+}
+
+test "OSC 3008: notify metadata routing" {
+    const testing = std.testing;
+
+    var p: Parser = .init(null);
+    const input = "3008;start=pi;kind=notify;title=aGk=;body=Ym9keQ==";
+    for (input) |ch| p.next(ch);
+
+    const cmd = p.end(null).?.*;
+    try testing.expect(cmd == .context_signal);
+    try testing.expect(cmd.context_signal.isNotify());
+    try testing.expectEqualStrings("aGk=", cmd.context_signal.readOption(.title).?);
+    try testing.expectEqualStrings("Ym9keQ==", cmd.context_signal.readOption(.body).?);
+    // A presence signal is NOT notify.
+    try testing.expect(cmd.context_signal.hookEvent() == null);
+}
+
+test "OSC 3008: presence signal is not notify" {
+    const testing = std.testing;
+
+    var p: Parser = .init(null);
+    const input = "3008;start=pi;event=busy";
+    for (input) |ch| p.next(ch);
+
+    const cmd = p.end(null).?.*;
+    try testing.expect(cmd == .context_signal);
+    try testing.expect(!cmd.context_signal.isNotify());
+}
+
+test "OSC 3008: HookEvent.parse coverage" {
+    const testing = std.testing;
+    try testing.expect(HookEvent.parse("session_start").? == .session_start);
+    try testing.expect(HookEvent.parse("session_end").? == .session_end);
+    try testing.expect(HookEvent.parse("busy").? == .busy);
+    try testing.expect(HookEvent.parse("idle").? == .idle);
+    try testing.expect(HookEvent.parse("awaiting_input").? == .awaiting_input);
+    try testing.expect(HookEvent.parse("nope") == null);
 }

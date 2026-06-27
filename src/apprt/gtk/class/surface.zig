@@ -585,6 +585,18 @@ pub const Surface = extern struct {
         /// The title of this surface, if any has been set.
         title: ?[:0]const u8 = null,
 
+        /// Supacode: a stable, per-surface identifier injected into the child
+        /// process environment as `SUPACODE_SURFACE_ID`. This is the gate that
+        /// makes agent hooks fire: each agent's `# supacode-managed-hook` block
+        /// is guarded on `[ -n "${SUPACODE_SURFACE_ID:-}" ]`, so without it
+        /// every installed hook no-ops. Generated once at surface construction
+        /// and owned (freed in finalize). Mirrors the macOS app, which injects
+        /// a per-surface UUID; on Linux attribution still comes from the
+        /// receiving surface (the OSC arrives on the emitting tty), so the id's
+        /// only job is to pass the guard, but we keep it stable + unique so a
+        /// future correlation use (e.g. SSH) has a real handle.
+        supacode_surface_id: ?[:0]const u8 = null,
+
         /// The manually overridden title of this surface from `promptTitle`.
         title_override: ?[:0]const u8 = null,
 
@@ -1609,7 +1621,72 @@ pub const Surface = extern struct {
             }
         }
 
+        // Supacode agent-presence env injection. `SUPACODE_SURFACE_ID` is the
+        // gate every installed agent hook checks (`[ -n "${SUPACODE_SURFACE_ID:-}" ]`):
+        // without it the hooks are inert no-ops, which is exactly why "Active"
+        // only ever showed the focused worktree. We also export the worktree
+        // and tab ids for parity with the macOS surface env (the legacy 4-var
+        // guard reads them); on Linux attribution is by the receiving surface,
+        // so they're informational, but kept so the same hook shells run
+        // unmodified. See AgentPresenceOSC.swift / AgentHookSettingsCommand.swift.
+        try self.injectSupacodeEnv(&env);
+
         return env;
+    }
+
+    /// Inject the `SUPACODE_*` surface env vars used by agent-presence hooks.
+    /// `SUPACODE_SURFACE_ID` is the load-bearing gate; `SUPACODE_WORKTREE_ID`
+    /// and `SUPACODE_TAB_ID` are parity fields. The surface id is generated
+    /// once and cached so it stays stable across env rebuilds for this surface.
+    fn injectSupacodeEnv(self: *Self, env: *std.process.EnvMap) !void {
+        const priv = self.private();
+        const sid = priv.supacode_surface_id orelse sid: {
+            const generated = supacodeGenerateSurfaceId() catch break :sid null;
+            priv.supacode_surface_id = generated;
+            break :sid generated;
+        };
+        if (sid) |s| {
+            try env.put("SUPACODE_SURFACE_ID", s);
+            // Tab id: stable per surface here (one id per surface is a valid
+            // tab handle); the worktree id comes from the owning window's
+            // worktree path when available.
+            try env.put("SUPACODE_TAB_ID", s);
+            // The macOS hook emits the local `pid=` suffix only when
+            // SUPACODE_SOCKET_PATH is set (its "local host" marker). On Linux
+            // the OSC always reaches the local surface, so we always want the
+            // pid for the liveness sweep: set SUPACODE_SOCKET_PATH to the
+            // surface id (a non-empty local marker) so the same unmodified hook
+            // shells emit pid=$PPID. There is no real socket; the value is only
+            // a presence flag, never opened.
+            try env.put("SUPACODE_SOCKET_PATH", s);
+        }
+        if (ext.getAncestor(Window, self.as(gtk.Widget))) |window| {
+            if (window.worktreeIdForSurface(self)) |wid| {
+                try env.put("SUPACODE_WORKTREE_ID", wid);
+            }
+        }
+    }
+
+    /// Generate a stable, unique surface id for `SUPACODE_SURFACE_ID`. Caller
+    /// owns the returned, NUL-terminated string (allocated with the app
+    /// allocator). Format: `sc-<hex>` from a 128-bit random value, so it is
+    /// collision-free across surfaces and carries no PII.
+    fn supacodeGenerateSurfaceId() ![:0]const u8 {
+        const alloc = Application.default().allocator();
+        var bytes: [16]u8 = undefined;
+        std.crypto.random.bytes(&bytes);
+        var hex: [32]u8 = undefined;
+        const charset = "0123456789abcdef";
+        for (bytes, 0..) |b, i| {
+            hex[i * 2] = charset[b >> 4];
+            hex[i * 2 + 1] = charset[b & 0x0f];
+        }
+        return std.fmt.allocPrintSentinel(
+            alloc,
+            "sc-{s}",
+            .{hex},
+            0,
+        );
     }
 
     /// Filter out environment variables that start with forbidden prefixes.
@@ -1923,6 +2000,10 @@ pub const Surface = extern struct {
         if (priv.pwd) |v| {
             glib.free(@ptrCast(@constCast(v)));
             priv.pwd = null;
+        }
+        if (priv.supacode_surface_id) |v| {
+            alloc.free(v);
+            priv.supacode_surface_id = null;
         }
         if (priv.title) |v| {
             glib.free(@ptrCast(@constCast(v)));

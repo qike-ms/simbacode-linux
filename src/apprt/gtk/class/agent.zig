@@ -16,6 +16,17 @@ const glib = @import("glib");
 
 const log = std.log.scoped(.supacode_agent);
 
+/// Agent activity state, set by OSC-3008 busy/idle/awaiting_input events.
+/// Ported verbatim from AgentPresenceFeature.Activity (macOS): `busy` is
+/// working (drives the shimmer), `idle` is waiting (turn finished, not parked
+/// on the user), `awaiting_input` is the explicit needs-you prompt that drives
+/// the attention banner/bell.
+pub const Activity = enum {
+    idle,
+    busy,
+    awaiting_input,
+};
+
 /// Known coding agents, matching the macOS asset marks
 /// (claude-code-mark, codex-mark, pi-mark, kiro-mark) plus a generic fallback.
 pub const Agent = enum {

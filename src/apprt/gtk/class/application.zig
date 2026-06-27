@@ -37,6 +37,7 @@ const Config = @import("config.zig").Config;
 const Surface = @import("surface.zig").Surface;
 const SplitTree = @import("split_tree.zig").SplitTree;
 const agentpkg = @import("agent.zig");
+const context_signal = @import("../../../terminal/osc/parsers/context_signal.zig");
 const Window = @import("window.zig").Window;
 const Tab = @import("tab.zig").Tab;
 const CloseConfirmationDialog = @import("close_confirmation_dialog.zig").CloseConfirmationDialog;
@@ -2430,6 +2431,28 @@ const Action = struct {
             value.action, value.id, value.metadata,
         });
 
+        // Route the rich-notification leg (kind=notify;title=<b64>;body=<b64>)
+        // separately from presence. Mirrors AgentPresenceOSC.isNotifyMetadata:
+        // a notify carries no `event=`, so it must be handled before the
+        // presence path or it would be dropped.
+        if (parseKindField(value.metadata)) |kind| {
+            if (std.mem.eql(u8, kind, "notify")) {
+                handleNotifySignal(self, window, surface, value);
+                return true;
+            }
+        }
+
+        // Authoritative agent-presence path: the `event=` field carries a
+        // HookEvent rawValue (session_start|session_end|busy|awaiting_input|
+        // idle) and the OSC id is the agent name. This is the macOS wire shape
+        // (AgentPresenceOSC / AgentHookSettingsCommand). When present it is the
+        // source of truth; the legacy `agent=`/`attention=` shape below is the
+        // fallback for the older pi-extension / supacode-signal emitters.
+        if (parseEventField(value.metadata)) |event| {
+            handlePresenceEvent(self, window, surface, value, event);
+            return true;
+        }
+
         // Parse an `agent=<name>` field from the metadata, if present. This is
         // how an agent announces its identity to the surface (trio decision:
         // OSC carries identity because the escape is already surface-scoped, so
@@ -2522,6 +2545,282 @@ const Action = struct {
         }
 
         return true;
+    }
+
+    /// Map an authoritative agent-presence `event=` to the surface's presence,
+    /// activity, and attention state. This is the macOS event vocabulary
+    /// (HookEvent: session_start|session_end|busy|awaiting_input|idle), with
+    /// the OSC context id carrying the agent name. Mirrors
+    /// AgentPresenceFeature.apply: session_start/end drive presence (tab icon +
+    /// Active membership), busy/idle drive activity, awaiting_input is the
+    /// needs-you attention signal.
+    fn handlePresenceEvent(
+        self: *Application,
+        window: ?*Window,
+        surface: *Surface,
+        value: apprt.action.ContextSignal,
+        event: context_signal.HookEvent,
+    ) void {
+        // The agent name is the OSC context id (start=<agent>). Fall back to a
+        // generic agent when it isn't a recognized name.
+        const agent: agentpkg.Agent = if (value.id.len > 0)
+            (agentpkg.Agent.parse(value.id) orelse .generic)
+        else
+            .generic;
+
+        // Optional local pid for the liveness sweep (present only on the local
+        // host; omitted over SSH). Drives the periodic sweep that reaps a
+        // crashed local agent that never sent session_end. Reject non-positive
+        // pids: kill(0/-N, 0) targets process groups (AgentPresenceOSC.parsePid).
+        const local_pid: ?std.posix.pid_t = if (fieldValue(value.metadata, "pid")) |raw|
+            (if (std.fmt.parseInt(std.posix.pid_t, raw, 10) catch null) |p|
+                (if (p > 0) p else null)
+            else
+                null)
+        else
+            null;
+
+        switch (event) {
+            .session_start => {
+                // Presence on: attach the agent (tab icon + Active membership).
+                if (window) |win| {
+                    win.setSurfaceAgent(surface, agent);
+                    // Only record a pid when one was carried (local host). A
+                    // pid-less session_start must NOT clobber a previously
+                    // tracked pid (AgentPresenceFeature pid-less branch).
+                    if (local_pid != null) win.setSurfaceAgentPid(surface, local_pid);
+                }
+                // A fresh session clears any stale attention on this surface.
+                clearSurfaceAttention(self, window, surface);
+            },
+            .session_end => {
+                // Presence off: detach the agent and clear attention/banner.
+                if (window) |win| {
+                    win.setSurfaceAgent(surface, null);
+                    win.hideAgentBannerFor(surface);
+                }
+                clearSurfaceAttention(self, window, surface);
+            },
+            .busy => {
+                // Working: ensure presence (auto-seed like the macOS app's
+                // pid-less activity path) and clear the needs-you state.
+                if (window) |win| {
+                    if (!win.surfaceHasAgent(surface)) win.setSurfaceAgent(surface, agent);
+                    if (local_pid != null) win.setSurfaceAgentPid(surface, local_pid);
+                    win.setSurfaceActivity(surface, .busy);
+                }
+                clearSurfaceAttention(self, window, surface);
+            },
+            .idle => {
+                // Waiting (turn finished, not parked on the user): keep the
+                // presence icon, mark idle, and clear attention.
+                if (window) |win| {
+                    if (win.surfaceHasAgent(surface)) win.setSurfaceActivity(surface, .idle);
+                }
+                clearSurfaceAttention(self, window, surface);
+            },
+            .awaiting_input => {
+                // Needs you: presence + attention. Show the banner + sidebar
+                // attention bell (the visible needs-you signal), but defer the
+                // desktop notification + bell-history entry to the notify leg,
+                // which carries the actual message body. Mirrors the macOS
+                // split: awaiting_input is the activity/attention state, the
+                // notify leg is the toast (so they don't double up).
+                if (window) |win| {
+                    if (!win.surfaceHasAgent(surface)) win.setSurfaceAgent(surface, agent);
+                    if (local_pid != null) win.setSurfaceAgentPid(surface, local_pid);
+                    win.setSurfaceActivity(surface, .awaiting_input);
+                    if (surface.getPwd()) |spwd| win.setSurfaceAttention(surface, spwd, true);
+                    win.showAgentBanner(surface, agent.label(), "");
+                }
+            },
+        }
+    }
+
+    /// Handle a rich-notification signal (kind=notify;title=<b64>;body=<b64>).
+    /// Decodes the base64 title/body and raises a desktop notification + bell
+    /// entry. Mirrors AgentPresenceOSC.parseNotify.
+    fn handleNotifySignal(
+        self: *Application,
+        window: ?*Window,
+        surface: *Surface,
+        value: apprt.action.ContextSignal,
+    ) void {
+        const alloc = self.allocator();
+        const agent: agentpkg.Agent = if (value.id.len > 0)
+            (agentpkg.Agent.parse(value.id) orelse .generic)
+        else
+            .generic;
+
+        const title_b64 = fieldValue(value.metadata, "title") orelse "";
+        const body_b64 = fieldValue(value.metadata, "body") orelse "";
+
+        var title_dec = decodeNotifyField(alloc, title_b64);
+        defer title_dec.deinit(alloc);
+        var body_dec = decodeNotifyField(alloc, body_b64);
+        defer body_dec.deinit(alloc);
+
+        // Title falls back to the agent name (AgentPresenceOSC.NotifySignal).
+        const title: []const u8 = if (title_dec.text()) |t| t else agent.label();
+        const body: []const u8 = body_dec.text() orelse "";
+
+        // The notify leg is the agent's done/needs-you alert: surface it as
+        // attention so it lands in the banner + bell + desktop notification,
+        // using the decoded title (not a hardcoded string).
+        raiseAttentionTitled(self, window, surface, title, body);
+    }
+
+    /// Clear attention + banner for a surface (presence-only or session reset).
+    fn clearSurfaceAttention(self: *Application, window: ?*Window, surface: *Surface) void {
+        _ = self;
+        if (window) |win| {
+            if (surface.getPwd()) |spwd| win.setSurfaceAttention(surface, spwd, false);
+            win.hideAgentBannerFor(surface);
+        }
+    }
+
+    /// Raise the needs-you attention signal for a surface: top banner, sidebar
+    /// bell entry, and a desktop notification. `title` is the display title
+    /// (agent label or decoded notify title); `detail` is the optional body.
+    fn raiseAttentionTitled(
+        self: *Application,
+        window: ?*Window,
+        surface: *Surface,
+        title: []const u8,
+        detail: []const u8,
+    ) void {
+        if (window) |win| {
+            if (surface.getPwd()) |spwd| win.setSurfaceAttention(surface, spwd, true);
+            win.showAgentBanner(surface, title, detail);
+            win.pushNotification(surface, title, detail);
+        }
+
+        const notif = gio.Notification.new("Agent needs attention");
+        defer notif.unref();
+        const alloc = self.allocator();
+        // Use the decoded title for the desktop notification too.
+        if (title.len > 0) {
+            if (alloc.dupeZ(u8, title)) |t| {
+                defer alloc.free(t);
+                notif.setTitle(t.ptr);
+            } else |_| {}
+        }
+        if (detail.len > 0) {
+            if (alloc.dupeZ(u8, detail)) |body| {
+                defer alloc.free(body);
+                notif.setBody(body.ptr);
+            } else |_| {}
+        }
+        const icon = gio.ThemedIcon.new("com.mitchellh.ghostty");
+        defer icon.unref();
+        notif.setIcon(icon.as(gio.Icon));
+        self.as(gio.Application).sendNotification("supacode-agent-attention", notif);
+    }
+
+    /// Parse the `event=` field as a HookEvent, or null if absent/unknown.
+    /// Rejects a duplicate `event=` field (returns null) to match
+    /// AgentPresenceOSC.parseFields' wire-splice defense: a repeated key could
+    /// otherwise flip perceived state to the last occurrence.
+    fn parseEventField(metadata: []const u8) ?context_signal.HookEvent {
+        if (fieldCount(metadata, "event") > 1) return null;
+        const v = fieldValue(metadata, "event") orelse return null;
+        return context_signal.HookEvent.parse(v);
+    }
+
+    /// Return the `kind=` field value (e.g. "notify"), or null when absent or
+    /// duplicated (duplicate `kind=` is rejected for the same wire-splice
+    /// reason as `event=`; AgentPresenceOSC.dedupedFields).
+    fn parseKindField(metadata: []const u8) ?[]const u8 {
+        if (fieldCount(metadata, "kind") > 1) return null;
+        return fieldValue(metadata, "kind");
+    }
+
+    /// Count how many times `field_key` appears as a key in a semicolon-
+    /// separated key=value metadata string. Used to reject duplicated
+    /// security-sensitive fields (event/kind).
+    fn fieldCount(metadata: []const u8, field_key: []const u8) usize {
+        var n: usize = 0;
+        var it = std.mem.splitScalar(u8, metadata, ';');
+        while (it.next()) |field| {
+            const eq = std.mem.indexOfScalar(u8, field, '=') orelse continue;
+            if (std.mem.eql(u8, field[0..eq], field_key)) n += 1;
+        }
+        return n;
+    }
+
+    /// A decoded notify field. Owns the full allocation (so free is always the
+    /// original buffer, never a shrunk sub-slice) and tracks the used prefix
+    /// length after control-char stripping. `text()` returns the live slice or
+    /// null when empty.
+    const DecodedField = struct {
+        buf: ?[]u8 = null,
+        used: usize = 0,
+
+        fn text(self: DecodedField) ?[]const u8 {
+            const b = self.buf orelse return null;
+            if (self.used == 0) return null;
+            return b[0..self.used];
+        }
+
+        fn deinit(self: *DecodedField, alloc: std.mem.Allocator) void {
+            if (self.buf) |b| alloc.free(b);
+            self.buf = null;
+            self.used = 0;
+        }
+    };
+
+    /// Decode a standard-base64 notify field into display text. Mirrors
+    /// AgentPresenceOSC.decodeNotifyValue: base64-decode, then JSON-string
+    /// unescape (the emit side copies the raw escaped JSON value verbatim, so
+    /// a body with `\n` / `\"` must be unescaped here or the literal backslash
+    /// sequences would render). Control chars are stripped last. Returns an
+    /// owned DecodedField (full allocation retained for a safe free).
+    fn decodeNotifyField(alloc: std.mem.Allocator, b64: []const u8) DecodedField {
+        if (b64.len == 0) return .{};
+        const decoder = std.base64.standard.Decoder;
+        const len = decoder.calcSizeForSlice(b64) catch return .{};
+        if (len == 0) return .{};
+        const out = alloc.alloc(u8, len) catch return .{};
+        decoder.decode(out, b64) catch {
+            alloc.free(out);
+            return .{};
+        };
+        // In-place JSON-string unescape + control-char strip. Both shrink, so
+        // we always write within `out`; the full buffer is freed via deinit.
+        var w: usize = 0;
+        var i: usize = 0;
+        while (i < out.len) : (i += 1) {
+            var c = out[i];
+            if (c == '\\' and i + 1 < out.len) {
+                i += 1;
+                c = switch (out[i]) {
+                    'n' => '\n',
+                    't' => '\t',
+                    'r' => '\r',
+                    'b' => 0x08,
+                    'f' => 0x0c,
+                    '"' => '"',
+                    '\\' => '\\',
+                    '/' => '/',
+                    // \uXXXX and unknown escapes: keep the following byte as-is
+                    // (best-effort; full \u handling is not needed for the
+                    // display-text use and a mid-escape cut is tolerated).
+                    else => out[i],
+                };
+            }
+            // Strip control chars (keep space 0x20 and printable bytes).
+            if (c >= 0x20 and c != 0x7f) {
+                out[w] = c;
+                w += 1;
+            }
+        }
+        // Defensive app-side length cap (the OSC doc promises "length-capped
+        // app-side"). The emit side already caps title/body (160/1000) and
+        // libghostty bounds the OSC at 2048, but cap here too so a hand-rolled
+        // emitter can't push an unbounded body into the UI.
+        const cap = 2048;
+        if (w > cap) w = cap;
+        return .{ .buf = out, .used = w };
     }
 
     /// Parse an `agent=<name>` field out of an OSC-3008 metadata string

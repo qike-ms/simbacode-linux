@@ -236,6 +236,17 @@ pub const Window = extern struct {
             agent: agentpkg.Agent,
             /// Owned NUL-terminated worktree path, or null for the default space.
             path: ?[:0]u8,
+            /// The agent's current activity, set by OSC-3008 busy/idle/
+            /// awaiting_input events. Mirrors AgentPresenceFeature.Activity:
+            /// busy = working, idle = waiting, awaiting_input = needs the user.
+            activity: agentpkg.Activity = .idle,
+            /// The agent's LOCAL process id, carried in `pid=` only when the
+            /// hook ran on the same host (gated on SUPACODE_SOCKET_PATH in the
+            /// emit; omitted over SSH). Null means "no local pid to track". The
+            /// liveness sweep reaps this entry when a non-null pid is dead, so a
+            /// crashed local agent that never sent session_end is cleaned up.
+            /// Mirrors AgentPresenceFeature.PresenceRecord.pids + livenessSweep.
+            pid: ?std.posix.pid_t = null,
         };
 
         /// Supacode (#22): aggregate agent presence for one worktree path.
@@ -299,6 +310,12 @@ pub const Window = extern struct {
         /// Supacode worktree sidebar: repeating poll timer (5s) that rescans
         /// the projects root for git worktree status.
         sidebar_timer: ?c_uint = null,
+
+        /// Supacode liveness-sweep timer. Periodically reaps agent presence
+        /// whose attributed local pid is dead — closing the deferred
+        /// agent-crash-TTL item. Mirrors AgentPresenceFeature.livenessSweep
+        /// (a 2s periodic kill(pid, 0) check). Removed in dispose.
+        liveness_timer: ?c_uint = null,
 
         /// The most recent worktree scan, owned by this window. Indexed by
         /// ListBox row index for row-activation -> open-worktree mapping.
@@ -1088,6 +1105,19 @@ pub const Window = extern struct {
         return null;
     }
 
+    /// A stable worktree id for `SUPACODE_WORKTREE_ID`, derived from the
+    /// surface's owning worktree path. Returns null for the default space
+    /// (no worktree) or when the surface isn't yet in a worktree view. The
+    /// returned slice is owned by the worktree_views map; callers must NOT
+    /// free it and must copy it before the map mutates. (Named "id" for parity
+    /// with the macOS env var; on Linux the worktree path IS the stable id and
+    /// attribution is by the receiving surface, so it is not percent-encoded.)
+    pub fn worktreeIdForSurface(self: *Self, surface: *Surface) ?[]const u8 {
+        const path = self.worktreePathForSurface(surface) orelse return null;
+        if (path.len == 0) return null;
+        return path;
+    }
+
     /// Whether worktree `path` has ≥1 running agent (#22). O(1) lookup into
     /// the incrementally-maintained `worktree_agents` map — never walks widget
     /// ancestry, so it's safe to call during teardown.
@@ -1672,6 +1702,10 @@ pub const Window = extern struct {
             _ = glib.Source.remove(timer);
             priv.sidebar_timer = null;
         }
+        if (priv.liveness_timer) |timer| {
+            _ = glib.Source.remove(timer);
+            priv.liveness_timer = null;
+        }
         if (priv.sidebar_statuses.len > 0) {
             sidebar.freeStatuses(alloc, priv.sidebar_statuses);
             priv.sidebar_statuses = &.{};
@@ -1821,6 +1855,52 @@ pub const Window = extern struct {
         // First scan immediately, then poll.
         self.refreshSidebar();
         priv.sidebar_timer = glib.timeoutAdd(5000, sidebarPollTimer, self);
+
+        // Start the agent-presence liveness sweep (AgentPresenceFeature
+        // livenessSweepInterval = 2s). Reaps presence whose local pid is dead.
+        priv.liveness_timer = glib.timeoutAdd(2000, livenessSweepTimer, self);
+    }
+
+    fn livenessSweepTimer(ud: ?*anyopaque) callconv(.c) c_int {
+        const self: *Window = @ptrCast(@alignCast(ud orelse return 0));
+        self.livenessSweep();
+        return @intFromBool(true);
+    }
+
+    /// Reap agent presence whose attributed local pid is dead. Mirrors
+    /// AgentPresenceFeature.liveness: a non-null pid that fails `kill(pid, 0)`
+    /// (process gone) means a crashed local agent that never sent session_end,
+    /// so its surface presence is cleared. Pid-less records (SSH attach) are
+    /// skipped — they have no local pid to check and are torn down by
+    /// session_end or surface close. Rebuilds the sidebar only if something
+    /// changed.
+    fn livenessSweep(self: *Window) void {
+        const priv = self.private();
+        var dead: std.ArrayListUnmanaged(*Surface) = .empty;
+        defer dead.deinit(Application.default().allocator());
+
+        var it = priv.surface_agents.iterator();
+        while (it.next()) |entry| {
+            const pid = entry.value_ptr.pid orelse continue;
+            // kill(pid, 0): 0 -> alive; ESRCH -> dead. Reject non-positive pids
+            // (kill(0/-N, 0) targets process groups, mirroring the macOS guard).
+            if (pid <= 0) continue;
+            std.posix.kill(pid, 0) catch |err| switch (err) {
+                error.ProcessNotFound => dead.append(
+                    Application.default().allocator(),
+                    entry.key_ptr.*,
+                ) catch {},
+                // EPERM etc.: process exists but we can't signal it — treat as alive.
+                else => {},
+            };
+        }
+
+        if (dead.items.len == 0) return;
+        for (dead.items) |surface| {
+            _ = self.removeSurfaceAgent(surface);
+            self.refreshTabAgentIcon(surface);
+        }
+        self.rebuildSidebarRows();
     }
 
     fn sidebarPollTimer(ud: ?*anyopaque) callconv(.c) c_int {
@@ -2467,7 +2547,13 @@ pub const Window = extern struct {
                     alloc.free(old);
                 }
             }
-            gop.value_ptr.* = .{ .agent = a, .path = path };
+            gop.value_ptr.* = .{
+                .agent = a,
+                .path = path,
+                // Preserve activity + pid across a re-attach on the same surface.
+                .activity = if (gop.found_existing) gop.value_ptr.activity else .idle,
+                .pid = if (gop.found_existing) gop.value_ptr.pid else null,
+            };
             if (path) |p| self.incrWorktreeAgent(p, a);
         } else {
             _ = self.removeSurfaceAgent(surface);
@@ -2502,6 +2588,36 @@ pub const Window = extern struct {
             self.refreshTabAgentIcon(surface);
             self.rebuildSidebarRows();
         }
+    }
+
+    /// Whether an agent is currently attached to `surface` (presence on). Used
+    /// by the OSC-3008 handler to auto-seed presence on a busy/awaiting_input
+    /// event that arrives without a prior session_start (mirrors
+    /// AgentPresenceFeature.applyActivity's pid-less auto-seed).
+    pub fn surfaceHasAgent(self: *Window, surface: *Surface) bool {
+        return self.private().surface_agents.contains(surface);
+    }
+
+    /// Set the activity state for an agent attached to `surface`. No-op if no
+    /// agent is present. Mirrors AgentPresenceFeature's atomic activity set
+    /// (busy/idle/awaiting_input). Rebuilds the sidebar so the worktree's
+    /// working indicator tracks the change.
+    pub fn setSurfaceActivity(self: *Window, surface: *Surface, activity: agentpkg.Activity) void {
+        const priv = self.private();
+        const entry = priv.surface_agents.getPtr(surface) orelse return;
+        if (entry.activity == activity) return;
+        entry.activity = activity;
+        self.rebuildSidebarRows();
+    }
+
+    /// Record the agent's local pid for the liveness sweep. The pid is carried
+    /// in the OSC `pid=` field only on the local host (omitted over SSH), so a
+    /// null pid means "nothing to sweep". No-op if no agent is attached.
+    /// Mirrors AgentPresenceFeature.PresenceRecord.pids.
+    pub fn setSurfaceAgentPid(self: *Window, surface: *Surface, pid: ?std.posix.pid_t) void {
+        const priv = self.private();
+        const entry = priv.surface_agents.getPtr(surface) orelse return;
+        entry.pid = pid;
     }
 
     /// Recompute and apply the indicator icon for the tab that owns `surface`.
