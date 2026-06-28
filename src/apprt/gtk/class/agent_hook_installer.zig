@@ -154,6 +154,15 @@ fn cleanupLegacyOwnFiles(alloc: Allocator, home: []const u8) void {
             log.warn("simbacode: legacy cleanup of {s} failed: {}", .{ rel, err });
         };
     }
+
+    // Strip stale Hermes consent-allowlist entries that point at the legacy
+    // presence script path (the new install only carries over non-ours
+    // entries keyed on the NEW path, so legacy ones would otherwise linger).
+    const legacy_script = joinHome(alloc, home, ".hermes/agent-hooks/supacode-presence.sh") catch return;
+    defer alloc.free(legacy_script);
+    patchHermesAllowlist(alloc, home, legacy_script, false) catch |err| {
+        log.warn("simbacode: legacy hermes allowlist cleanup failed: {}", .{err});
+    };
 }
 
 /// Uninstall the agent-presence hooks for every supported agent. Removes only
@@ -451,9 +460,11 @@ fn hermesHooksBlock(alloc: Allocator, script_path: []const u8) ![]u8 {
 }
 
 /// True when the managed sentinel appears on the `hooks:` header line (our
-/// block writes `hooks: # <sentinel>`).
+/// block writes `hooks: # <sentinel>`). Recognizes the legacy marker too so an
+/// upgrade replaces (not preserves) a pre-rebrand managed block.
 fn blockIsSimbacodeManaged(_: []const u8, hooks_line: []const u8) bool {
-    return std.mem.indexOf(u8, hooks_line, hooks.ownership_marker) != null;
+    return std.mem.indexOf(u8, hooks_line, hooks.ownership_marker) != null or
+        std.mem.indexOf(u8, hooks_line, hooks.legacy_ownership_marker) != null;
 }
 
 /// Advance `it` past lines that are part of an indented YAML block body (lines
@@ -745,13 +756,15 @@ fn installOwnFile(alloc: Allocator, home: []const u8, rel: []const u8, content: 
     log.info("simbacode: installed {s} file at {s}", .{ agent.rawValue(), rel });
 }
 
-/// Uninstall a simbacode-owned file: remove it only if it carries the sentinel.
+/// Uninstall a simbacode-owned file: remove it only if it carries our managed
+/// sentinel (new or legacy, so an upgrade can clean up pre-rebrand files).
 fn uninstallOwnFile(alloc: Allocator, home: []const u8, rel: []const u8) !void {
     const path = try joinHome(alloc, home, rel);
     defer alloc.free(path);
     const existing = (try readFileAlloc(alloc, path)) orelse return;
     defer alloc.free(existing);
-    if (std.mem.indexOf(u8, existing, hooks.ownership_marker) == null) return;
+    if (std.mem.indexOf(u8, existing, hooks.ownership_marker) == null and
+        std.mem.indexOf(u8, existing, hooks.legacy_ownership_marker) == null) return;
     std.fs.cwd().deleteFile(path) catch |err| switch (err) {
         error.FileNotFound => {},
         else => return err,
