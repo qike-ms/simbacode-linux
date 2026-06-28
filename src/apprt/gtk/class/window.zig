@@ -2611,15 +2611,24 @@ pub const Window = extern struct {
         return false;
     }
 
-    /// Append a small agent indicator to a sidebar `box`. We use a Pango-markup
-    /// emoji label (\u{1F916}) rather than a Gtk.Image of the agent SVG, because a
-    /// raw-SVG BytesIcon does not reliably render in a plain Gtk.Image (the Adw
-    /// tab indicator renders it via a different path). A text glyph is
-    /// guaranteed to render, the same way the \u{1F514} attention bell already
-    /// does in these rows. `agent` is used for the tooltip only. (#4)
+    /// Append a small per-agent indicator to a sidebar `box`. We use a
+    /// Pango-markup text mark (agent.symbol(), e.g. \u{03C0} for Pi) rather than a
+    /// Gtk.Image of the agent SVG: a raw-SVG BytesIcon does not reliably render
+    /// in a plain Gtk.Image (the Adw tab indicator renders it via a different
+    /// path), whereas a text glyph is guaranteed to render \u2014 the same way the
+    /// \u{1F514} attention bell already does in these rows. The distinct symbol lets
+    /// the user tell which agent runs where at a glance. (#4)
     fn appendAgentIcon(box: *gtk.Box, agent: agentpkg.Agent) void {
+        const alloc = Application.default().allocator();
+        const markup = std.fmt.allocPrintSentinel(
+            alloc,
+            "<span size='small' foreground='#7aa2f7'>{s}</span>",
+            .{agent.symbol()},
+            0,
+        ) catch return;
+        defer alloc.free(markup);
         const label = gtk.Label.new(null);
-        label.setMarkup("<span size='small'>\u{1F916}</span>");
+        label.setMarkup(markup.ptr);
         label.as(gtk.Widget).setValign(.center);
         label.as(gtk.Widget).setTooltipText(agent.label().ptr);
         box.append(label.as(gtk.Widget));

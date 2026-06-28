@@ -2517,14 +2517,13 @@ const Action = struct {
         // CLEARS any prior attention on this surface — the Pi extension sends a
         // presence refresh at the start of every turn, which must un-latch the
         // previous turn's attention (trio codex MAJOR M1).
-        if (surface.getPwd()) |surface_pwd| {
-            if (window) |win| {
-                if (active and wants_attention) {
-                    win.setSurfaceAttention(surface, surface_pwd, true);
-                } else {
-                    // presence-only start, or any end: clear this surface.
-                    win.setSurfaceAttention(surface, surface_pwd, false);
-                }
+        if (window) |win| {
+            const spwd = surface.getPwd() orelse "";
+            if (active and wants_attention) {
+                win.setSurfaceAttention(surface, spwd, true);
+            } else {
+                // presence-only start, or any end: clear this surface.
+                win.setSurfaceAttention(surface, spwd, false);
             }
         }
 
@@ -2658,7 +2657,7 @@ const Action = struct {
                     if (local_pid != null) win.setSurfaceAgentPid(surface, local_pid);
                     win.setSurfaceActivity(surface, .awaiting_input);
                     if (!win.surfaceIsForeground(surface)) {
-                        if (surface.getPwd()) |spwd| win.setSurfaceAttention(surface, spwd, true);
+                        win.setSurfaceAttention(surface, surface.getPwd() orelse "", true);
                         win.showAgentBanner(surface, agent.label(), "");
                     }
                 }
@@ -2703,7 +2702,7 @@ const Action = struct {
     fn clearSurfaceAttention(self: *Application, window: ?*Window, surface: *Surface) void {
         _ = self;
         if (window) |win| {
-            if (surface.getPwd()) |spwd| win.setSurfaceAttention(surface, spwd, false);
+            win.setSurfaceAttention(surface, surface.getPwd() orelse "", false);
             win.hideAgentBannerFor(surface);
         }
     }
@@ -2727,7 +2726,7 @@ const Action = struct {
 
         if (window) |win| {
             if (!foreground) {
-                if (surface.getPwd()) |spwd| win.setSurfaceAttention(surface, spwd, true);
+                win.setSurfaceAttention(surface, surface.getPwd() orelse "", true);
                 win.showAgentBanner(surface, title, detail);
             }
             win.pushNotification(surface, title, detail);
