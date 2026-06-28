@@ -583,7 +583,7 @@ pub const Parser = struct {
             },
 
             .@"3008" => switch (c) {
-                // Supacode: allocating (like OSC 52) so an over-2048 notify keeps its
+                // simbacode: allocating (like OSC 52) so an over-2048 notify keeps its
                 // title/earlier fields instead of being discarded whole (body may drop).
                 ';' => self.captureTrailing(.allocating),
                 else => self.state = .invalid,

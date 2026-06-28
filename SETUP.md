@@ -1,4 +1,4 @@
-# SETUP — building & running supacode-linux (release)
+# SETUP — building & running simbacode-linux (release)
 
 A Ghostty fork (GTK4/libadwaita) with a worktree sidebar + AI-agent integration.
 **No nix.** Builds natively against system GTK4/libadwaita + zig 0.15.2.
@@ -37,24 +37,24 @@ Build takes ~90s. Binary lands at `zig-out/bin/ghostty`.
 ## Install the binary for everyday use
 
 ```bash
-cp zig-out/bin/ghostty ~/.local/bin/supacode
-chmod +x ~/.local/bin/supacode
+cp zig-out/bin/ghostty ~/.local/bin/simbacode
+chmod +x ~/.local/bin/simbacode
 ```
 
-A prebuilt copy is already installed at **`~/.local/bin/supacode`**.
+A prebuilt copy is already installed at **`~/.local/bin/simbacode`**.
 
 ## Run
 
 ```bash
-supacode            # native Wayland (or X11)
+simbacode           # native Wayland (or X11)
 # Force X11 if a Wayland session misbehaves:
-GDK_BACKEND=x11 supacode
+GDK_BACKEND=x11 simbacode
 ```
 
 ## Other
 
 - Targeted tests: `zig build test -Dtest-filter=<name>` (full suite is slow).
 - Format: `zig fmt .`
-- First launch installs supacode agent hooks into `~/.codex`, `~/.claude`,
-  `~/.pi`, `~/.config/opencode`, etc. (toggle/state in `~/.supacode/hooks.json`).
-  They are guarded to no-op outside a supacode terminal surface.
+- First launch installs simbacode agent hooks into `~/.codex`, `~/.claude`,
+  `~/.pi`, `~/.config/opencode`, etc. (toggle/state in `~/.simbacode/hooks.json`).
+  They are guarded to no-op outside a simbacode terminal surface.

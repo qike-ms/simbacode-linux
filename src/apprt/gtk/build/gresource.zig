@@ -62,12 +62,12 @@ pub const css = [_][]const u8{
     "style-hc-dark.css",
 };
 
-/// Supacode custom symbolic icons (basename without extension) embedded under
+/// simbacode custom symbolic icons (basename without extension) embedded under
 /// the icon theme's `scalable/actions/` path. Resolvable by `icon-name`.
 pub const custom_icons = [_][]const u8{
-    "supacode-split-right-symbolic",
-    "supacode-split-down-symbolic",
-    "supacode-bell-symbolic",
+    "simbacode-split-right-symbolic",
+    "simbacode-split-down-symbolic",
+    "simbacode-bell-symbolic",
 };
 
 pub const Blueprint = struct {
@@ -217,7 +217,7 @@ fn genIcons(writer: *std.Io.Writer) !void {
         }
     }
 
-    // Supacode custom symbolic action icons (e.g. split-right/split-down for
+    // simbacode custom symbolic action icons (e.g. split-right/split-down for
     // the tab-bar button group). These live under the icon theme's
     // `scalable/actions/` path so GTK's default icon theme — which
     // automatically includes `<resource_base_path>/icons/` — can resolve them

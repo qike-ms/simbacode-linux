@@ -1330,8 +1330,8 @@ pub const Application = extern struct {
         // know if the window will load.
         self.showConfigErrorsDialog();
 
-        // Supacode: reconcile agent-presence hooks on launch. Installs the
-        // `# supacode-managed-hook` blocks into each agent's native config so
+        // simbacode: reconcile agent-presence hooks on launch. Installs the
+        // `# simbacode-managed-hook` blocks into each agent's native config so
         // agents emit OSC-3008 presence to their tty. Idempotent + best-effort
         // (never blocks startup); gated on a settings toggle (default on).
         // Runs on a detached thread so filesystem I/O never stalls the UI.
@@ -1345,7 +1345,7 @@ pub const Application = extern struct {
     fn startupAgentHooks(self: *Self) void {
         _ = self;
         const thread = std.Thread.spawn(.{}, agent_hook_installer.reconcileOnLaunch, .{}) catch |err| {
-            log.warn("supacode: failed to spawn agent-hook installer thread: {}", .{err});
+            log.warn("simbacode: failed to spawn agent-hook installer thread: {}", .{err});
             return;
         };
         thread.detach();
@@ -2429,7 +2429,7 @@ const Action = struct {
         };
     }
 
-    /// Supacode OSC-3008 context signal: an agent running in a surface
+    /// simbacode OSC-3008 context signal: an agent running in a surface
     /// announces it needs (action==0 start) or no longer needs (action==1
     /// end) the user's attention. We flag the surface's worktree row in the
     /// sidebar and, on start, raise a desktop notification.
@@ -2448,7 +2448,7 @@ const Action = struct {
         const surface = v.rt_surface.surface;
         const window = ext.getAncestor(Window, surface.as(gtk.Widget));
 
-        log.debug("supacode context_signal action={d} id={s} metadata={s}", .{
+        log.debug("simbacode context_signal action={d} id={s} metadata={s}", .{
             value.action, value.id, value.metadata,
         });
 
@@ -2468,7 +2468,7 @@ const Action = struct {
         // idle) and the OSC id is the agent name. This is the macOS wire shape
         // (AgentPresenceOSC / AgentHookSettingsCommand). When present it is the
         // source of truth; the legacy `agent=`/`attention=` shape below is the
-        // fallback for the older pi-extension / supacode-signal emitters.
+        // fallback for the older pi-extension / simbacode-signal emitters.
         if (parseEventField(value.metadata)) |event| {
             handlePresenceEvent(self, window, surface, value, event);
             return true;
@@ -2565,7 +2565,7 @@ const Action = struct {
             defer icon.unref();
             notif.setIcon(icon.as(gio.Icon));
 
-            const id_str = if (value.id.len > 0) value.id else "supacode-context-signal";
+            const id_str = if (value.id.len > 0) value.id else "simbacode-context-signal";
             self.as(gio.Application).sendNotification(id_str, notif);
         }
 
@@ -2760,7 +2760,7 @@ const Action = struct {
         const icon = gio.ThemedIcon.new("com.mitchellh.ghostty");
         defer icon.unref();
         notif.setIcon(icon.as(gio.Icon));
-        self.as(gio.Application).sendNotification("supacode-agent-attention", notif);
+        self.as(gio.Application).sendNotification("simbacode-agent-attention", notif);
     }
 
     /// Parse the `event=` field as a HookEvent, or null if absent/unknown.

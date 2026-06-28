@@ -1,18 +1,18 @@
-/* supacode-managed-extension */
-// # supacode-managed-hook
+/* simbacode-managed-extension */
+// # simbacode-managed-hook
 /**
- * Supacode + Pi integration extension.
+ * simbacode + Pi integration extension.
  *
- * Reports agent lifecycle and notifications to Supacode by emitting OSC 3008
+ * Reports agent lifecycle and notifications to simbacode by emitting OSC 3008
  * escape sequences to the controlling terminal. Inert in any terminal that
- * does not handle OSC 3008, and reaches Supacode over SSH too (no local
+ * does not handle OSC 3008, and reaches simbacode over SSH too (no local
  * socket needed), matching the Claude / Codex / Kiro hook integrations.
  *
- * Required env (injected by Supacode on every surface):
- *   SUPACODE_SURFACE_ID  present only on a Supacode surface; absence is the
+ * Required env (injected by simbacode on every surface):
+ *   SIMBACODE_SURFACE_ID  present only on a simbacode surface; absence is the
  *                        no-op gate.
  * Optional:
- *   SUPACODE_SOCKET_PATH present only on the local host; gates the local pid
+ *   SIMBACODE_SOCKET_PATH present only on the local host; gates the local pid
  *                        so the app's liveness sweep can reap a crashed agent.
  *
  * Hook event mapping:
@@ -37,13 +37,13 @@ const BODY_BUDGET = 1000;
 let lastWarnedAt = 0;
 const WARN_INTERVAL_MS = 60_000;
 
-function isSupacodeSurface(): boolean {
-  const id = process.env["SUPACODE_SURFACE_ID"];
+function isSimbacodeSurface(): boolean {
+  const id = process.env["SIMBACODE_SURFACE_ID"];
   return !!id && id.length > 0;
 }
 
 function localPidSuffix(): string {
-  return process.env["SUPACODE_SOCKET_PATH"] ? `;pid=${process.pid}` : "";
+  return process.env["SIMBACODE_SOCKET_PATH"] ? `;pid=${process.pid}` : "";
 }
 
 function writeToTerminal(sequence: string): void {
@@ -71,7 +71,7 @@ function writeToTerminal(sequence: string): void {
     if (now - lastWarnedAt > WARN_INTERVAL_MS) {
       lastWarnedAt = now;
       const e = err as NodeJS.ErrnoException;
-      process.stderr.write(`supacode: OSC emit failed: ${e.code ?? ""} ${e.message ?? String(err)}\n`);
+      process.stderr.write(`simbacode: OSC emit failed: ${e.code ?? ""} ${e.message ?? String(err)}\n`);
     }
   }
 }
@@ -116,7 +116,7 @@ function lastAssistantText(ctx: { sessionManager: { getEntries(): any[] } }): st
 }
 
 export default function (pi: ExtensionAPI) {
-  if (!isSupacodeSurface()) return;
+  if (!isSimbacodeSurface()) return;
   emitPresence("session_start");
 
   pi.on("agent_start", (_event, _ctx) => {

@@ -1,4 +1,4 @@
-//! Supacode worktree sidebar.
+//! simbacode worktree sidebar.
 //!
 //! Scans a root directory (the configured projects root, default `~/git`) for
 //! git repositories, lists each repo's worktrees, and reports per-worktree
@@ -6,14 +6,14 @@
 //! navigation ListBox in the window. Activating a row opens that worktree's
 //! path in a new terminal tab.
 //!
-//! This is a straight port of the original Supacode (macOS) sidebar's
+//! This is a straight port of the original supacode (macOS) sidebar's
 //! git-scan logic, which on Linux we drive with `std.process.Child` instead of
 //! the Swift GitClient.
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 
-const log = std.log.scoped(.supacode_sidebar);
+const log = std.log.scoped(.simbacode_sidebar);
 
 /// Status of a single worktree (or a repo's main checkout).
 pub const WorktreeStatus = struct {

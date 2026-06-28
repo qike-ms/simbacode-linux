@@ -29,9 +29,9 @@ template $GhosttyWindow: Adw.ApplicationWindow {
           title: _("Worktrees");
         };
 
-        // Supacode (#21): add a project folder to the sidebar. Opens a
+        // simbacode (#21): add a project folder to the sidebar. Opens a
         // Gtk.FileDialog folder picker; the chosen root is persisted to
-        // ~/.supacode/sidebar.json and scanned for worktrees.
+        // ~/.simbacode/sidebar.json and scanned for worktrees.
         [end]
         Gtk.Button sidebar_add_button {
           icon-name: "list-add-symbolic";
@@ -76,7 +76,7 @@ template $GhosttyWindow: Adw.ApplicationWindow {
       Adw.HeaderBar {
         visible: bind template.headerbar-visible;
 
-        // Supacode (#10): repo + user identity chip in the title bar — a
+        // simbacode (#10): repo + user identity chip in the title bar — a
         // square account avatar plus a two-line block (branch bold over repo
         // name), matching m5/supa tabs.png annotation #3. Updated from Zig as
         // the active worktree changes; hidden when no worktree is active.
@@ -137,9 +137,9 @@ template $GhosttyWindow: Adw.ApplicationWindow {
             focus-on-click: false;
           }
 
-          // Supacode (#11): notification bell + per-worktree history popover.
+          // simbacode (#11): notification bell + per-worktree history popover.
           Gtk.MenuButton notification_button {
-            icon-name: "supacode-bell-symbolic";
+            icon-name: "simbacode-bell-symbolic";
             tooltip-text: _("Notifications");
             can-focus: false;
             focus-on-click: false;
@@ -249,7 +249,7 @@ template $GhosttyWindow: Adw.ApplicationWindow {
           orientation: horizontal;
           visible: bind $titlebar_style_is_tabs(template.titlebar-style) as <bool>;
 
-          // Supacode (#12): explicit new-tab + split button group, matching
+          // simbacode (#12): explicit new-tab + split button group, matching
           // macOS annotation #5. All three target the active worktree's tab
           // space via the window actions (which use activeTabView()).
           Gtk.Button {
@@ -270,7 +270,7 @@ template $GhosttyWindow: Adw.ApplicationWindow {
             ]
 
             action-name: "win.split-right";
-            icon-name: "supacode-split-right-symbolic";
+            icon-name: "simbacode-split-right-symbolic";
             tooltip-text: _("Split Right");
             can-focus: false;
             focus-on-click: false;
@@ -282,7 +282,7 @@ template $GhosttyWindow: Adw.ApplicationWindow {
             ]
 
             action-name: "win.split-down";
-            icon-name: "supacode-split-down-symbolic";
+            icon-name: "simbacode-split-down-symbolic";
             tooltip-text: _("Split Down");
             can-focus: false;
             focus-on-click: false;

@@ -1,13 +1,13 @@
-//! Supacode agent-presence hook installer (Linux port).
+//! simbacode agent-presence hook installer (Linux port).
 //!
 //! Mirrors the macOS source's per-agent hook installers
 //! (`AgentHookSettingsCommand`, `AgentPresenceOSC`, and the
 //! `{Codex,Claude,Copilot,Kiro}HookSettings` / `OpenCodePluginContent` /
-//! `PiExtensionContent` builders). Each agent gets a `# supacode-managed-hook`
+//! `PiExtensionContent` builders). Each agent gets a `# simbacode-managed-hook`
 //! guarded shell command (or a plugin/extension that runs it) written into the
 //! agent's NATIVE config, so the agent emits OSC-3008 agent-presence events to
-//! its controlling tty. The command is inert outside Supacode because it is
-//! guarded on `[ -n "${SUPACODE_SURFACE_ID:-}" ]` (the surface env var injected
+//! its controlling tty. The command is inert outside simbacode because it is
+//! guarded on `[ -n "${SIMBACODE_SURFACE_ID:-}" ]` (the surface env var injected
 //! by `surface.zig`).
 //!
 //! The hook command shape is byte-for-byte faithful to
@@ -15,7 +15,7 @@
 //! `AgentPresenceOSC.{ttyResolveSnippet,emitShell}` so the wire stays
 //! compatible with the macOS app and the same hooks could run on either.
 //!
-//! Install + uninstall are idempotent: the trailing `# supacode-managed-hook`
+//! Install + uninstall are idempotent: the trailing `# simbacode-managed-hook`
 //! sentinel is the SOLE ownership marker (`AgentHookCommandOwnership`), so the
 //! installer only ever edits its own blocks and never clobbers user-authored
 //! hooks.
@@ -23,22 +23,26 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 
-const log = std.log.scoped(.supacode_agent_hooks);
+const log = std.log.scoped(.simbacode_agent_hooks);
 
-/// Sentinel comment appended to every Supacode-installed hook command. The SOLE
+/// Sentinel comment appended to every simbacode-installed hook command. The SOLE
 /// source of truth for ownership (mirrors
 /// `AgentHookSettingsCommand.ownershipMarker`): install/uninstall key off this
 /// and ONLY this, so user-authored hooks are never touched.
-pub const ownership_marker = "# supacode-managed-hook";
+pub const ownership_marker = "# simbacode-managed-hook";
 
-/// Env var present only on Supacode surfaces; its presence is the
-/// no-op-outside-Supacode emit gate (`AgentPresenceOSC.surfaceEnvVar`).
-pub const surface_env_var = "SUPACODE_SURFACE_ID";
+/// Legacy ownership marker from before the simbacode rebrand. Uninstall still
+/// strips blocks carrying this so an upgrade doesn't orphan old hooks.
+pub const legacy_ownership_marker = "# supacode-managed-hook";
+
+/// Env var present only on simbacode surfaces; its presence is the
+/// no-op-outside-simbacode emit gate (`AgentPresenceOSC.surfaceEnvVar`).
+pub const surface_env_var = "SIMBACODE_SURFACE_ID";
 
 /// Env var present only on the local host; gates the local `pid=` suffix
 /// (`AgentHookSettingsCommand.socketPathEnvVar`). On Linux surface.zig sets it
 /// to the surface id so the pid is always emitted for the liveness sweep.
-pub const socket_path_env_var = "SUPACODE_SOCKET_PATH";
+pub const socket_path_env_var = "SIMBACODE_SOCKET_PATH";
 
 /// The supported agents, with their config directory under $HOME. Ported from
 /// `SkillAgent` (macOS): claude, codex, copilot, kiro, opencode, pi. `hermes`
@@ -107,7 +111,7 @@ pub const HookEvent = enum {
 /// a presence icon never appears).
 ///
 /// Resolution order, most-reliable first:
-///   1. `$SUPACODE_TTY` — the surface's real pts path, injected by the
+///   1. `$SIMBACODE_TTY` — the surface's real pts path, injected by the
 ///      emulator into every surface's environment. Always correct when set;
 ///      agents that re-exec or detach still inherit it.
 ///   2. `/proc/$PPID/fd/{0,1,2}` — the parent agent's std fds, which point at
@@ -118,7 +122,7 @@ pub const HookEvent = enum {
 /// missing device falls through to the next candidate.
 pub const tty_resolve_snippet =
     "__tty=\"\"; " ++
-    "if [ -n \"${SUPACODE_TTY:-}\" ] && [ -w \"$SUPACODE_TTY\" ]; then __tty=\"$SUPACODE_TTY\"; fi; " ++
+    "if [ -n \"${SIMBACODE_TTY:-}\" ] && [ -w \"$SIMBACODE_TTY\" ]; then __tty=\"$SIMBACODE_TTY\"; fi; " ++
     "if [ -z \"$__tty\" ]; then for __fd in 0 1 2; do " ++
     "__c=$(readlink \"/proc/$PPID/fd/$__fd\" 2>/dev/null); " ++
     "case \"$__c\" in /dev/pts/*|/dev/tty[0-9]*) if [ -w \"$__c\" ]; then __tty=\"$__c\"; break; fi;; esac; " ++
@@ -143,7 +147,7 @@ pub fn emitShell(alloc: Allocator, event: HookEvent, agent: Agent) ![]u8 {
     );
 }
 
-/// The OSC guard expression: a surface id present (the no-op-outside-Supacode
+/// The OSC guard expression: a surface id present (the no-op-outside-simbacode
 /// gate). Verbatim port of `AgentHookSettingsCommand.oscGuardExpr`.
 pub const osc_guard_expr = "[ -n \"${" ++ surface_env_var ++ ":-}\" ]";
 
@@ -234,10 +238,13 @@ pub fn compositeCommand(alloc: Allocator, events: []const HookEvent, agent: Agen
     return compositeCommandFull(alloc, events, false, agent);
 }
 
-/// True when a command string was installed by Supacode. The trailing sentinel
+/// True when a command string was installed by simbacode. The trailing sentinel
 /// is the source of truth (`AgentHookCommandOwnership.isSupacodeManagedCommand`).
-pub fn isSupacodeManagedCommand(command: []const u8) bool {
-    return std.mem.indexOf(u8, command, ownership_marker) != null;
+/// Recognizes the legacy `# supacode-managed-hook` marker too, so an upgrade
+/// from the supacode-branded build can still detect and clean up old blocks.
+pub fn isSimbacodeManagedCommand(command: []const u8) bool {
+    return std.mem.indexOf(u8, command, ownership_marker) != null or
+        std.mem.indexOf(u8, command, legacy_ownership_marker) != null;
 }
 
 test "compositeCommand carries event, guard, sentinel, suppression" {
@@ -251,8 +258,8 @@ test "compositeCommand carries event, guard, sentinel, suppression" {
     try testing.expect(std.mem.indexOf(u8, cmd, "event=busy") != null);
     // agent name as the OSC context id
     try testing.expect(std.mem.indexOf(u8, cmd, "start=claude") != null);
-    // surface-id guard (no-op outside Supacode)
-    try testing.expect(std.mem.indexOf(u8, cmd, "SUPACODE_SURFACE_ID") != null);
+    // surface-id guard (no-op outside simbacode)
+    try testing.expect(std.mem.indexOf(u8, cmd, "SIMBACODE_SURFACE_ID") != null);
     // output suppression + tolerant exit
     try testing.expect(std.mem.indexOf(u8, cmd, ">/dev/null 2>&1 || true") != null);
     // trailing ownership sentinel
@@ -260,7 +267,7 @@ test "compositeCommand carries event, guard, sentinel, suppression" {
     // tty resolve
     try testing.expect(std.mem.indexOf(u8, cmd, "ps -o tty=") != null);
     // pid suffix gated on socket path
-    try testing.expect(std.mem.indexOf(u8, cmd, "SUPACODE_SOCKET_PATH") != null);
+    try testing.expect(std.mem.indexOf(u8, cmd, "SIMBACODE_SOCKET_PATH") != null);
     try testing.expect(std.mem.indexOf(u8, cmd, "pid=$PPID") != null);
 }
 
@@ -294,16 +301,16 @@ test "compositeCommand multiple events" {
     try testing.expect(std.mem.indexOf(u8, cmd, "event=idle") != null);
 }
 
-test "isSupacodeManagedCommand keys off sentinel only" {
+test "isSimbacodeManagedCommand keys off sentinel only" {
     const testing = std.testing;
     const alloc = testing.allocator;
 
     const cmd = try compositeCommand(alloc, &.{.busy}, .claude);
     defer alloc.free(cmd);
-    try testing.expect(isSupacodeManagedCommand(cmd));
+    try testing.expect(isSimbacodeManagedCommand(cmd));
     // A user hook that merely references the env var is NOT ours.
-    try testing.expect(!isSupacodeManagedCommand(
-        "[ -n \"$SUPACODE_SURFACE_ID\" ] && echo hi",
+    try testing.expect(!isSimbacodeManagedCommand(
+        "[ -n \"$SIMBACODE_SURFACE_ID\" ] && echo hi",
     ));
 }
 
@@ -313,16 +320,16 @@ test "compositeCommand exact shape matches macOS AgentHookSettingsCommand" {
 
     // Byte-for-byte expected output of the composite hook command for
     // (events:[.busy], forwardStdinAsNotification:false, agent:.claude). The
-    // tty-resolve step prefers the injected SUPACODE_TTY and /proc/$PPID/fd
+    // tty-resolve step prefers the injected SIMBACODE_TTY and /proc/$PPID/fd
     // probes before the ps fallback to fix agents that run hooks with no
     // controlling terminal on Linux; the rest (guard, OSC payload, pid gate,
     // suppression, sentinel) is macOS parity.
     const expected =
-        "[ -n \"${SUPACODE_SURFACE_ID:-}\" ] && { " ++
+        "[ -n \"${SIMBACODE_SURFACE_ID:-}\" ] && { " ++
         tty_resolve_snippet ++ "; " ++
-        "__sp=\"\"; [ -n \"${SUPACODE_SOCKET_PATH:-}\" ] && __sp=\";pid=$PPID\"; " ++
+        "__sp=\"\"; [ -n \"${SIMBACODE_SOCKET_PATH:-}\" ] && __sp=\";pid=$PPID\"; " ++
         "printf '\\033]3008;start=claude;event=busy%s\\033\\\\' \"$__sp\" > \"$__tty\"; " ++
-        "} >/dev/null 2>&1 || true # supacode-managed-hook";
+        "} >/dev/null 2>&1 || true # simbacode-managed-hook";
 
     const cmd = try compositeCommand(alloc, &.{.busy}, .claude);
     defer alloc.free(cmd);

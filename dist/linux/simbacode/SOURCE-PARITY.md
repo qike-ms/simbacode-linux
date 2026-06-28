@@ -1,4 +1,4 @@
-# supacode-linux ↔ macOS supacode source parity (issue #25)
+# simbacode-linux ↔ macOS supacode source parity (issue #25)
 
 Comparison of the merged Linux agent-presence implementation against the
 authoritative macOS source (the supabitapp/supacode
@@ -31,7 +31,7 @@ Linux files:
   action byte is descriptive only (`AgentPresenceOSC.action(for:)`).
 - Field names `event/pid/kind/title/body` match `AgentPresenceOSC.swift:36–40`.
 
-DIFFERS(intentional): the pid suffix is gated on `SUPACODE_SOCKET_PATH`
+DIFFERS(intentional): the pid suffix is gated on `SIMBACODE_SOCKET_PATH`
 (`emitShell`, `:216`) — Linux always sets that env var (to the surface id) so a
 pid is always emitted, because on Linux the OSC always reaches the local
 surface. macOS gates it on a real socket path (omitted over SSH). Wire shape is
@@ -57,17 +57,17 @@ identical; only the gating value differs.
 `AgentPresenceOSC.swift:198` (`ttyResolveSnippet`), `:212` (`emitShell`), `:237`
 (`notifyExtractAwk`), `:252` (`emitNotifyShell`).
 
-- Guard: `[ -n "${SUPACODE_SURFACE_ID:-}" ]` (agent_hooks `osc_guard_expr`) ==
+- Guard: `[ -n "${SIMBACODE_SURFACE_ID:-}" ]` (agent_hooks `osc_guard_expr`) ==
   `oscGuardExpr` (`AgentHookSettingsCommand.swift:69`).
 - tty resolve: **DIVERGES (intentional, Linux robustness)**. macOS
   `ttyResolveSnippet` is `ps -o tty= -p "$PPID"` only. On Linux that fails for
   agents that run hooks with no controlling terminal (e.g. Codex), so the
-  snippet now resolves most-reliable-first: `$SUPACODE_TTY` (the surface's real
+  snippet now resolves most-reliable-first: `$SIMBACODE_TTY` (the surface's real
   pts path, injected by the emulator in `termio/Exec.zig`) → `/proc/$PPID/fd/
   {0,1,2}` → `ps -o tty=` (the original, as fallback). Each candidate is
   validated with `[ -w ]`. The OSC wire payload is unchanged.
 - Brace group, output suppression `>/dev/null 2>&1 || true`, trailing
-  `# supacode-managed-hook` sentinel — all identical.
+  `# simbacode-managed-hook` sentinel — all identical.
 - Notify awk: `agent_hooks.notify_extract_awk` was verified **byte-identical**
   (609 bytes) to `AgentPresenceOSC.notifyExtractAwk` via a diff harness.
 
@@ -75,25 +75,25 @@ DIFFERS(intentional): macOS `envCheck` keeps a legacy 4-var guard
 (`AgentHookSettingsCommand.swift:39`) for *detecting* old hooks; the live guard
 is surface-id-only (`oscGuardExpr`), which is exactly what Linux emits. Linux
 does not carry the legacy-detection branch of `AgentHookCommandOwnership`
-(`isLegacyCommand`) because supacode-linux never shipped the pre-sentinel
-hooks; ownership is sentinel-only (`agent_hooks.isSupacodeManagedCommand`),
+(`isLegacyCommand`) because simbacode-linux never shipped the pre-sentinel
+hooks; ownership is sentinel-only (`agent_hooks.isSimbacodeManagedCommand`),
 matching `AgentHookCommandOwnership.isSupacodeManagedCommand`'s primary path.
 
 ## 4. Env injection
 
 **MATCHES (gate)** — `AgentPresenceOSC.swift:34` (`surfaceEnvVar`).
 
-- Linux `surface.zig injectSupacodeEnv` sets `SUPACODE_SURFACE_ID` (the gate),
-  plus `SUPACODE_TAB_ID`, `SUPACODE_WORKTREE_ID`, and `SUPACODE_SOCKET_PATH`.
+- Linux `surface.zig injectSimbacodeEnv` sets `SIMBACODE_SURFACE_ID` (the gate),
+  plus `SIMBACODE_TAB_ID`, `SIMBACODE_WORKTREE_ID`, and `SIMBACODE_SOCKET_PATH`.
 - The gate var name + role match: hooks no-op without it.
 
 DIFFERS(intentional, Linux-appropriate):
-- macOS injects a per-*tab* UUID for `SUPACODE_TAB_ID` and percent-encodes
-  `SUPACODE_WORKTREE_ID`; Linux uses the surface id for TAB_ID and the raw
+- macOS injects a per-*tab* UUID for `SIMBACODE_TAB_ID` and percent-encodes
+  `SIMBACODE_WORKTREE_ID`; Linux uses the surface id for TAB_ID and the raw
   worktree path for WORKTREE_ID. On Linux attribution is by the receiving
   surface (the OSC arrives on the emitting tty), so these are informational
   parity fields, not load-bearing — the legacy guard only checks `-n`.
-- `SUPACODE_SOCKET_PATH` on macOS is a real Unix-domain socket path; on Linux
+- `SIMBACODE_SOCKET_PATH` on macOS is a real Unix-domain socket path; on Linux
   there is no socket (OSC is the transport), so it is set to the surface id as a
   non-empty "local host" marker so the unmodified hook shells emit `pid=$PPID`.
 
@@ -107,14 +107,14 @@ DIFFERS(intentional, Linux-appropriate):
 | claude | `.claude/settings.json` hooks | same | `ClaudeHookSettings.swift`, `ClaudeSettingsInstaller.swift:55` |
 | codex | `.codex/hooks.json` | same | `CodexSettingsInstaller.swift:217` |
 | kiro | `.kiro/agents/kiro_default.json` flat `timeout_ms` | same | `KiroSettingsInstaller.swift:179`, `KiroHookSettings.swift` |
-| copilot | `.copilot/hooks/supacode.json` own file | same | `CopilotHooksInstaller.swift`, `CopilotHookSettings.swift` |
-| opencode | `.config/opencode/plugins/*.js` plugin | `supacode-presence.js` | `OpenCodePluginContent.swift`, `OpenCodePluginInstaller.swift:61` |
-| pi | `.pi/agent/extensions/supacode/index.ts` | same | `PiExtensionContent.swift`, `PiSettingsInstaller.swift:105` |
-| hermes | `.hermes/agent-hooks/supacode-presence.sh` + `config.yaml` `hooks:` + `shell-hooks-allowlist.json` | **Linux-only, no macOS source** | `installHermes` / `patchHermesConfig` / `patchHermesAllowlist` |
+| copilot | `.copilot/hooks/simbacode.json` own file | same | `CopilotHooksInstaller.swift`, `CopilotHookSettings.swift` |
+| opencode | `.config/opencode/plugins/*.js` plugin | `simbacode-presence.js` | `OpenCodePluginContent.swift`, `OpenCodePluginInstaller.swift:61` |
+| pi | `.pi/agent/extensions/simbacode/index.ts` | same | `PiExtensionContent.swift`, `PiSettingsInstaller.swift:105` |
+| hermes | `.hermes/agent-hooks/simbacode-presence.sh` + `config.yaml` `hooks:` + `shell-hooks-allowlist.json` | **Linux-only, no macOS source** | `installHermes` / `patchHermesConfig` / `patchHermesAllowlist` |
 
 **Hermes** has no macOS counterpart (it is a Linux-only agent). Its shell hooks
 run via `shlex.split` with `shell=False`, so an inline pipeline is impossible;
-instead Supacode ships a managed presence SCRIPT and points `config.yaml`'s
+instead simbacode ships a managed presence SCRIPT and points `config.yaml`'s
 `hooks:` block at it, plus a consent allowlist entry per event (otherwise the
 hook is silently skipped). The config patch only touches a literal `hooks: {}`
 or a previously-managed block (sentinel-keyed); a user-populated `hooks:` map is
@@ -167,7 +167,7 @@ DIFFERS(intentional):
 
 DIFFERS(intentional simplification): Linux tracks one `?pid` per surface-agent
 record; macOS tracks a `Set<pid_t>` (`PresenceRecord.pids`). Equivalent for the
-one-agent-per-surface case supacode-linux targets; a single surface hosting two
+one-agent-per-surface case simbacode-linux targets; a single surface hosting two
 local agents of the same name would only track the latest pid. Documented.
 
 ---
@@ -178,8 +178,8 @@ local agents of the same name would only track the latest pid. Documented.
    awaiting_input hand-composed hook (`CopilotHookSettings.notificationCommand`).
    Copilot still reports presence/activity; only the dedicated needs-you banner
    on a permission prompt is missing.
-2. **Per-tab UUID / percent-encoded worktree id** for `SUPACODE_TAB_ID` /
-   `SUPACODE_WORKTREE_ID` (informational on Linux).
+2. **Per-tab UUID / percent-encoded worktree id** for `SIMBACODE_TAB_ID` /
+   `SIMBACODE_WORKTREE_ID` (informational on Linux).
 3. **pid Set vs single pid** per surface-agent record.
 4. **Process-scan fallback** for un-hooked agents (explicitly the optional
    last-resort path per #25; the hook path is the real design and is done).

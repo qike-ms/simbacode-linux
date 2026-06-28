@@ -1,4 +1,4 @@
-# Trio code review — supacode-linux sidebar + agent-native (consolidated)
+# Trio code review — simbacode-linux sidebar + agent-native (consolidated)
 
 Branch reviewed: `7191adddc..81f3db5b4` (stages 4–6). Three independent
 reviewers: codex (gpt-class), claude (opus), opencode (opus-4.8). Findings
@@ -32,7 +32,7 @@ surface that leaves the tree (`treeContains` helper).
 
 - Banner detail now Pango-escaped (claude m1).
 - Sidebar diff aggregation uses saturating add — no overflow panic (all three).
-- `supacode-signal` sanitizes inputs (strips control chars + `;`) to prevent
+- `simbacode-signal` sanitizes inputs (strips control chars + `;`) to prevent
   OSC field injection from assistant text (codex, claude m3, opencode m1).
 
 ## Deferred (tracked in HANDOFF "Next steps")

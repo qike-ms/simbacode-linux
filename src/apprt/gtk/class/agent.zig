@@ -1,4 +1,4 @@
-//! Supacode agent presence: map an agent name (announced via OSC-3008
+//! simbacode agent presence: map an agent name (announced via OSC-3008
 //! `agent=<name>` metadata) to a GIcon used as an Adw.TabPage indicator icon.
 //!
 //! Icons are embedded as symbolic SVGs and wrapped in a `gio.BytesIcon`, so no
@@ -14,7 +14,7 @@ const std = @import("std");
 const gio = @import("gio");
 const glib = @import("glib");
 
-const log = std.log.scoped(.supacode_agent);
+const log = std.log.scoped(.simbacode_agent);
 
 /// Agent activity state, set by OSC-3008 busy/idle/awaiting_input events.
 /// Ported verbatim from AgentPresenceFeature.Activity (macOS): `busy` is

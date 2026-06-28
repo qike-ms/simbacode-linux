@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# supacode-signal — emit an OSC-3008 (Hierarchical Context Signalling) sequence
-# to the controlling terminal so supacode-linux can show agent presence,
+# simbacode-signal — emit an OSC-3008 (Hierarchical Context Signalling) sequence
+# to the controlling terminal so simbacode-linux can show agent presence,
 # activity, and attention for the current surface.
 #
 # This is the Linux agent-integration transport. On macOS supacode injects a
@@ -10,17 +10,17 @@
 # (AgentPresenceOSC.swift) so the same hooks are compatible with both apps.
 #
 # Usage:
-#   supacode-signal <event> [--agent NAME] [--pid PID]
+#   simbacode-signal <event> [--agent NAME] [--pid PID]
 #
 #   <event> is one of the HookEvent values:
 #     session_start | session_end | busy | awaiting_input | idle
 #
 # Examples:
-#   supacode-signal session_start --agent claude   # presence on (tab icon)
-#   supacode-signal busy          --agent claude   # working
-#   supacode-signal awaiting_input --agent claude  # needs you (banner + bell)
-#   supacode-signal idle          --agent claude   # waiting
-#   supacode-signal session_end   --agent claude   # presence off
+#   simbacode-signal session_start --agent claude   # presence on (tab icon)
+#   simbacode-signal busy          --agent claude   # working
+#   simbacode-signal awaiting_input --agent claude  # needs you (banner + bell)
+#   simbacode-signal idle          --agent claude   # waiting
+#   simbacode-signal session_end   --agent claude   # presence off
 #
 # The sequence emitted is:
 #   ESC ] 3008 ; <action>=<agent> ; event=<event> [ ; pid=<pid> ] ST
@@ -28,10 +28,10 @@
 # event= field; the action byte is descriptive.
 #
 # Notes:
-#  - Emission is gated on SUPACODE_SURFACE_ID (set by supacode-linux on every
-#    surface). Outside a Supacode surface this is a silent no-op, mirroring the
+#  - Emission is gated on SIMBACODE_SURFACE_ID (set by simbacode-linux on every
+#    surface). Outside a simbacode surface this is a silent no-op, mirroring the
 #    installed hooks.
-#  - pid defaults to $PPID when SUPACODE_SOCKET_PATH is set (the local-host
+#  - pid defaults to $PPID when SIMBACODE_SOCKET_PATH is set (the local-host
 #    marker), and feeds the app's liveness sweep. Omit over SSH.
 #  - Output goes to the controlling tty (/dev/tty) so it is not captured by a
 #    pipe and reaches the terminal even when stdout is redirected.
@@ -45,7 +45,7 @@ ST=$'\033\\'
 agent="agent"
 pid=""
 
-die() { echo "supacode-signal: $*" >&2; exit 2; }
+die() { echo "simbacode-signal: $*" >&2; exit 2; }
 
 # Strip OSC-3008-hostile bytes: control chars (0x00-0x1F, 0x7F) and ';' which
 # separates fields, to prevent field injection.
@@ -72,7 +72,7 @@ while [ $# -gt 0 ]; do
 done
 
 # Gate on the surface env var, exactly like the installed hooks.
-[ -n "${SUPACODE_SURFACE_ID:-}" ] || exit 0
+[ -n "${SIMBACODE_SURFACE_ID:-}" ] || exit 0
 
 # action byte: end for session_end, else start (app keys off event=).
 if [ "$event" = "session_end" ]; then action="end"; else action="start"; fi
@@ -81,7 +81,7 @@ if [ "$event" = "session_end" ]; then action="end"; else action="start"; fi
 pid_suffix=""
 if [ -n "$pid" ]; then
   pid_suffix=";pid=$(sanitize "$pid")"
-elif [ -n "${SUPACODE_SOCKET_PATH:-}" ]; then
+elif [ -n "${SIMBACODE_SOCKET_PATH:-}" ]; then
   pid_suffix=";pid=$PPID"
 fi
 

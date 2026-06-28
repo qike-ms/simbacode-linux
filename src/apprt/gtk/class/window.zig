@@ -228,7 +228,7 @@ pub const Window = extern struct {
             index: usize,
         };
 
-        /// Supacode (#22): an agent recorded on a surface. Drives the per-tab
+        /// simbacode (#22): an agent recorded on a surface. Drives the per-tab
         /// agent indicator icon and (via OSC-3008 events) its activity state.
         pub const AgentEntry = struct {
             agent: agentpkg.Agent,
@@ -237,7 +237,7 @@ pub const Window = extern struct {
             /// busy = working, idle = waiting, awaiting_input = needs the user.
             activity: agentpkg.Activity = .idle,
             /// The agent's LOCAL process id, carried in `pid=` only when the
-            /// hook ran on the same host (gated on SUPACODE_SOCKET_PATH in the
+            /// hook ran on the same host (gated on SIMBACODE_SOCKET_PATH in the
             /// emit; omitted over SSH). Null means "no local pid to track". The
             /// liveness sweep reaps this entry when a non-null pid is dead, so a
             /// crashed local agent that never sent session_end is cleaned up.
@@ -245,7 +245,7 @@ pub const Window = extern struct {
             pid: ?std.posix.pid_t = null,
         };
 
-        /// Supacode (#11): one entry in the notification bell history. Owns its
+        /// simbacode (#11): one entry in the notification bell history. Owns its
         /// strings; freed in `clearNotifications` / dispose.
         pub const Notification = struct {
             /// Owned NUL-terminated worktree path the event came from. Used to
@@ -295,11 +295,11 @@ pub const Window = extern struct {
         /// See tabOverviewOpen for why we have this.
         tab_overview_focus_timer: ?c_uint = null,
 
-        /// Supacode worktree sidebar: repeating poll timer (5s) that rescans
+        /// simbacode worktree sidebar: repeating poll timer (5s) that rescans
         /// the projects root for git worktree status.
         sidebar_timer: ?c_uint = null,
 
-        /// Supacode liveness-sweep timer. Periodically reaps agent presence
+        /// simbacode liveness-sweep timer. Periodically reaps agent presence
         /// whose attributed local pid is dead — closing the deferred
         /// agent-crash-TTL item. Mirrors AgentPresenceFeature.livenessSweep
         /// (a 2s periodic kill(pid, 0) check). Removed in dispose.
@@ -309,8 +309,8 @@ pub const Window = extern struct {
         /// ListBox row index for row-activation -> open-worktree mapping.
         sidebar_statuses: []sidebar.WorktreeStatus = &.{},
 
-        /// Supacode (#21): user-curated set of project roots persisted to
-        /// `~/.supacode/sidebar.json`. The sidebar scans ONLY these roots —
+        /// simbacode (#21): user-curated set of project roots persisted to
+        /// `~/.simbacode/sidebar.json`. The sidebar scans ONLY these roots —
         /// never a blanket `~/git` walk. Loaded on startup; written on
         /// add/remove. Empty on first run (no auto-import).
         sidebar_store: sidebar_store.Store = .{},
@@ -332,7 +332,7 @@ pub const Window = extern struct {
         /// Rebuilt on every refresh. Owned by this window.
         sidebar_rows: std.ArrayListUnmanaged(SidebarRowRef) = .empty,
 
-        /// Supacode agent presence: maps a surface (by pointer, stable identity)
+        /// simbacode agent presence: maps a surface (by pointer, stable identity)
         /// to the agent attached to it plus the worktree path that owned the
         /// surface at attach time. Populated by OSC-3008 `agent=<name>`
         /// metadata; cleared on `end` or surface teardown. The owning path is
@@ -341,7 +341,7 @@ pub const Window = extern struct {
         /// by surface pointer so two tabs sharing a worktree don't collide.
         surface_agents: std.AutoHashMapUnmanaged(*Surface, AgentEntry) = .empty,
 
-        /// Supacode (#11): notification history backing the toolbar bell
+        /// simbacode (#11): notification history backing the toolbar bell
         /// popover. Each record is an aggregated agent attention event. The
         /// banner is transient; this list is the persistent history.
         notifications: std.ArrayListUnmanaged(Notification) = .empty,
@@ -363,19 +363,19 @@ pub const Window = extern struct {
         sidebar_list: *gtk.ListBox,
         sidebar_add_button: *gtk.Button,
 
-        /// Supacode (#10): title-bar repo + user identity chip widgets.
+        /// simbacode (#10): title-bar repo + user identity chip widgets.
         identity_chip: *gtk.Box,
         identity_avatar: *adw.Avatar,
         identity_branch: *gtk.Label,
         identity_repo: *gtk.Label,
 
-        /// Supacode (#11): notification bell button + popover widgets.
+        /// simbacode (#11): notification bell button + popover widgets.
         notification_button: *gtk.MenuButton,
         notification_list: *gtk.ListBox,
         notification_empty: *gtk.Label,
         notification_clear_button: *gtk.Button,
 
-        /// Supacode per-worktree tab spaces (#7, Option A): a Gtk.Stack holding
+        /// simbacode per-worktree tab spaces (#7, Option A): a Gtk.Stack holding
         /// one Adw.TabView per worktree path. Selecting a worktree in the
         /// sidebar swaps the visible TabView (and repoints tab_bar / overview)
         /// so each folder owns its own set of tabs, matching macOS supacode
@@ -449,7 +449,7 @@ pub const Window = extern struct {
         priv.tab_bindings = gobject.BindingGroup.new();
         priv.tab_bindings.bind("title", self.as(gobject.Object), "title", .{});
 
-        // Supacode (#7): register the template tab_view as the default tab
+        // simbacode (#7): register the template tab_view as the default tab
         // space so per-worktree view bookkeeping has a consistent fallback.
         self.registerDefaultWorktreeView();
 
@@ -1080,7 +1080,7 @@ pub const Window = extern struct {
         return null;
     }
 
-    /// A stable worktree id for `SUPACODE_WORKTREE_ID`, derived from the
+    /// A stable worktree id for `SIMBACODE_WORKTREE_ID`, derived from the
     /// surface's owning worktree path. Returns null for the default space
     /// (no worktree) or when the surface isn't yet in a worktree view. The
     /// returned slice is owned by the worktree_views map; callers must NOT
@@ -1607,7 +1607,7 @@ pub const Window = extern struct {
 
         priv.command_palette.set(null);
 
-        // Supacode sidebar teardown: stop the poll timer and free owned state.
+        // simbacode sidebar teardown: stop the poll timer and free owned state.
         const alloc = Application.default().allocator();
         if (priv.sidebar_timer) |timer| {
             _ = glib.Source.remove(timer);
@@ -1639,12 +1639,12 @@ pub const Window = extern struct {
         priv.surface_agents.deinit(alloc);
         priv.surface_agents = .empty;
 
-        // Supacode (#11): free notification history.
+        // simbacode (#11): free notification history.
         for (priv.notifications.items) |*n| n.deinit(alloc);
         priv.notifications.deinit(alloc);
         priv.notifications = .empty;
 
-        // Supacode per-worktree views (#7): free the owned (duped) path keys.
+        // simbacode per-worktree views (#7): free the owned (duped) path keys.
         // The TabView widgets themselves are owned by the worktree_stack and
         // torn down by disposeTemplate / GTK.
         {
@@ -1724,7 +1724,7 @@ pub const Window = extern struct {
         // calls some winproto functions.
         self.syncAppearance();
 
-        // Set up the Supacode worktree sidebar: connect row activation,
+        // Set up the simbacode worktree sidebar: connect row activation,
         // perform the first scan, and start the periodic refresh poll.
         self.initSidebar();
 
@@ -2089,7 +2089,7 @@ pub const Window = extern struct {
             const root_z = alloc.dupeZ(u8, repo_root_str) catch return row;
             defer alloc.free(root_z);
             remove_btn.as(gobject.Object).setDataFull(
-                "supacode-repo-root",
+                "simbacode-repo-root",
                 glib.strdup(root_z.ptr),
                 glibFreeData,
             );
@@ -2116,7 +2116,7 @@ pub const Window = extern struct {
     /// before calling `removeSidebarRoot`, because that rebuilds the sidebar
     /// (destroying this button and the glib-owned data behind `cstr`).
     fn sidebarRemoveClicked(btn: *gtk.Button, self: *Window) callconv(.c) void {
-        const data = btn.as(gobject.Object).getData("supacode-repo-root") orelse return;
+        const data = btn.as(gobject.Object).getData("simbacode-repo-root") orelse return;
         const cstr: [*:0]const u8 = @ptrCast(data);
         const alloc = Application.default().allocator();
         const path = alloc.dupe(u8, std.mem.sliceTo(cstr, 0)) catch return;
@@ -2435,7 +2435,7 @@ pub const Window = extern struct {
         return false;
     }
 
-    /// Supacode agent presence: attach (or detach) an agent to a surface.
+    /// simbacode agent presence: attach (or detach) an agent to a surface.
     /// Called from the OSC-3008 context_signal handler when an `agent=<name>`
     /// metadata field is present. `surface` is keyed by pointer (stable). On
     /// attach we record the agent; on detach we remove it. Either way we
@@ -2730,7 +2730,7 @@ pub const Window = extern struct {
         _ = surface;
     }
 
-    /// Supacode (#11): append an agent attention event to the notification
+    /// simbacode (#11): append an agent attention event to the notification
     /// bell history and refresh the popover. `title` is the agent label;
     /// `detail` is optional metadata (first line shown). The banner is the
     /// transient surface for this same event; the bell is the persistent log.
@@ -3185,7 +3185,7 @@ pub const Window = extern struct {
             self.disconnectSurfaceHandlers(tree);
         }
 
-        // Supacode: clear agent presence for any surface in this tab so a
+        // simbacode: clear agent presence for any surface in this tab so a
         // closed tab doesn't leave a stale icon or dangling banner target
         // (trio footgun #1: missing end-events leak presence).
         self.clearTabAgents(tab);

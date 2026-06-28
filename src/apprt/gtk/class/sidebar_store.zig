@@ -2,17 +2,17 @@
 //!
 //! Issue #21: instead of auto-scanning every repo under `~/git`, the sidebar
 //! lists only folders the user has explicitly added via the `+` button. The
-//! chosen set is persisted to `~/.supacode/sidebar.json` and read on startup.
+//! chosen set is persisted to `~/.simbacode/sidebar.json` and read on startup.
 //!
-//! macOS source of truth: `~/.supacode/sidebar.json` (a far richer nested
-//! schema of sections/buckets/items; see Supacode's `SidebarState.swift`). On
+//! macOS source of truth: `~/.supacode/sidebar.json` (the macOS app) (a far richer nested
+//! schema of sections/buckets/items; see supacode's `SidebarState.swift`). On
 //! Linux we persist only the flat list of project roots we need — the file is
 //! versioned so the schema can grow later without breaking older readers.
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 
-const log = std.log.scoped(.supacode_sidebar);
+const log = std.log.scoped(.simbacode_sidebar);
 
 /// Current on-disk schema version for the Linux sidebar store.
 pub const schema_version: u32 = 1;
@@ -66,10 +66,32 @@ const Wire = struct {
     roots: []const []const u8 = &.{},
 };
 
-/// Resolve `~/.supacode/sidebar.json`. Caller owns the result.
+/// Resolve `~/.simbacode/sidebar.json`. Caller owns the result. If the new
+/// location is absent but a legacy `~/.supacode/sidebar.json` exists, returns
+/// the legacy path so existing config is read (one-time migration on next save
+/// writes to the new location).
 pub fn storePath(alloc: Allocator) ?[:0]u8 {
     const home = std.posix.getenv("HOME") orelse return null;
-    return std.fs.path.joinZ(alloc, &.{ home, ".supacode", "sidebar.json" }) catch null;
+    const new_path = std.fs.path.joinZ(alloc, &.{ home, ".simbacode", "sidebar.json" }) catch return null;
+    // If the new file is missing but a legacy one exists, hand back the legacy
+    // path so we read it (load path). Saves always go through the new path via
+    // saveStorePath below.
+    std.fs.cwd().access(new_path, .{}) catch {
+        const legacy = std.fs.path.joinZ(alloc, &.{ home, ".supacode", "sidebar.json" }) catch return new_path;
+        if (std.fs.cwd().access(legacy, .{})) {
+            alloc.free(new_path);
+            return legacy;
+        } else |_| {
+            alloc.free(legacy);
+        }
+    };
+    return new_path;
+}
+
+/// Resolve the canonical (new) `~/.simbacode/sidebar.json` for writing.
+pub fn saveStorePath(alloc: Allocator) ?[:0]u8 {
+    const home = std.posix.getenv("HOME") orelse return null;
+    return std.fs.path.joinZ(alloc, &.{ home, ".simbacode", "sidebar.json" }) catch null;
 }
 
 /// Load the persisted store. Returns an empty store when the file is absent
@@ -124,11 +146,12 @@ pub fn loadFrom(alloc: Allocator, path: []const u8) Store {
     return store;
 }
 
-/// Persist `store` to `~/.supacode/sidebar.json`, creating the parent
+/// Persist `store` to `~/.simbacode/sidebar.json`, creating the parent
 /// directory as needed. Writes atomically via a temp file + rename so a
-/// crash mid-write never truncates the user's curation.
+/// crash mid-write never truncates the user's curation. Always writes to the
+/// canonical (new) location, completing migration off any legacy path.
 pub fn save(alloc: Allocator, store: *const Store) !void {
-    const path = storePath(alloc) orelse return error.NoHome;
+    const path = saveStorePath(alloc) orelse return error.NoHome;
     defer alloc.free(path);
     return saveTo(alloc, path, store);
 }
@@ -191,7 +214,7 @@ test "loadFrom missing file yields empty store" {
     defer tmp.cleanup();
     const dir = try tmp.dir.realpathAlloc(alloc, ".");
     defer alloc.free(dir);
-    const path = try std.fs.path.join(alloc, &.{ dir, ".supacode", "sidebar.json" });
+    const path = try std.fs.path.join(alloc, &.{ dir, ".simbacode", "sidebar.json" });
     defer alloc.free(path);
 
     var store = loadFrom(alloc, path);
@@ -205,7 +228,7 @@ test "saveTo then loadFrom round-trips roots" {
     defer tmp.cleanup();
     const dir = try tmp.dir.realpathAlloc(alloc, ".");
     defer alloc.free(dir);
-    const path = try std.fs.path.join(alloc, &.{ dir, ".supacode", "sidebar.json" });
+    const path = try std.fs.path.join(alloc, &.{ dir, ".simbacode", "sidebar.json" });
     defer alloc.free(path);
 
     {

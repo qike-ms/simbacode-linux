@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Generate the supacode-linux app icon (white "SC" on a charcoal tile).
+"""Generate the simbacode-linux app icon (white "SC" on a charcoal tile).
 
 Writes images/gnome/<size>.png at every size the Zig build installs into the
 hicolor icon theme (see src/build/GhosttyResources.zig). The mark matches the

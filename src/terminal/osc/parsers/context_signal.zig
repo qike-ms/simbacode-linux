@@ -42,7 +42,7 @@ pub const Command = struct {
         return option.read(self.metadata);
     }
 
-    /// The Supacode agent-presence hook event carried in `event=`, or null if
+    /// The simbacode agent-presence hook event carried in `event=`, or null if
     /// the field is absent or carries an unknown value. This is the
     /// authoritative presence signal (AgentPresenceOSC.parse keys off it);
     /// the OSC start/end action byte is descriptive only.
@@ -92,7 +92,7 @@ pub const ExitStatus = enum {
     }
 };
 
-/// Supacode agent-presence hook events carried in the `event=` metadata field.
+/// simbacode agent-presence hook events carried in the `event=` metadata field.
 /// This is the authoritative event vocabulary ported verbatim from the macOS
 /// source (`AgentHookSettingsCommand.HookEvent` /
 /// `AgentPresenceFeature.Activity`): the wire `event=` rawValues must match
@@ -141,7 +141,7 @@ pub const Field = enum {
     status,
     signal,
 
-    // Supacode agent-presence fields (OSC 3008 metadata, AgentPresenceOSC).
+    // simbacode agent-presence fields (OSC 3008 metadata, AgentPresenceOSC).
     // `event` carries a HookEvent rawValue; `pid` (above) is the agent's local
     // process id for the liveness sweep. The notify leg uses kind/title/body.
     event,
@@ -598,7 +598,7 @@ test "OSC 3008: start command with no fields" {
 }
 
 // ============================================================================
-// Supacode agent-presence event vocabulary tests
+// simbacode agent-presence event vocabulary tests
 // ============================================================================
 
 test "OSC 3008: agent-presence session_start event" {

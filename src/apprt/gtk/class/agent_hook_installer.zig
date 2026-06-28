@@ -1,17 +1,17 @@
-//! Supacode agent-presence hook INSTALLER (Linux port).
+//! simbacode agent-presence hook INSTALLER (Linux port).
 //!
-//! Writes / removes the `# supacode-managed-hook` guarded blocks into each
+//! Writes / removes the `# simbacode-managed-hook` guarded blocks into each
 //! agent's NATIVE config, so the agent emits OSC-3008 agent-presence events to
 //! its controlling tty. Faithful port of the macOS per-agent installers:
 //!   - Claude  -> `~/.claude/settings.json` `hooks` map (JSON merge)
 //!   - Codex   -> `~/.codex/hooks.json` `hooks` map (JSON merge)
 //!   - Kiro    -> `~/.kiro/agents/kiro_default.json` flat `hooks` map (JSON merge)
-//!   - Copilot -> `~/.copilot/hooks/supacode.json` (own file)
-//!   - OpenCode-> `~/.config/opencode/plugins/supacode-presence.js` (own file)
-//!   - Pi      -> `~/.pi/agent/extensions/supacode/index.ts` (own file)
+//!   - Copilot -> `~/.copilot/hooks/simbacode.json` (own file)
+//!   - OpenCode-> `~/.config/opencode/plugins/simbacode-presence.js` (own file)
+//!   - Pi      -> `~/.pi/agent/extensions/simbacode/index.ts` (own file)
 //!
-//! Idempotent: the trailing `# supacode-managed-hook` sentinel is the SOLE
-//! ownership marker, so a re-install strips only Supacode-managed entries then
+//! Idempotent: the trailing `# simbacode-managed-hook` sentinel is the SOLE
+//! ownership marker, so a re-install strips only simbacode-managed entries then
 //! re-appends the canonical ones (`install = uninstall + append`), and a
 //! user-authored hook in the same file is never touched.
 //!
@@ -24,7 +24,7 @@ const hooks = @import("agent_hooks.zig");
 const Agent = hooks.Agent;
 const HookEvent = hooks.HookEvent;
 
-const log = std.log.scoped(.supacode_agent_hooks);
+const log = std.log.scoped(.simbacode_agent_hooks);
 
 /// A single canonical hook slot: an event key (the agent-native event name),
 /// an optional matcher, the OSC events the command emits, and whether it
@@ -91,7 +91,7 @@ pub const kiro_slots = [_]HookSlot{
 /// is not yet ported (the flat-slot model has no payload-conditional shape);
 /// agentStop already owns the done-alert, so a Copilot permission prompt shows
 /// presence/activity but not the dedicated needs-you banner until ported. See
-/// dist/linux/supacode/SOURCE-PARITY.md deferred items.
+/// dist/linux/simbacode/SOURCE-PARITY.md deferred items.
 pub const copilot_slots = [_]HookSlot{
     .{ .event_key = "sessionStart", .events = &.{.session_start}, .timeout = 5 },
     .{ .event_key = "userPromptSubmitted", .events = &.{.busy}, .timeout = 10 },
@@ -116,12 +116,12 @@ fn homeDir() ?[]const u8 {
 }
 
 /// Install the agent-presence hooks for every supported agent. Idempotent:
-/// re-running strips Supacode-managed blocks then re-appends the canonical
+/// re-running strips simbacode-managed blocks then re-appends the canonical
 /// set, never touching user-authored hooks. Best-effort per agent: a failure
 /// installing one agent is logged and does not block the others.
 pub fn installAll(alloc: Allocator) void {
     const home = homeDir() orelse {
-        log.warn("supacode: HOME unset; skipping agent-hook install", .{});
+        log.warn("simbacode: HOME unset; skipping agent-hook install", .{});
         return;
     };
     installOne(alloc, home, .claude) catch |err| logErr(.claude, "install", err);
@@ -131,10 +131,33 @@ pub fn installAll(alloc: Allocator) void {
     installOne(alloc, home, .opencode) catch |err| logErr(.opencode, "install", err);
     installOne(alloc, home, .pi) catch |err| logErr(.pi, "install", err);
     installOne(alloc, home, .hermes) catch |err| logErr(.hermes, "install", err);
+
+    // Clean up own-files written by the legacy supacode-branded build so an
+    // upgrade doesn't leave orphaned `supacode*` files alongside the new
+    // `simbacode*` ones. Only removes files carrying our managed sentinel.
+    cleanupLegacyOwnFiles(alloc, home);
+}
+
+/// Remove legacy `supacode*` own-files (pre-rebrand) if they carry the managed
+/// sentinel. The JSON/YAML hook-map installers already strip legacy blocks via
+/// `isSimbacodeManagedCommand` (which matches the legacy marker); this handles
+/// the standalone own-files whose paths changed in the rebrand.
+fn cleanupLegacyOwnFiles(alloc: Allocator, home: []const u8) void {
+    const legacy_paths = [_][]const u8{
+        ".copilot/hooks/supacode.json",
+        ".config/opencode/plugins/supacode-presence.js",
+        ".pi/agent/extensions/supacode/index.ts",
+        ".hermes/agent-hooks/supacode-presence.sh",
+    };
+    for (legacy_paths) |rel| {
+        uninstallOwnFile(alloc, home, rel) catch |err| {
+            log.warn("simbacode: legacy cleanup of {s} failed: {}", .{ rel, err });
+        };
+    }
 }
 
 /// Uninstall the agent-presence hooks for every supported agent. Removes only
-/// Supacode-managed blocks (by sentinel); user-authored hooks survive.
+/// simbacode-managed blocks (by sentinel); user-authored hooks survive.
 pub fn uninstallAll(alloc: Allocator) void {
     const home = homeDir() orelse return;
     uninstallOne(alloc, home, .claude) catch |err| logErr(.claude, "uninstall", err);
@@ -147,7 +170,7 @@ pub fn uninstallAll(alloc: Allocator) void {
 }
 
 fn logErr(agent: Agent, op: []const u8, err: anyerror) void {
-    log.warn("supacode: {s} hooks for {s} failed: {}", .{ op, agent.rawValue(), err });
+    log.warn("simbacode: {s} hooks for {s} failed: {}", .{ op, agent.rawValue(), err });
 }
 
 fn installOne(alloc: Allocator, home: []const u8, agent: Agent) !void {
@@ -160,9 +183,9 @@ fn installOne(alloc: Allocator, home: []const u8, agent: Agent) !void {
             try setCodexHooksFlag(alloc, home, true);
         },
         .kiro => try installJsonHookMap(alloc, home, ".kiro/agents/kiro_default.json", &kiro_slots, agent, .flat),
-        .copilot => try installOwnFile(alloc, home, ".copilot/hooks/supacode.json", try copilotFileSource(alloc), agent),
-        .opencode => try installOwnFile(alloc, home, ".config/opencode/plugins/supacode-presence.js", try openCodePluginSource(alloc), agent),
-        .pi => try installOwnFile(alloc, home, ".pi/agent/extensions/supacode/index.ts", try piExtensionSource(alloc), agent),
+        .copilot => try installOwnFile(alloc, home, ".copilot/hooks/simbacode.json", try copilotFileSource(alloc), agent),
+        .opencode => try installOwnFile(alloc, home, ".config/opencode/plugins/simbacode-presence.js", try openCodePluginSource(alloc), agent),
+        .pi => try installOwnFile(alloc, home, ".pi/agent/extensions/simbacode/index.ts", try piExtensionSource(alloc), agent),
         .hermes => try installHermes(alloc, home),
     }
 }
@@ -175,9 +198,9 @@ fn uninstallOne(alloc: Allocator, home: []const u8, agent: Agent) !void {
             try setCodexHooksFlag(alloc, home, false);
         },
         .kiro => try uninstallJsonHookMap(alloc, home, ".kiro/agents/kiro_default.json", .flat),
-        .copilot => try uninstallOwnFile(alloc, home, ".copilot/hooks/supacode.json"),
-        .opencode => try uninstallOwnFile(alloc, home, ".config/opencode/plugins/supacode-presence.js"),
-        .pi => try uninstallOwnFile(alloc, home, ".pi/agent/extensions/supacode/index.ts"),
+        .copilot => try uninstallOwnFile(alloc, home, ".copilot/hooks/simbacode.json"),
+        .opencode => try uninstallOwnFile(alloc, home, ".config/opencode/plugins/simbacode-presence.js"),
+        .pi => try uninstallOwnFile(alloc, home, ".pi/agent/extensions/simbacode/index.ts"),
         .hermes => try uninstallHermes(alloc, home),
     }
 }
@@ -217,7 +240,7 @@ fn readFileAlloc(alloc: Allocator, path: []const u8) !?[]u8 {
 /// Atomically write `content` to `path` (write temp + rename).
 fn writeFileAtomic(alloc: Allocator, path: []const u8, content: []const u8) !void {
     try ensureParentDir(path);
-    const tmp = try std.fmt.allocPrint(alloc, "{s}.supacode.tmp", .{path});
+    const tmp = try std.fmt.allocPrint(alloc, "{s}.simbacode.tmp", .{path});
     defer alloc.free(tmp);
     {
         const file = try std.fs.cwd().createFile(tmp, .{ .truncate = true });
@@ -231,7 +254,7 @@ fn writeFileAtomic(alloc: Allocator, path: []const u8, content: []const u8) !voi
 /// for the Hermes presence script, which Hermes runs as a subprocess.
 fn writeExecutableAtomic(alloc: Allocator, path: []const u8, content: []const u8) !void {
     try ensureParentDir(path);
-    const tmp = try std.fmt.allocPrint(alloc, "{s}.supacode.tmp", .{path});
+    const tmp = try std.fmt.allocPrint(alloc, "{s}.simbacode.tmp", .{path});
     defer alloc.free(tmp);
     {
         const file = try std.fs.cwd().createFile(tmp, .{ .truncate = true, .mode = 0o755 });
@@ -262,7 +285,7 @@ fn writeExecutableAtomic(alloc: Allocator, path: []const u8, content: []const u8
 // and always prints `{}` so Hermes never treats it as a block/inject decision.
 // ===========================================================================
 
-const hermes_script_rel = ".hermes/agent-hooks/supacode-presence.sh";
+const hermes_script_rel = ".hermes/agent-hooks/simbacode-presence.sh";
 const hermes_config_rel = ".hermes/config.yaml";
 const hermes_allowlist_rel = ".hermes/shell-hooks-allowlist.json";
 
@@ -284,7 +307,7 @@ fn installHermes(alloc: Allocator, home: []const u8) !void {
     if (try readFileAlloc(alloc, script_path)) |existing| {
         defer alloc.free(existing);
         if (std.mem.indexOf(u8, existing, hooks.ownership_marker) == null) {
-            log.warn("supacode: {s} exists but is not Supacode-managed; skipping hermes", .{hermes_script_rel});
+            log.warn("simbacode: {s} exists but is not simbacode-managed; skipping hermes", .{hermes_script_rel});
             return;
         }
     }
@@ -296,7 +319,7 @@ fn installHermes(alloc: Allocator, home: []const u8) !void {
 
     // 3. The consent allowlist so the hooks are not silently skipped.
     try patchHermesAllowlist(alloc, home, script_path, true);
-    log.info("supacode: installed hermes presence hooks", .{});
+    log.info("simbacode: installed hermes presence hooks", .{});
 }
 
 fn uninstallHermes(alloc: Allocator, home: []const u8) !void {
@@ -309,17 +332,17 @@ fn uninstallHermes(alloc: Allocator, home: []const u8) !void {
 
 /// The Hermes presence script: read the hook JSON on stdin, pick an OSC event
 /// from `hook_event_name`, resolve the tty, emit the OSC 3008 presence
-/// sequence, and print `{}`. Guarded on SUPACODE_SURFACE_ID so it is inert
-/// outside a Supacode surface. Caller owns the result.
+/// sequence, and print `{}`. Guarded on SIMBACODE_SURFACE_ID so it is inert
+/// outside a simbacode surface. Caller owns the result.
 fn hermesScriptSource(alloc: Allocator) ![]u8 {
     // Reuse the shared tty-resolve snippet so behavior matches every other
-    // agent's hook (SUPACODE_TTY -> /proc fd -> ps).
+    // agent's hook (SIMBACODE_TTY -> /proc fd -> ps).
     return std.fmt.allocPrint(alloc,
         \\#!/bin/sh
         \\# {s}
-        \\# Supacode agent-presence bridge for Hermes. Generated — do not edit.
+        \\# simbacode agent-presence bridge for Hermes. Generated — do not edit.
         \\__in=$(cat 2>/dev/null)
-        \\[ -n "${{SUPACODE_SURFACE_ID:-}}" ] || {{ printf '{{}}\n'; exit 0; }}
+        \\[ -n "${{SIMBACODE_SURFACE_ID:-}}" ] || {{ printf '{{}}\n'; exit 0; }}
         \\__ev=$(printf '%s' "$__in" | sed -n 's/.*"hook_event_name"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | head -n1)
         \\case "$__ev" in
         \\  on_session_start) __osc=session_start; __act=start;;
@@ -328,7 +351,7 @@ fn hermesScriptSource(alloc: Allocator) ![]u8 {
         \\  on_session_end|on_session_finalize) __osc=session_end; __act=end;;
         \\  *) printf '{{}}\n'; exit 0;;
         \\esac
-        \\{{ {s}; __sp=""; [ -n "${{SUPACODE_SOCKET_PATH:-}}" ] && __sp=";pid=$PPID"; printf '\033]3008;%s=hermes;event=%s%s\033\\' "$__act" "$__osc" "$__sp" > "$__tty"; }} >/dev/null 2>&1 || true
+        \\{{ {s}; __sp=""; [ -n "${{SIMBACODE_SOCKET_PATH:-}}" ] && __sp=";pid=$PPID"; printf '\033]3008;%s=hermes;event=%s%s\033\\' "$__act" "$__osc" "$__sp" > "$__tty"; }} >/dev/null 2>&1 || true
         \\printf '{{}}\n'
         \\
     , .{ hooks.ownership_marker, hooks.tty_resolve_snippet });
@@ -347,7 +370,7 @@ fn patchHermesConfig(alloc: Allocator, home: []const u8, script_path: []const u8
         if (!enable) return;
         // No config yet: nothing safe to anchor to; skip (Hermes will write its
         // own config on first run, and the next install will patch it).
-        log.warn("supacode: ~/.hermes/config.yaml missing; skipping hermes hooks block", .{});
+        log.warn("simbacode: ~/.hermes/config.yaml missing; skipping hermes hooks block", .{});
         return;
     };
     defer alloc.free(original);
@@ -371,7 +394,7 @@ fn patchHermesConfig(alloc: Allocator, home: []const u8, script_path: []const u8
             const is_empty_map = std.mem.eql(u8, after, "{}");
             // Our managed block spans this `hooks:` line plus indented lines
             // until the next column-0 key. Detect ours by the sentinel inside.
-            const our_block = !is_empty_map and blockIsSupacodeManaged(original, line);
+            const our_block = !is_empty_map and blockIsSimbacodeManaged(original, line);
             if (is_empty_map or our_block) {
                 handled = true;
                 if (enable) {
@@ -388,7 +411,7 @@ fn patchHermesConfig(alloc: Allocator, home: []const u8, script_path: []const u8
                 continue;
             }
             // User-populated hooks map: do not touch.
-            log.warn("supacode: ~/.hermes/config.yaml has a user hooks block; skipping", .{});
+            log.warn("simbacode: ~/.hermes/config.yaml has a user hooks block; skipping", .{});
             return;
         }
         if (!first) try out.append(alloc, '\n');
@@ -429,7 +452,7 @@ fn hermesHooksBlock(alloc: Allocator, script_path: []const u8) ![]u8 {
 
 /// True when the managed sentinel appears on the `hooks:` header line (our
 /// block writes `hooks: # <sentinel>`).
-fn blockIsSupacodeManaged(_: []const u8, hooks_line: []const u8) bool {
+fn blockIsSimbacodeManaged(_: []const u8, hooks_line: []const u8) bool {
     return std.mem.indexOf(u8, hooks_line, hooks.ownership_marker) != null;
 }
 
@@ -501,7 +524,7 @@ fn patchHermesAllowlist(alloc: Allocator, home: []const u8, script_path: []const
 
 /// Install (idempotent) the canonical hook map into a JSON settings file.
 /// `install = uninstall + append`: parse the existing object, strip every
-/// Supacode-managed command from the `hooks` map, append the canonical groups,
+/// simbacode-managed command from the `hooks` map, append the canonical groups,
 /// and write back. A missing file starts from an empty object; a non-object
 /// `hooks` value is refused (would destroy user data we don't own).
 fn installJsonHookMap(
@@ -533,7 +556,7 @@ fn installJsonHookMap(
         break :root .{ .object = .init(aa) };
     };
 
-    // Get/replace the `hooks` object, pruning Supacode-managed commands.
+    // Get/replace the `hooks` object, pruning simbacode-managed commands.
     var hooks_obj = try prunedHooksObject(aa, &root, format);
 
     // Append the canonical groups, grouped by event key (preserving order).
@@ -545,10 +568,10 @@ fn installJsonHookMap(
     const out = try std.json.Stringify.valueAlloc(alloc, root, .{ .whitespace = .indent_2 });
     defer alloc.free(out);
     try writeFileAtomic(alloc, path, out);
-    log.info("supacode: installed {s} hooks at {s}", .{ agent.rawValue(), rel });
+    log.info("simbacode: installed {s} hooks at {s}", .{ agent.rawValue(), rel });
 }
 
-/// Uninstall (idempotent): strip every Supacode-managed command from the JSON
+/// Uninstall (idempotent): strip every simbacode-managed command from the JSON
 /// settings file's `hooks` map, leaving user hooks intact. No-op if the file
 /// is missing.
 fn uninstallJsonHookMap(
@@ -576,10 +599,10 @@ fn uninstallJsonHookMap(
     const out = try std.json.Stringify.valueAlloc(alloc, root, .{ .whitespace = .indent_2 });
     defer alloc.free(out);
     try writeFileAtomic(alloc, path, out);
-    log.info("supacode: uninstalled hooks from {s}", .{rel});
+    log.info("simbacode: uninstalled hooks from {s}", .{rel});
 }
 
-/// Build a fresh `hooks` object with every Supacode-managed command pruned from
+/// Build a fresh `hooks` object with every simbacode-managed command pruned from
 /// the existing one. A non-object `hooks` value is refused.
 fn prunedHooksObject(
     aa: Allocator,
@@ -607,7 +630,7 @@ fn prunedHooksObject(
     return result;
 }
 
-/// Strip Supacode-managed commands from one group, returning null if the group
+/// Strip simbacode-managed commands from one group, returning null if the group
 /// becomes empty. For `nested`, the group is `{matcher?, hooks:[...]}`; for
 /// `flat`, the group is a single `{command, timeout_ms}` entry.
 fn strippedGroup(aa: Allocator, group: std.json.Value, format: HookFormat) !?std.json.Value {
@@ -616,7 +639,7 @@ fn strippedGroup(aa: Allocator, group: std.json.Value, format: HookFormat) !?std
             // A flat entry is itself the command-bearing object.
             if (group != .object) return group;
             const cmd = group.object.get("command") orelse return group;
-            if (cmd == .string and hooks.isSupacodeManagedCommand(cmd.string)) return null;
+            if (cmd == .string and hooks.isSimbacodeManagedCommand(cmd.string)) return null;
             return group;
         },
         .nested => {
@@ -627,7 +650,7 @@ fn strippedGroup(aa: Allocator, group: std.json.Value, format: HookFormat) !?std
             for (hooks_val.array.items) |hook| {
                 if (hook == .object) {
                     if (hook.object.get("command")) |cmd| {
-                        if (cmd == .string and hooks.isSupacodeManagedCommand(cmd.string)) continue;
+                        if (cmd == .string and hooks.isSimbacodeManagedCommand(cmd.string)) continue;
                     }
                 }
                 try kept.append(hook);
@@ -684,7 +707,7 @@ fn appendCanonicalSlots(
             if (existing.* == .array) {
                 try existing.array.append(group);
             } else {
-                // A non-array value at a Supacode event key is malformed user
+                // A non-array value at a simbacode event key is malformed user
                 // data we don't own. Refuse rather than silently replace it
                 // (matches macOS AgentHookSettingsFileInstaller.invalidEventHooks).
                 return InstallError.InvalidExistingConfig;
@@ -701,8 +724,8 @@ fn appendCanonicalSlots(
 // Own-file installer (Copilot / OpenCode / Pi).
 // ===========================================================================
 
-/// Install a Supacode-owned file: write `content` to `<home>/<rel>` only if the
-/// existing file (if any) is also Supacode-managed (carries the sentinel). A
+/// Install a simbacode-owned file: write `content` to `<home>/<rel>` only if the
+/// existing file (if any) is also simbacode-managed (carries the sentinel). A
 /// user file that merely shares the name is never overwritten.
 fn installOwnFile(alloc: Allocator, home: []const u8, rel: []const u8, content: []u8, agent: Agent) !void {
     defer alloc.free(content);
@@ -713,16 +736,16 @@ fn installOwnFile(alloc: Allocator, home: []const u8, rel: []const u8, content: 
         defer alloc.free(existing);
         if (std.mem.indexOf(u8, existing, hooks.ownership_marker) == null) {
             // Not ours — refuse to overwrite a user file with the same name.
-            log.warn("supacode: {s} exists but is not Supacode-managed; skipping", .{rel});
+            log.warn("simbacode: {s} exists but is not simbacode-managed; skipping", .{rel});
             return;
         }
         if (std.mem.eql(u8, existing, content)) return; // already current
     }
     try writeFileAtomic(alloc, path, content);
-    log.info("supacode: installed {s} file at {s}", .{ agent.rawValue(), rel });
+    log.info("simbacode: installed {s} file at {s}", .{ agent.rawValue(), rel });
 }
 
-/// Uninstall a Supacode-owned file: remove it only if it carries the sentinel.
+/// Uninstall a simbacode-owned file: remove it only if it carries the sentinel.
 fn uninstallOwnFile(alloc: Allocator, home: []const u8, rel: []const u8) !void {
     const path = try joinHome(alloc, home, rel);
     defer alloc.free(path);
@@ -733,15 +756,15 @@ fn uninstallOwnFile(alloc: Allocator, home: []const u8, rel: []const u8) !void {
         error.FileNotFound => {},
         else => return err,
     };
-    log.info("supacode: uninstalled file {s}", .{rel});
+    log.info("simbacode: uninstalled file {s}", .{rel});
 }
 
 // ===========================================================================
 // Own-file source builders.
 // ===========================================================================
 
-/// Build `~/.copilot/hooks/supacode.json` (CopilotHookSettings). Copilot auto-
-/// loads every JSON file in the hooks dir, so Supacode owns its own file. The
+/// Build `~/.copilot/hooks/simbacode.json` (CopilotHookSettings). Copilot auto-
+/// loads every JSON file in the hooks dir, so simbacode owns its own file. The
 /// composite command embeds the ownership sentinel, so the file is always
 /// recognizable. Caller owns the result.
 fn copilotFileSource(alloc: Allocator) ![]u8 {
@@ -770,7 +793,7 @@ fn copilotFileSource(alloc: Allocator) ![]u8 {
     return alloc.dupe(u8, out);
 }
 
-/// Build `~/.config/opencode/plugins/supacode-presence.js` (OpenCodePluginContent).
+/// Build `~/.config/opencode/plugins/simbacode-presence.js` (OpenCodePluginContent).
 /// OpenCode loads JS/TS plugins; the plugin runs the same guarded shell command
 /// every other agent's hooks run. Caller owns the result.
 fn openCodePluginSource(alloc: Allocator) ![]u8 {
@@ -799,11 +822,11 @@ fn openCodePluginSource(alloc: Allocator) ![]u8 {
     return std.fmt.allocPrint(alloc,
         \\// {s}
         \\//
-        \\// Generated by Supacode — do not edit. Bridges OpenCode plugin events to
-        \\// Supacode's OSC 3008 agent-presence protocol by running the same guarded
-        \\// shell command Supacode installs for every other agent. The command checks
-        \\// SUPACODE_SURFACE_ID first, so it is inert outside a Supacode surface.
-        \\export const SupacodePresence = async ({{ $ }}) => {{
+        \\// Generated by simbacode — do not edit. Bridges OpenCode plugin events to
+        \\// simbacode's OSC 3008 agent-presence protocol by running the same guarded
+        \\// shell command simbacode installs for every other agent. The command checks
+        \\// SIMBACODE_SURFACE_ID first, so it is inert outside a simbacode surface.
+        \\export const SimbacodePresence = async ({{ $ }}) => {{
         \\  const emit = (command) => $`sh -c ${{command}}`.quiet().nothrow()
         \\  await emit({s})
         \\  return {{
@@ -840,7 +863,7 @@ fn jsString(alloc: Allocator, value: []const u8) ![]u8 {
 }
 
 /// The Pi extension index.ts (PiExtensionContent). Shipped in-tree; the
-/// installer reconciles it into `~/.pi/agent/extensions/supacode/index.ts`.
+/// installer reconciles it into `~/.pi/agent/extensions/simbacode/index.ts`.
 /// The sentinel is the first line so install/uninstall recognize it. Caller
 /// owns the result.
 fn piExtensionSource(alloc: Allocator) ![]u8 {
@@ -873,7 +896,7 @@ fn setCodexHooksFlag(alloc: Allocator, home: []const u8, enable: bool) !void {
 
     if (std.mem.eql(u8, rewritten, original)) return; // no change
     try writeFileAtomic(alloc, path, rewritten);
-    log.info("supacode: codex hooks feature flag {s}", .{if (enable) "enabled" else "disabled"});
+    log.info("simbacode: codex hooks feature flag {s}", .{if (enable) "enabled" else "disabled"});
 }
 
 /// Return the TOML section name if `line` is a `[section]` header (trailing
@@ -974,21 +997,21 @@ fn rewriteCodexFeatures(alloc: Allocator, original: []const u8, enable: bool) ![
 /// A distinct comment form, but `installOwnFile` keys off the shared sentinel,
 /// which this file also embeds in its header for uniform detection.
 const pi_extension_index_ts =
-    \\/* supacode-managed-extension */
-    \\// # supacode-managed-hook
+    \\/* simbacode-managed-extension */
+    \\// # simbacode-managed-hook
     \\/**
-    \\ * Supacode + Pi integration extension.
+    \\ * simbacode + Pi integration extension.
     \\ *
-    \\ * Reports agent lifecycle and notifications to Supacode by emitting OSC 3008
+    \\ * Reports agent lifecycle and notifications to simbacode by emitting OSC 3008
     \\ * escape sequences to the controlling terminal. Inert in any terminal that
-    \\ * does not handle OSC 3008, and reaches Supacode over SSH too (no local
+    \\ * does not handle OSC 3008, and reaches simbacode over SSH too (no local
     \\ * socket needed), matching the Claude / Codex / Kiro hook integrations.
     \\ *
-    \\ * Required env (injected by Supacode on every surface):
-    \\ *   SUPACODE_SURFACE_ID  present only on a Supacode surface; absence is the
+    \\ * Required env (injected by simbacode on every surface):
+    \\ *   SIMBACODE_SURFACE_ID  present only on a simbacode surface; absence is the
     \\ *                        no-op gate.
     \\ * Optional:
-    \\ *   SUPACODE_SOCKET_PATH present only on the local host; gates the local pid
+    \\ *   SIMBACODE_SOCKET_PATH present only on the local host; gates the local pid
     \\ *                        so the app's liveness sweep can reap a crashed agent.
     \\ *
     \\ * Hook event mapping:
@@ -1013,13 +1036,13 @@ const pi_extension_index_ts =
     \\let lastWarnedAt = 0;
     \\const WARN_INTERVAL_MS = 60_000;
     \\
-    \\function isSupacodeSurface(): boolean {
-    \\  const id = process.env["SUPACODE_SURFACE_ID"];
+    \\function isSimbacodeSurface(): boolean {
+    \\  const id = process.env["SIMBACODE_SURFACE_ID"];
     \\  return !!id && id.length > 0;
     \\}
     \\
     \\function localPidSuffix(): string {
-    \\  return process.env["SUPACODE_SOCKET_PATH"] ? `;pid=${process.pid}` : "";
+    \\  return process.env["SIMBACODE_SOCKET_PATH"] ? `;pid=${process.pid}` : "";
     \\}
     \\
     \\function writeToTerminal(sequence: string): void {
@@ -1047,7 +1070,7 @@ const pi_extension_index_ts =
     \\    if (now - lastWarnedAt > WARN_INTERVAL_MS) {
     \\      lastWarnedAt = now;
     \\      const e = err as NodeJS.ErrnoException;
-    \\      process.stderr.write(`supacode: OSC emit failed: ${e.code ?? ""} ${e.message ?? String(err)}\n`);
+    \\      process.stderr.write(`simbacode: OSC emit failed: ${e.code ?? ""} ${e.message ?? String(err)}\n`);
     \\    }
     \\  }
     \\}
@@ -1092,7 +1115,7 @@ const pi_extension_index_ts =
     \\}
     \\
     \\export default function (pi: ExtensionAPI) {
-    \\  if (!isSupacodeSurface()) return;
+    \\  if (!isSimbacodeSurface()) return;
     \\  emitPresence("session_start");
     \\
     \\  pi.on("agent_start", (_event, _ctx) => {
@@ -1116,7 +1139,7 @@ const pi_extension_index_ts =
 // First-run / settings toggle.
 // ===========================================================================
 
-/// Persisted install-settings file: `~/.supacode/hooks.json`. Tracks whether
+/// Persisted install-settings file: `~/.simbacode/hooks.json`. Tracks whether
 /// agent-hook auto-install is enabled (default on) and whether the first-run
 /// install has happened. Matches the user's preference: run automatically on
 /// first launch WITH a settings toggle to disable (default on).
@@ -1127,9 +1150,9 @@ const SettingsFile = struct {
     installed: bool = false,
 };
 
-/// Resolve `~/.supacode/hooks.json`. Caller owns the result.
+/// Resolve `~/.simbacode/hooks.json`. Caller owns the result.
 fn settingsPath(alloc: Allocator, home: []const u8) ![]u8 {
-    return std.fs.path.join(alloc, &.{ home, ".supacode", "hooks.json" });
+    return std.fs.path.join(alloc, &.{ home, ".simbacode", "hooks.json" });
 }
 
 /// Load the install-settings file, or defaults when missing/malformed.
@@ -1167,22 +1190,22 @@ pub fn reconcileOnLaunch() void {
     const home = homeDir() orelse return;
     const settings = loadSettings(alloc, home);
     if (!settings.enabled) {
-        log.debug("supacode: agent-hook auto-install disabled by settings", .{});
+        log.debug("simbacode: agent-hook auto-install disabled by settings", .{});
         return;
     }
     installAll(alloc);
     saveSettings(alloc, home, .{ .enabled = true, .installed = true }) catch |err|
-        log.warn("supacode: failed to persist hook settings: {}", .{err});
+        log.warn("simbacode: failed to persist hook settings: {}", .{err});
 }
 
-/// Disable auto-install and uninstall all Supacode-managed hooks. Used by the
+/// Disable auto-install and uninstall all simbacode-managed hooks. Used by the
 /// settings toggle when the user turns the feature off.
 pub fn disableAndUninstall() void {
     const alloc = std.heap.page_allocator;
     const home = homeDir() orelse return;
     uninstallAll(alloc);
     saveSettings(alloc, home, .{ .enabled = false, .installed = false }) catch |err|
-        log.warn("supacode: failed to persist hook settings: {}", .{err});
+        log.warn("simbacode: failed to persist hook settings: {}", .{err});
 }
 
 // ===========================================================================
@@ -1224,14 +1247,14 @@ test "install + uninstall claude settings.json round-trips, idempotent" {
         defer alloc.free(bytes);
         // User hook preserved.
         try testing.expect(std.mem.indexOf(u8, bytes, "echo user-hook") != null);
-        // Supacode-managed hook present.
+        // simbacode-managed hook present.
         try testing.expect(std.mem.indexOf(u8, bytes, hooks.ownership_marker) != null);
         try testing.expect(std.mem.indexOf(u8, bytes, "event=session_start") != null);
         try testing.expect(std.mem.indexOf(u8, bytes, "event=busy") != null);
         try testing.expect(std.mem.indexOf(u8, bytes, "AskUserQuestion|ExitPlanMode") != null);
     }
 
-    // Re-install: idempotent (no duplicate Supacode blocks).
+    // Re-install: idempotent (no duplicate simbacode blocks).
     try installJsonHookMap(alloc, home, settings_rel, &claude_slots, .claude, .nested);
     {
         const bytes = (try readFileAlloc(alloc, path)).?;
@@ -1248,7 +1271,7 @@ test "install + uninstall claude settings.json round-trips, idempotent" {
         try testing.expect(std.mem.indexOf(u8, bytes, "echo user-hook") != null);
     }
 
-    // Uninstall: Supacode blocks gone, user hook survives.
+    // Uninstall: simbacode blocks gone, user hook survives.
     try uninstallJsonHookMap(alloc, home, settings_rel, .nested);
     {
         const bytes = (try readFileAlloc(alloc, path)).?;
@@ -1278,14 +1301,14 @@ test "install kiro flat hooks uses timeout_ms" {
     try testing.expect(std.mem.indexOf(u8, bytes, "agentSpawn") != null);
     try testing.expect(std.mem.indexOf(u8, bytes, "event=session_start") != null);
 
-    // Uninstall removes the file's Supacode entries.
+    // Uninstall removes the file's simbacode entries.
     try uninstallJsonHookMap(alloc, home, rel, .flat);
     const after = (try readFileAlloc(alloc, path)).?;
     defer alloc.free(after);
     try testing.expect(std.mem.indexOf(u8, after, hooks.ownership_marker) == null);
 }
 
-test "install refuses a non-array Supacode event value (no silent data loss)" {
+test "install refuses a non-array simbacode event value (no silent data loss)" {
     const testing = std.testing;
     const alloc = testing.allocator;
 
@@ -1298,7 +1321,7 @@ test "install refuses a non-array Supacode event value (no silent data loss)" {
     const path = try joinHome(alloc, home, rel);
     defer alloc.free(path);
 
-    // A Supacode event key with a non-array (malformed) value must NOT be
+    // A simbacode event key with a non-array (malformed) value must NOT be
     // silently replaced; install refuses (mirrors macOS invalidEventHooks).
     try writeFileAtomic(alloc, path,
         \\{ "hooks": { "SessionStart": "malformed-not-an-array" } }
@@ -1323,7 +1346,7 @@ test "own-file installer respects user-owned files" {
     const home = try tmp.dir.realpathAlloc(alloc, ".");
     defer alloc.free(home);
 
-    const rel = ".copilot/hooks/supacode.json";
+    const rel = ".copilot/hooks/simbacode.json";
     const path = try joinHome(alloc, home, rel);
     defer alloc.free(path);
 
@@ -1337,7 +1360,7 @@ test "own-file installer respects user-owned files" {
         try testing.expectEqualStrings("user content no sentinel", bytes);
     }
 
-    // Replace with a Supacode-managed file, then install overwrites it.
+    // Replace with a simbacode-managed file, then install overwrites it.
     {
         const seed = try copilotFileSource(alloc);
         defer alloc.free(seed);
@@ -1357,7 +1380,7 @@ test "own-file installer respects user-owned files" {
         try testing.expect(std.mem.indexOf(u8, bytes, hooks.ownership_marker) != null);
     }
 
-    // Uninstall removes the Supacode-managed file.
+    // Uninstall removes the simbacode-managed file.
     try uninstallOwnFile(alloc, home, rel);
     try testing.expect((try readFileAlloc(alloc, path)) == null);
 }
@@ -1370,7 +1393,7 @@ test "opencode plugin + pi extension carry sentinel and events" {
     defer alloc.free(plugin);
     try testing.expect(std.mem.indexOf(u8, plugin, hooks.ownership_marker) != null);
     try testing.expect(std.mem.indexOf(u8, plugin, "event=session_start") != null);
-    try testing.expect(std.mem.indexOf(u8, plugin, "SupacodePresence") != null);
+    try testing.expect(std.mem.indexOf(u8, plugin, "SimbacodePresence") != null);
 
     const pi_src = try piExtensionSource(alloc);
     defer alloc.free(pi_src);
