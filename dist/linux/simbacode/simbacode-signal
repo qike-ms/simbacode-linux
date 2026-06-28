@@ -1,0 +1,96 @@
+#!/usr/bin/env bash
+# simbacode-signal — emit an OSC-3008 (Hierarchical Context Signalling) sequence
+# to the controlling terminal so simbacode-linux can show agent presence,
+# activity, and attention for the current surface.
+#
+# This is the Linux agent-integration transport. On macOS supacode injects a
+# Unix-domain socket + env vars and agents post JSON to it; on Linux we carry
+# the same information over OSC-3008, which the terminal routes to the exact
+# surface the escape arrives on. The wire format matches the macOS source
+# (AgentPresenceOSC.swift) so the same hooks are compatible with both apps.
+#
+# Usage:
+#   simbacode-signal <event> [--agent NAME] [--pid PID]
+#
+#   <event> is one of the HookEvent values:
+#     session_start | session_end | busy | awaiting_input | idle
+#
+# Examples:
+#   simbacode-signal session_start --agent claude   # presence on (tab icon)
+#   simbacode-signal busy          --agent claude   # working
+#   simbacode-signal awaiting_input --agent claude  # needs you (banner + bell)
+#   simbacode-signal idle          --agent claude   # waiting
+#   simbacode-signal session_end   --agent claude   # presence off
+#
+# The sequence emitted is:
+#   ESC ] 3008 ; <action>=<agent> ; event=<event> [ ; pid=<pid> ] ST
+# where <action> is "end" for session_end, else "start". The app keys off the
+# event= field; the action byte is descriptive.
+#
+# Notes:
+#  - Emission is gated on SIMBACODE_SURFACE_ID (set by simbacode-linux on every
+#    surface). Outside a simbacode surface this is a silent no-op, mirroring the
+#    installed hooks.
+#  - pid defaults to $PPID when SIMBACODE_SOCKET_PATH is set (the local-host
+#    marker), and feeds the app's liveness sweep. Omit over SSH.
+#  - Output goes to the controlling tty (/dev/tty) so it is not captured by a
+#    pipe and reaches the terminal even when stdout is redirected.
+
+set -u
+
+OSC="3008"
+ESC=$'\033'
+ST=$'\033\\'
+
+agent="agent"
+pid=""
+
+die() { echo "simbacode-signal: $*" >&2; exit 2; }
+
+# Strip OSC-3008-hostile bytes: control chars (0x00-0x1F, 0x7F) and ';' which
+# separates fields, to prevent field injection.
+sanitize() {
+  printf '%s' "$1" | LC_ALL=C tr -d '\000-\037\177;' | LC_ALL=C tr -s ' '
+}
+
+[ $# -ge 1 ] || die "missing event (session_start|session_end|busy|awaiting_input|idle)"
+event="$1"; shift
+
+case "$event" in
+  session_start|session_end|busy|awaiting_input|idle) ;;
+  *) die "unknown event '$event'" ;;
+esac
+
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --agent) agent="${2:-}"; shift 2 ;;
+    --agent=*) agent="${1#*=}"; shift ;;
+    --pid) pid="${2:-}"; shift 2 ;;
+    --pid=*) pid="${1#*=}"; shift ;;
+    *) die "unexpected argument '$1'" ;;
+  esac
+done
+
+# Gate on the surface env var, exactly like the installed hooks.
+[ -n "${SIMBACODE_SURFACE_ID:-}" ] || exit 0
+
+# action byte: end for session_end, else start (app keys off event=).
+if [ "$event" = "session_end" ]; then action="end"; else action="start"; fi
+
+# pid suffix: explicit --pid, else $PPID when the local-host marker is set.
+pid_suffix=""
+if [ -n "$pid" ]; then
+  pid_suffix=";pid=$(sanitize "$pid")"
+elif [ -n "${SIMBACODE_SOCKET_PATH:-}" ]; then
+  pid_suffix=";pid=$PPID"
+fi
+
+seq="${ESC}]${OSC};${action}=$(sanitize "$agent");event=${event}${pid_suffix}${ST}"
+
+# Emit to the controlling terminal. Prefer /dev/tty so the sequence reaches the
+# terminal even when stdout is redirected; fall back to stdout in CI.
+if { printf '%s' "$seq" >/dev/tty; } 2>/dev/null; then
+  :
+else
+  printf '%s' "$seq" 2>/dev/null || true
+fi
