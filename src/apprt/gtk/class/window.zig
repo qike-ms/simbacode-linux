@@ -2797,7 +2797,25 @@ pub const Window = extern struct {
             oldest.deinit(alloc);
         }
 
+        // Audibly signal the new notification (a system beep), so the user
+        // notices an agent needs them even when not looking at the sidebar.
+        // Skipped when the user is already on this surface (no point beeping
+        // at a notification they're already looking at).
+        if (!self.surfaceIsForeground(surface)) self.playNotificationSound();
+
         self.refreshNotifications();
+    }
+
+    /// Play a short system sound for a new agent notification. Uses the GDK
+    /// surface beep (dependency-free, same mechanism as the terminal bell).
+    /// Gated on the terminal's `bell-features.system` so a user who silenced
+    /// the bell also silences notification sounds.
+    fn playNotificationSound(self: *Window) void {
+        const priv = self.private();
+        const config = if (priv.config) |v| v.get() else return;
+        if (!config.@"bell-features".system) return;
+        const native = self.as(gtk.Native).getSurface() orelse return;
+        native.beep();
     }
 
     /// Rebuild the notification popover list and update the bell's unread
