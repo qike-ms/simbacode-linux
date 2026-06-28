@@ -1937,6 +1937,12 @@ pub const Window = extern struct {
         priv.sidebar_rows.clearRetainingCapacity();
         priv.sidebar_list.removeAll();
 
+        // The worktree leaf row matching the currently-visible worktree, so we
+        // can highlight it after the rebuild. GTK drops selection on removeAll,
+        // and single-selection otherwise sticks on the top row (misleading).
+        const active_path = self.activeWorktreePath();
+        var active_row: ?*gtk.ListBoxRow = null;
+
         var i: usize = 0;
         while (i < statuses.len) {
             // Find the contiguous run of worktrees belonging to this repo.
@@ -1958,10 +1964,22 @@ pub const Window = extern struct {
                     const row = self.buildWorktreeRow(st);
                     priv.sidebar_list.append(row.as(gtk.Widget));
                     priv.sidebar_rows.append(alloc, .{ .kind = .worktree, .index = idx }) catch {};
+                    if (active_path) |ap| {
+                        if (std.mem.eql(u8, ap, st.path)) active_row = row;
+                    }
                 }
             }
 
             i = j;
+        }
+
+        // Highlight the active worktree's row (or clear selection when none is
+        // active), so the highlight reflects where the user actually is rather
+        // than sticking on the first row.
+        if (active_row) |row| {
+            priv.sidebar_list.selectRow(row);
+        } else {
+            priv.sidebar_list.unselectAll();
         }
     }
 
@@ -2031,14 +2049,16 @@ pub const Window = extern struct {
         box.append(label.as(gtk.Widget));
 
         // Agent presence icon (#4): a generic bot mark on the repo header when
-        // any worktree in this group has a running agent (so a collapsed repo
-        // still signals "agents running here").
-        if (self.groupHasAgent(group)) appendAgentIcon(box, .generic);
+        // any worktree in this group has a running agent. Only shown when the
+        // group is COLLAPSED — when expanded the per-worktree rows carry their
+        // own agent/diff/bell marks, so showing them here too is redundant (#1).
+        if (collapsed and self.groupHasAgent(group)) appendAgentIcon(box, .generic);
 
-        // Badge label (right): aggregated diff stat + attention bell. Fixed
-        // size, right-aligned, so counters never get clipped by long names.
+        // Badge label (right): aggregated diff stat + attention bell, shown only
+        // when collapsed (see above). Fixed size, right-aligned, so counters
+        // never get clipped by long names.
         var badge_buf: [320]u8 = undefined;
-        const badges: []const u8 = blk: {
+        const badges: []const u8 = if (!collapsed) "" else blk: {
             var stream = std.io.fixedBufferStream(&badge_buf);
             const w = stream.writer();
             // macOS shows both +added and -removed together whenever any
@@ -2319,7 +2339,13 @@ pub const Window = extern struct {
         const alloc = Application.default().allocator();
 
         if (active) {
-            const dup = alloc.dupeZ(u8, path) catch return;
+            // Store the CANONICAL worktree path for this surface (via its owning
+            // worktree TabView), not the shell-reported pwd: getPwd depends on
+            // OSC 7 and often doesn't match a sidebar row exactly, which is why
+            // the sidebar bell never appeared. Fall back to the passed pwd only
+            // when the surface isn't in a named worktree view.
+            const wt_path: []const u8 = self.worktreePathForSurface(surface) orelse path;
+            const dup = alloc.dupeZ(u8, wt_path) catch return;
             const gop = priv.sidebar_attention.getOrPut(alloc, surface) catch {
                 alloc.free(dup);
                 return;
