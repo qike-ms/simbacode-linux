@@ -2814,9 +2814,10 @@ pub const Window = extern struct {
     /// `bell-features.system` so silencing the bell silences these too; we also
     /// ring the GDK beep as a last-resort fallback.
     fn playNotificationSound(self: *Window) void {
-        const priv = self.private();
-        const config = if (priv.config) |v| v.get() else return;
-        if (!config.@"bell-features".system) return;
+        // Note: agent notifications are a distinct concern from the terminal
+        // BEL bell, so this is intentionally NOT gated on `bell-features.system`
+        // (which is off by default and controls the terminal bell character).
+        // A new agent notification always tries to play a short sound.
 
         // Candidate players, in preference order. canberra plays the themed
         // event sound (the proper freedesktop way); the others play a file.
