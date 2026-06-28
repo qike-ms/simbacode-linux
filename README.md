@@ -23,12 +23,37 @@
 
 > [!NOTE]
 >
-> **supacode-linux** is a fork of [Ghostty](https://ghostty.org) that adds a
-> worktree sidebar and AI coding-agent integration to the GTK (Linux) app.
-> It is inspired by [supacode](https://github.com/supabitapp/supacode), bringing
-> its agent-presence experience to Linux. See [SETUP.md](SETUP.md) for build and
-> run instructions. The rest of this README is the upstream Ghostty
-> documentation.
+> ## simbacode-linux
+>
+> **simbacode-linux** turns [Ghostty](https://ghostty.org) into an
+> **agent-centric terminal**: a worktree sidebar, live per-agent presence and
+> activity, and click-to-jump notifications — so you can run several coding
+> agents across many repos and worktrees and always know, at a glance, which
+> one is working, which is waiting, and which needs you.
+>
+> ### Standing on the shoulders of giants
+>
+> simbacode-linux is inspired by, and deeply indebted to, two outstanding
+> projects:
+>
+> - **[supacode](https://github.com/supabitapp/supacode)** pioneered this
+>   agent-centric way of working. It is a genuinely wonderful app: it treats
+>   coding agents as first-class citizens of your workflow, makes git worktrees
+>   effortless, and surfaces exactly the right signal — presence, activity, and
+>   "needs you" attention — without ever getting in your way. If you are on
+>   macOS, use supacode; it is the real thing and we admire it enormously.
+>   simbacode-linux exists to bring that same experience to Linux, and borrows
+>   many of its ideas (the OSC-based agent-presence protocol, worktree-grouped
+>   sidebar, and per-tab agent indicators) with gratitude.
+> - **[Ghostty](https://ghostty.org)** provides the fast, native,
+>   standards-compliant terminal foundation that all of this is built on.
+>
+> simbacode-linux is a separate, community project and is **not affiliated with
+> or endorsed by** supacode/supabit or the Ghostty project. The name is
+> deliberately distinct to avoid any brand confusion.
+>
+> See [SETUP.md](SETUP.md) for build and run instructions. The rest of this
+> README is the upstream Ghostty documentation.
 
 ## About
 
