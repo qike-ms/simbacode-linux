@@ -2556,11 +2556,18 @@ pub const Window = extern struct {
         var it = priv.surface_agents.iterator();
         while (it.next()) |entry| {
             const s = entry.key_ptr.*;
-            const spwd = s.getPwd() orelse continue;
-            // Match the surface to this worktree: exact, or pwd is nested under
-            // the worktree path (a subdir the agent cd'd into).
-            const match = std.mem.eql(u8, spwd, path) or
-                (spwd.len > path.len and std.mem.startsWith(u8, spwd, path) and spwd[path.len] == '/');
+            // Map the surface to its worktree via its owning TabView (the
+            // reliable association — each worktree owns one view), falling back
+            // to the shell-reported pwd when the surface isn't in a named
+            // worktree view (e.g. the default space). getPwd alone is
+            // unreliable: it depends on OSC 7 and may not match exactly.
+            const match = if (self.worktreePathForSurface(s)) |wt|
+                std.mem.eql(u8, wt, path)
+            else if (s.getPwd()) |spwd|
+                (std.mem.eql(u8, spwd, path) or
+                    (spwd.len > path.len and std.mem.startsWith(u8, spwd, path) and spwd[path.len] == '/'))
+            else
+                false;
             if (!match) continue;
             // Prefer an actively-working/waiting agent over an idle one.
             if (entry.value_ptr.activity != .idle) return entry.value_ptr.agent;
@@ -2578,17 +2585,18 @@ pub const Window = extern struct {
         return false;
     }
 
-    /// Append a small agent icon (Gtk.Image from the agent's GIcon) to `box`,
-    /// sized for a sidebar row. Falls back to the generic bot when `agent` is
-    /// the generic/unknown mark. No-op on allocation failure (#4).
+    /// Append a small agent indicator to a sidebar `box`. We use a Pango-markup
+    /// emoji label (\u{1F916}) rather than a Gtk.Image of the agent SVG, because a
+    /// raw-SVG BytesIcon does not reliably render in a plain Gtk.Image (the Adw
+    /// tab indicator renders it via a different path). A text glyph is
+    /// guaranteed to render, the same way the \u{1F514} attention bell already
+    /// does in these rows. `agent` is used for the tooltip only. (#4)
     fn appendAgentIcon(box: *gtk.Box, agent: agentpkg.Agent) void {
-        const icon = agent.newIcon() orelse return;
-        defer icon.unref();
-        const image = gtk.Image.newFromGicon(icon);
-        image.setPixelSize(14);
-        image.as(gtk.Widget).setValign(.center);
-        image.as(gtk.Widget).setTooltipText(agent.label().ptr);
-        box.append(image.as(gtk.Widget));
+        const label = gtk.Label.new(null);
+        label.setMarkup("<span size='small'>\u{1F916}</span>");
+        label.as(gtk.Widget).setValign(.center);
+        label.as(gtk.Widget).setTooltipText(agent.label().ptr);
+        box.append(label.as(gtk.Widget));
     }
 
     /// Recompute and apply the indicator icon for the tab that owns `surface`.
