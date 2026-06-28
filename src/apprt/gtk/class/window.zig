@@ -2806,16 +2806,58 @@ pub const Window = extern struct {
         self.refreshNotifications();
     }
 
-    /// Play a short system sound for a new agent notification. Uses the GDK
-    /// surface beep (dependency-free, same mechanism as the terminal bell).
-    /// Gated on the terminal's `bell-features.system` so a user who silenced
-    /// the bell also silences notification sounds.
+    /// Play a short system sound for a new agent notification. GNOME/Wayland
+    /// commonly maps the GDK "beep" to nothing, so we play a real freedesktop
+    /// event sound by spawning an external player, trying the most
+    /// widely-available first. Best-effort + fire-and-forget: a missing player
+    /// or no audio is a silent no-op. Gated on the terminal's
+    /// `bell-features.system` so silencing the bell silences these too; we also
+    /// ring the GDK beep as a last-resort fallback.
     fn playNotificationSound(self: *Window) void {
         const priv = self.private();
         const config = if (priv.config) |v| v.get() else return;
         if (!config.@"bell-features".system) return;
-        const native = self.as(gtk.Native).getSurface() orelse return;
-        native.beep();
+
+        // Candidate players, in preference order. canberra plays the themed
+        // event sound (the proper freedesktop way); the others play a file.
+        const sound_file = "/usr/share/sounds/freedesktop/stereo/bell.oga";
+        const candidates = [_][]const [*:0]const u8{
+            &.{ "canberra-gtk-play", "-i", "bell" },
+            &.{ "pw-play", sound_file },
+            &.{ "paplay", sound_file },
+        };
+        for (candidates) |argv| {
+            if (spawnDetached(argv)) return;
+        }
+
+        // Last resort: the GDK surface beep (often silent on GNOME, but free).
+        if (self.as(gtk.Native).getSurface()) |native| native.beep();
+    }
+
+    /// Spawn `argv` (NUL-terminated arg strings) fire-and-forget via
+    /// `gio.Subprocess`, which integrates with the GLib main loop and reaps the
+    /// child automatically (no zombies). stdout/stderr are silenced. Returns
+    /// true if the child spawned, false if the binary was missing / spawn
+    /// failed (so the caller can try the next candidate). Used for the
+    /// notification sound players.
+    fn spawnDetached(argv: []const [*:0]const u8) bool {
+        // gio.Subprocess.newv wants a NULL-terminated argv array. We model the
+        // sentinel with an optional-pointer buffer, then hand the binding the
+        // non-optional view it expects (it reads up to the NULL terminator).
+        var buf: [8]?[*:0]const u8 = undefined;
+        if (argv.len + 1 > buf.len) return false;
+        for (argv, 0..) |a, i| buf[i] = a;
+        buf[argv.len] = null;
+        const argv_ptr: [*]const [*:0]const u8 = @ptrCast(&buf);
+        const proc = gio.Subprocess.newv(
+            argv_ptr,
+            .{ .stdout_silence = true, .stderr_silence = true },
+            null,
+        ) orelse return false;
+        // We don't need to track it; GLib reaps it. Drop our ref so it frees
+        // once the child exits.
+        proc.unref();
+        return true;
     }
 
     /// Rebuild the notification popover list and update the bell's unread
