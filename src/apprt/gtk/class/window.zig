@@ -299,6 +299,12 @@ pub const Window = extern struct {
         /// the projects root for git worktree status.
         sidebar_timer: ?c_uint = null,
 
+        /// Whether we've already done the one-time "open the first repo on
+        /// startup" jump. Without this the default space (no worktree) is shown
+        /// first, which is confusing — a terminal there belongs to no repo. Set
+        /// after the first scan that finds at least one worktree.
+        did_initial_worktree_open: bool = false,
+
         /// simbacode liveness-sweep timer. Periodically reaps agent presence
         /// whose attributed local pid is dead — closing the deferred
         /// agent-crash-TTL item. Mirrors AgentPresenceFeature.livenessSweep
@@ -1836,6 +1842,18 @@ pub const Window = extern struct {
         self.rebuildSidebarRows();
         // Refresh the identity chip now that branch/repo labels are available (#10).
         self.updateIdentityChip();
+
+        // One-time startup jump: open the first repo's first worktree so the
+        // initial terminal belongs to a real repo instead of the no-worktree
+        // default space (which is confusing — agents started there show in no
+        // sidebar folder). Only when the user is still on the default space, so
+        // we never yank them out of a worktree they navigated to.
+        if (!priv.did_initial_worktree_open and statuses.len > 0) {
+            priv.did_initial_worktree_open = true;
+            if (self.activeWorktreePath() == null) {
+                self.openWorktree(&statuses[0]);
+            }
+        }
     }
 
     /// Handler for the sidebar header `+` button: present a folder picker and,
@@ -2283,6 +2301,10 @@ pub const Window = extern struct {
         // First visit: open an initial terminal in the worktree's cwd.
         if (!had_tabs) {
             self.newTabForWindow(null, .{ .working_directory = st.path });
+        } else if (self.getActiveSurface()) |surface| {
+            // Existing view: focus its active surface's input so the user can
+            // type immediately (not the outer widget — see grabFocus note).
+            surface.grabFocus();
         }
     }
 
@@ -2305,7 +2327,10 @@ pub const Window = extern struct {
         const page = view.getPage(tab.as(gtk.Widget));
         self.switchToWorktreeView(view);
         view.setSelectedPage(page);
-        _ = surface.as(gtk.Widget).grabFocus();
+        // Focus the surface's inner GL area (where keystrokes go), not the
+        // outer Surface widget — otherwise the TUI's input box stays unfocused
+        // and typing is dropped until the user clicks inside it.
+        surface.grabFocus();
         // The user has now seen it: clear this tab's attention + bells.
         self.clearTabAttention(surface);
         return true;
