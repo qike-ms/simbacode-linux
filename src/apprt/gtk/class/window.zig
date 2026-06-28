@@ -347,6 +347,14 @@ pub const Window = extern struct {
         /// by surface pointer so two tabs sharing a worktree don't collide.
         surface_agents: std.AutoHashMapUnmanaged(*Surface, AgentEntry) = .empty,
 
+        /// Surfaces we've registered a GObject weak-ref on (so we purge them
+        /// from `surface_agents` / `sidebar_attention` the instant they're
+        /// finalized, regardless of which tab/split teardown path runs). Keyed
+        /// by surface pointer; the value is unused. Prevents the use-after-free
+        /// where a closed split pane's stale pointer is dereferenced on the
+        /// next OSC-driven sidebar rebuild.
+        tracked_surfaces: std.AutoHashMapUnmanaged(*Surface, void) = .empty,
+
         /// simbacode (#11): notification history backing the toolbar bell
         /// popover. Each record is an aggregated agent attention event. The
         /// banner is transient; this list is the persistent history.
@@ -1645,6 +1653,19 @@ pub const Window = extern struct {
         priv.surface_agents.deinit(alloc);
         priv.surface_agents = .empty;
 
+        // Drop the GObject weak-refs we registered on tracked surfaces so the
+        // weak-notify can't fire into this half-disposed window. `disposing`
+        // is already true (set above), so any in-flight notify is a no-op, but
+        // we also remove the refs explicitly for surfaces still alive.
+        {
+            var it = priv.tracked_surfaces.keyIterator();
+            while (it.next()) |k| {
+                k.*.as(gobject.Object).weakUnref(surfaceFinalized, self);
+            }
+            priv.tracked_surfaces.deinit(alloc);
+            priv.tracked_surfaces = .empty;
+        }
+
         // simbacode (#11): free notification history.
         for (priv.notifications.items) |*n| n.deinit(alloc);
         priv.notifications.deinit(alloc);
@@ -2361,6 +2382,7 @@ pub const Window = extern struct {
         const alloc = Application.default().allocator();
 
         if (active) {
+            self.trackSurface(surface);
             // Store the CANONICAL worktree path for this surface (via its owning
             // worktree TabView), not the shell-reported pwd: getPwd depends on
             // OSC 7 and often doesn't match a sidebar row exactly, which is why
@@ -2470,6 +2492,7 @@ pub const Window = extern struct {
         const alloc = Application.default().allocator();
 
         if (agent) |a| {
+            self.trackSurface(surface);
             const gop = priv.surface_agents.getOrPut(alloc, surface) catch return;
             gop.value_ptr.* = .{
                 .agent = a,
@@ -2492,6 +2515,45 @@ pub const Window = extern struct {
     fn removeSurfaceAgent(self: *Window, surface: *Surface) bool {
         const priv = self.private();
         return priv.surface_agents.remove(surface);
+    }
+
+    /// Register a GObject weak-ref on `surface` (once) so that when the surface
+    /// is finalized — by ANY path (split pane close, tab close, window close)
+    /// — we synchronously purge it from every map keyed by `*Surface`. Without
+    /// this, a stale pointer left after a split pane closes is dereferenced on
+    /// the next OSC-driven sidebar rebuild (getPwd / widget-ancestry walk),
+    /// causing an intermittent use-after-free crash. Idempotent per surface.
+    fn trackSurface(self: *Window, surface: *Surface) void {
+        const priv = self.private();
+        const alloc = Application.default().allocator();
+        const gop = priv.tracked_surfaces.getOrPut(alloc, surface) catch return;
+        if (gop.found_existing) return;
+        // The weak-notify fires with `self` (the Window) as data and the
+        // finalized object pointer; we use the latter as the map key.
+        surface.as(gobject.Object).weakRef(surfaceFinalized, self);
+    }
+
+    /// GObject weak-notify: a tracked surface is being finalized. Purge it from
+    /// all `*Surface`-keyed maps so no stale pointer survives. `where` is the
+    /// finalized object's address (now invalid — use only as a map key, never
+    /// dereference). Mirrors the surface pointer we stored.
+    fn surfaceFinalized(data: ?*anyopaque, where: *gobject.Object) callconv(.c) void {
+        const self: *Window = @ptrCast(@alignCast(data orelse return));
+        const surface: *Surface = @ptrCast(where);
+        const priv = self.private();
+        // Window may be mid-dispose; guard the maps defensively.
+        if (priv.disposing) {
+            _ = priv.tracked_surfaces.remove(surface);
+            return;
+        }
+        var changed = false;
+        if (priv.surface_agents.remove(surface)) changed = true;
+        if (self.clearSurfaceAttention(surface)) changed = true;
+        _ = priv.tracked_surfaces.remove(surface);
+        // The surface is gone; refresh UI so its icon/bell disappears. We avoid
+        // refreshTabAgentIcon (it would re-walk the dead surface's ancestry);
+        // a full sidebar rebuild is keyed off live statuses only.
+        if (changed) self.rebuildSidebarRows();
     }
 
     /// Clear any agent presence recorded for a surface. Called on surface
