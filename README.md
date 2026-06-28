@@ -1,61 +1,154 @@
-<!-- LOGO -->
-<h1>
-<p align="center">
-  <img src="https://github.com/user-attachments/assets/fe853809-ba8b-400b-83ab-a9a0da25be8a" alt="Logo" width="128">
-  <br>Ghostty
-</h1>
-  <p align="center">
-    Fast, native, feature-rich terminal emulator pushing modern features.
-    <br />
-    A native GUI or embeddable library via <code>libghostty</code>.
-    <br />
-    <a href="#about">About</a>
-    ·
-    <a href="https://ghostty.org/download">Download</a>
-    ·
-    <a href="https://ghostty.org/docs">Documentation</a>
-    ·
-    <a href="CONTRIBUTING.md">Contributing</a>
-    ·
-    <a href="HACKING.md">Developing</a>
-  </p>
-</p>
+# simbacode-linux
 
-> [!NOTE]
->
-> ## simbacode-linux
->
-> **simbacode-linux** turns [Ghostty](https://ghostty.org) into an
-> **agent-centric terminal**: a worktree sidebar, live per-agent presence and
-> activity, and click-to-jump notifications — so you can run several coding
-> agents across many repos and worktrees and always know, at a glance, which
-> one is working, which is waiting, and which needs you.
->
-> ### Standing on the shoulders of giants
->
-> simbacode-linux is inspired by, and deeply indebted to, two outstanding
-> projects:
->
-> - **[supacode](https://github.com/supabitapp/supacode)** pioneered this
->   agent-centric way of working. It is a genuinely wonderful app: it treats
->   coding agents as first-class citizens of your workflow, makes git worktrees
->   effortless, and surfaces exactly the right signal — presence, activity, and
->   "needs you" attention — without ever getting in your way. If you are on
->   macOS, use supacode; it is the real thing and we admire it enormously.
->   simbacode-linux exists to bring that same experience to Linux, and borrows
->   many of its ideas (the OSC-based agent-presence protocol, worktree-grouped
->   sidebar, and per-tab agent indicators) with gratitude.
-> - **[Ghostty](https://ghostty.org)** provides the fast, native,
->   standards-compliant terminal foundation that all of this is built on.
->
-> simbacode-linux is a separate, community project and is **not affiliated with
-> or endorsed by** supacode/supabit or the Ghostty project. The name is
-> deliberately distinct to avoid any brand confusion.
->
-> See [SETUP.md](SETUP.md) for build and run instructions. The rest of this
-> README is the upstream Ghostty documentation.
+**An agent-centric terminal for Linux.** simbacode-linux turns
+[Ghostty](https://ghostty.org) into a terminal built for running many AI coding
+agents at once: a git-worktree sidebar, live per-agent presence and activity,
+and click-to-jump notifications — so you always know, at a glance, which agent
+is working, which is waiting, and which needs you.
 
-## About
+> [!WARNING]
+>
+> **Status: alpha / prototype.** This is an experimental build for developers
+> comfortable building from source and with an app that integrates with your
+> AI-agent config files. There are **no packaged releases yet** (no AppImage,
+> Flatpak, or `.deb`), and the integration modifies files under your home
+> directory (see [Security model](#security-model) below). Use it if you like
+> living on the edge; don't yet treat it as a finished product.
+
+## What it does
+
+- **Worktree sidebar** — discovers your git repos and their worktrees, grouped
+  by repo, showing branch, dirty state, and ahead/behind + insertion/deletion
+  counts. Click a worktree to jump to its terminal.
+- **Live agent presence** — when a coding agent starts working in a terminal,
+  its icon appears next to the worktree; activity (busy / waiting) updates live.
+- **"Needs you" notifications** — when an agent finishes or needs input, you get
+  an attention bell on the sidebar row and tab, a desktop notification, and a
+  sound. Click to jump straight to that agent.
+- **Multi-agent aware** — several agents across many repos/worktrees at once,
+  each with its own indicator.
+
+### Implemented today
+
+- Worktree-grouped sidebar with branch / dirty / ahead-behind / diff stats
+- OSC-3008 agent-presence protocol + per-agent hook installers for
+  **Claude Code, Codex, Copilot, Kiro, OpenCode, Pi, and Hermes**
+- Per-agent presence icons, attention bells (sidebar + tab), desktop
+  notifications + sound, click-to-jump
+- Per-worktree tab spaces; persisted sidebar state
+
+### Not implemented yet
+
+See the [issue backlog](https://github.com/qike-ms/simbacode-linux/issues) and
+the umbrella tracking issue
+[#6](https://github.com/qike-ms/simbacode-linux/issues/6). Highlights:
+
+- **Settings UI + agent-integration manager** (opt-in install / preview /
+  uninstall of hooks) — _planned P0_, see
+  [#7](https://github.com/qike-ms/simbacode-linux/issues/7)
+- Command palette, worktree creation from the sidebar, PR/check status badges
+- Phone control + Matrix/Telegram/Signal notifications over Tailnet
+- Packaged releases (AppImage / Flatpak / `.deb`)
+
+> _Screenshots / demo GIF: coming soon._
+
+## Install
+
+There are no packaged releases yet — you build from source. See
+[SETUP.md](SETUP.md) for the full instructions (build deps, build flags, run).
+In short:
+
+```bash
+scripts/install-build-deps.sh         # one-time: blueprint-compiler + gtk4-layer-shell into ~/.local
+zig build -Demit-macos-app=false -Doptimize=ReleaseFast \
+  --search-prefix "$HOME/.local" -Dpatch-rpath "$HOME/.local/lib/x86_64-linux-gnu"
+cp zig-out/bin/ghostty ~/.local/bin/simbacode
+simbacode
+```
+
+Requires zig 0.15.2 and system GTK4 / libadwaita. No nix required.
+
+## Security model
+
+simbacode integrates with coding agents by installing small **presence hooks**
+into their config files. This is the project's main trust boundary, so it is
+worth understanding exactly what happens.
+
+**What gets written.** On launch, simbacode installs hooks into these paths
+under your home directory (only for agents you actually have installed):
+
+| Agent | File(s) modified / created |
+|---|---|
+| Claude Code | `~/.claude/settings.json` |
+| Codex | `~/.codex/config.toml`, `~/.codex/hooks.json` |
+| Copilot | `~/.copilot/hooks/simbacode.json` |
+| Kiro | `~/.kiro/agents/kiro_default.json` |
+| OpenCode | `~/.config/opencode/plugins/simbacode-presence.js` |
+| Pi | `~/.pi/agent/extensions/simbacode/index.ts` |
+| Hermes | `~/.hermes/config.yaml`, `~/.hermes/shell-hooks-allowlist.json`, `~/.hermes/agent-hooks/simbacode-presence.sh` |
+
+State is tracked in `~/.simbacode/hooks.json`.
+
+**How it tries to be safe.** The installer is written to be conservative:
+
+- Changes are marked with a managed sentinel and are **idempotent** — install /
+  uninstall are reversible and re-running doesn't duplicate anything.
+- It **preserves user-authored hooks** (for Hermes it only patches an empty or
+  missing `hooks:` block, never a populated one).
+- Own-files it created are removed cleanly on uninstall.
+- The hooks **no-op unless they're running inside a simbacode terminal** — they
+  only emit when `SIMBACODE_SURFACE_ID` is set, so they stay silent in any other
+  terminal.
+
+**Honest caveats.** Today this happens automatically on first launch rather
+than via an explicit opt-in dialog, and there is not yet a backup/restore or a
+settings page to preview/disable it. Making installation explicit opt-in, with
+a preview of changed files and backup/restore, is the planned **P0** work in
+[#7](https://github.com/qike-ms/simbacode-linux/issues/7). If you'd rather not
+have any config modified, don't run simbacode yet.
+
+**Uninstall.** To remove all hooks and integration state:
+
+```bash
+# remove the per-agent hooks simbacode installed, then drop its state
+rm -f ~/.codex/hooks.json \
+      ~/.copilot/hooks/simbacode.json \
+      ~/.config/opencode/plugins/simbacode-presence.js \
+      ~/.hermes/agent-hooks/simbacode-presence.sh
+rm -rf ~/.pi/agent/extensions/simbacode
+rm -rf ~/.simbacode
+# Then manually review ~/.claude/settings.json, ~/.codex/config.toml,
+# ~/.kiro/agents/kiro_default.json, and ~/.hermes/config.yaml and remove the
+# blocks marked with the `simbacode-managed-hook` sentinel.
+```
+
+## Relationship to Ghostty and supacode
+
+simbacode-linux is inspired by, and deeply indebted to, two outstanding
+projects:
+
+- **[supacode](https://github.com/supabitapp/supacode)** pioneered this
+  agent-centric way of working. It treats coding agents as first-class citizens
+  of your workflow, makes git worktrees effortless, and surfaces exactly the
+  right signal — presence, activity, and "needs you" attention — without ever
+  getting in your way. **If you are on macOS, use supacode**; it is the real,
+  polished thing and we admire it enormously. simbacode-linux exists to bring
+  that experience to Linux, borrowing many of its ideas (the OSC-based
+  agent-presence protocol, worktree-grouped sidebar, and per-tab agent
+  indicators) with gratitude.
+- **[Ghostty](https://ghostty.org)** provides the fast, native,
+  standards-compliant terminal foundation that all of this is built on.
+
+simbacode-linux is a separate, community project and is **not affiliated with
+or endorsed by** supacode/supabit or the Ghostty project. The name is
+deliberately distinct to avoid any brand confusion.
+
+---
+
+_The rest of this README is the upstream Ghostty documentation, retained
+because simbacode-linux is a Ghostty fork and inherits its terminal._
+
+## About Ghostty
 
 Ghostty is a terminal emulator that differentiates itself by being
 fast, feature-rich, and native. While there are many excellent terminal

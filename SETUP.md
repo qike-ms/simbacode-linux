@@ -41,8 +41,6 @@ cp zig-out/bin/ghostty ~/.local/bin/simbacode
 chmod +x ~/.local/bin/simbacode
 ```
 
-A prebuilt copy is already installed at **`~/.local/bin/simbacode`**.
-
 ## Run
 
 ```bash
@@ -57,4 +55,6 @@ GDK_BACKEND=x11 simbacode
 - Format: `zig fmt .`
 - First launch installs simbacode agent hooks into `~/.codex`, `~/.claude`,
   `~/.pi`, `~/.config/opencode`, etc. (toggle/state in `~/.simbacode/hooks.json`).
-  They are guarded to no-op outside a simbacode terminal surface.
+  They are guarded to no-op outside a simbacode terminal surface. See the
+  **Security model** section of [README.md](README.md) for the full list of
+  files modified and how to uninstall.
