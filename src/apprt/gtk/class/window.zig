@@ -2819,13 +2819,16 @@ pub const Window = extern struct {
         // (which is off by default and controls the terminal bell character).
         // A new agent notification always tries to play a short sound.
 
-        // Candidate players, in preference order. canberra plays the themed
-        // event sound (the proper freedesktop way); the others play a file.
-        const sound_file = "/usr/share/sounds/freedesktop/stereo/bell.oga";
+        // Candidate players, in preference order. We play the freedesktop
+        // `complete.oga` file directly (the sound the user picked); canberra's
+        // themed `complete` event is the last file-based fallback in case the
+        // file path differs on another distro.
+        const sound_file = "/usr/share/sounds/freedesktop/stereo/complete.oga";
         const candidates = [_][]const [*:0]const u8{
-            &.{ "canberra-gtk-play", "-i", "bell" },
             &.{ "pw-play", sound_file },
             &.{ "paplay", sound_file },
+            &.{ "canberra-gtk-play", "-f", sound_file },
+            &.{ "canberra-gtk-play", "-i", "complete" },
         };
         for (candidates) |argv| {
             if (spawnDetached(argv)) return;
