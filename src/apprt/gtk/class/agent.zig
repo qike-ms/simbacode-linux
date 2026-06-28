@@ -87,11 +87,11 @@ pub const Agent = enum {
     pub fn symbol(self: Agent) []const u8 {
         return switch (self) {
             .claude => "\u{2733}", // ✳ eight-spoked asterisk
-            .codex => "&gt;_", // >_  prompt mark (escaped for markup)
+            .codex => "&gt;_", // >_ prompt mark (escaped for Pango markup)
             .pi => "\u{03C0}", // π
             .kiro => "ki",
             .hermes => "h",
-            .opencode => "oc",
+            .opencode => "\u{1F916}", // 🤖 robot (matches its own tab-bar mark)
             .openclaw => "\u{1F99E}", // 🦞 lobster
             .generic => "\u{1F916}", // 🤖 robot
         };

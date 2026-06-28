@@ -325,12 +325,6 @@ template $GhosttyWindow: Adw.ApplicationWindow {
           visible: bind template.debug;
         }
 
-        Adw.Banner agent_banner {
-          revealed: false;
-          button-label: _("Open");
-          button-clicked => $agent_banner_clicked();
-        }
-
         Adw.ToastOverlay toast_overlay {
           Gtk.Stack worktree_stack {
             Adw.TabView tab_view {

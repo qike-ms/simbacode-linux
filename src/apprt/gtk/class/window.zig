@@ -341,11 +341,6 @@ pub const Window = extern struct {
         /// by surface pointer so two tabs sharing a worktree don't collide.
         surface_agents: std.AutoHashMapUnmanaged(*Surface, AgentEntry) = .empty,
 
-        /// The surface the agent attention banner currently points at, so the
-        /// banner's "Open" button can teleport focus there (trio: close the
-        /// loop — signal -> one-click jump to the waiting agent).
-        agent_banner_surface: ?*Surface = null,
-
         /// Supacode (#11): notification history backing the toolbar bell
         /// popover. Each record is an aggregated agent attention event. The
         /// banner is transient; this list is the persistent history.
@@ -367,7 +362,6 @@ pub const Window = extern struct {
         split_view: *adw.OverlaySplitView,
         sidebar_list: *gtk.ListBox,
         sidebar_add_button: *gtk.Button,
-        agent_banner: *adw.Banner,
 
         /// Supacode (#10): title-bar repo + user identity chip widgets.
         identity_chip: *gtk.Box,
@@ -2206,9 +2200,12 @@ pub const Window = extern struct {
         label.setEllipsize(.end);
         box.append(label.as(gtk.Widget));
 
-        // Agent presence icon (#4): a small bot/agent mark when an agent runs
-        // in this worktree. Drawn between the branch name and the diff badges.
-        if (self.agentForPath(st.path)) |a| appendAgentIcon(box, a);
+        // Agent presence icons (#4): one mark per DISTINCT agent running in
+        // this worktree, so a second agent in another tab of the same branch
+        // doesn't overwrite the first. Drawn between the branch name and the
+        // diff badges.
+        var agent_buf: [8]agentpkg.Agent = undefined;
+        for (self.agentsForPath(st.path, &agent_buf)) |a| appendAgentIcon(box, a);
 
         // Badge label (right): fixed size, right-aligned, never clipped.
         if (badges.len > 0) {
@@ -2570,23 +2567,20 @@ pub const Window = extern struct {
         entry.pid = pid;
     }
 
-    /// Find a representative agent running in (or under) a worktree `path`, by
-    /// scanning the recorded agent surfaces and matching each surface's pwd
-    /// against the path. Returns the focused/first match, preferring a busy or
-    /// awaiting_input agent so the sidebar reflects active work. Used to draw a
-    /// bot icon next to the worktree/branch in the sidebar (#4). `null` when no
-    /// agent runs there.
-    fn agentForPath(self: *Window, path: []const u8) ?agentpkg.Agent {
+    /// Collect the distinct agents running in (or under) a worktree `path`,
+    /// writing them into `out` and returning the slice. Multiple tabs in the
+    /// same worktree can run different agents (e.g. pi in one, codex in
+    /// another); each is shown so a second agent doesn't overwrite the first.
+    /// A surface is mapped to its worktree via its owning TabView (the reliable
+    /// association), falling back to the shell-reported pwd. Duplicates (two
+    /// tabs running the SAME agent) are collapsed. Order is unspecified.
+    fn agentsForPath(self: *Window, path: []const u8, out: *[8]agentpkg.Agent) []agentpkg.Agent {
         const priv = self.private();
-        var fallback: ?agentpkg.Agent = null;
+        var n: usize = 0;
         var it = priv.surface_agents.iterator();
         while (it.next()) |entry| {
+            if (n >= out.len) break;
             const s = entry.key_ptr.*;
-            // Map the surface to its worktree via its owning TabView (the
-            // reliable association — each worktree owns one view), falling back
-            // to the shell-reported pwd when the surface isn't in a named
-            // worktree view (e.g. the default space). getPwd alone is
-            // unreliable: it depends on OSC 7 and may not match exactly.
             const match = if (self.worktreePathForSurface(s)) |wt|
                 std.mem.eql(u8, wt, path)
             else if (s.getPwd()) |spwd|
@@ -2595,18 +2589,29 @@ pub const Window = extern struct {
             else
                 false;
             if (!match) continue;
-            // Prefer an actively-working/waiting agent over an idle one.
-            if (entry.value_ptr.activity != .idle) return entry.value_ptr.agent;
-            if (fallback == null) fallback = entry.value_ptr.agent;
+            const a = entry.value_ptr.agent;
+            // Dedup: skip an agent kind already collected.
+            var dup = false;
+            for (out[0..n]) |existing| {
+                if (existing == a) {
+                    dup = true;
+                    break;
+                }
+            }
+            if (!dup) {
+                out[n] = a;
+                n += 1;
+            }
         }
-        return fallback;
+        return out[0..n];
     }
 
     /// Whether any agent runs in (or under) any worktree in `group` (a repo's
     /// contiguous worktree run). Drives the repo-header bot icon (#4).
     fn groupHasAgent(self: *Window, group: []const sidebar.WorktreeStatus) bool {
+        var buf: [8]agentpkg.Agent = undefined;
         for (group) |*st| {
-            if (self.agentForPath(st.path) != null) return true;
+            if (self.agentsForPath(st.path, &buf).len > 0) return true;
         }
         return false;
     }
@@ -2698,69 +2703,31 @@ pub const Window = extern struct {
         }
     }
 
-    /// Show the top-of-window agent attention banner (req 4). `title` is the
-    /// agent label; `detail` is optional metadata shown after it. The banner's
-    /// "Open" button teleports focus to `surface`.
+    /// Agent attention top-banner: REMOVED. The sidebar branch bell + per-tab
+    /// bell now carry the needs-attention signal, so the intrusive top banner
+    /// was dropped. These stubs are kept so the OSC-3008 handler call sites and
+    /// teardown code don't need to special-case its absence; they do nothing.
     pub fn showAgentBanner(
         self: *Window,
         surface: *Surface,
         title: []const u8,
         detail: []const u8,
     ) void {
-        const priv = self.private();
-        const alloc = Application.default().allocator();
-
-        priv.agent_banner_surface = surface;
-
-        // Prefix the agent label with the repo/worktree context (#2).
-        var ctx_buf: [256]u8 = undefined;
-        var title_buf: [320]u8 = undefined;
-        const display_title: []const u8 = if (self.contextLabelForSurface(surface, &ctx_buf)) |ctx|
-            (std.fmt.bufPrint(&title_buf, "{s} \u{00b7} {s}", .{ ctx, title }) catch title)
-        else
-            title;
-
-        // The banner title is parsed as Pango markup, so escape the detail
-        // (assistant text may contain < & etc.) before composing (trio m1).
-        const trimmed = trimFirstLine(detail);
-        const text: [:0]const u8 = blk: {
-            if (trimmed.len > 0) {
-                const dz = alloc.dupeZ(u8, trimmed) catch break :blk null;
-                defer alloc.free(dz);
-                const esc = glib.markupEscapeText(dz.ptr, -1);
-                defer glib.free(esc);
-                break :blk std.fmt.allocPrintSentinel(
-                    alloc,
-                    "{s} \u{2014} {s}",
-                    .{ display_title, std.mem.sliceTo(esc, 0) },
-                    0,
-                ) catch null;
-            }
-            break :blk std.fmt.allocPrintSentinel(
-                alloc,
-                "{s} needs attention",
-                .{display_title},
-                0,
-            ) catch null;
-        } orelse (alloc.dupeZ(u8, "Agent needs attention") catch return);
-        defer alloc.free(text);
-
-        priv.agent_banner.setTitle(text.ptr);
-        priv.agent_banner.setRevealed(@intFromBool(true));
+        _ = self;
+        _ = surface;
+        _ = title;
+        _ = detail;
     }
 
-    /// Hide the agent attention banner and forget its target surface.
+    /// No-op (banner removed). See `showAgentBanner`.
     pub fn hideAgentBanner(self: *Window) void {
-        const priv = self.private();
-        priv.agent_banner.setRevealed(@intFromBool(false));
-        priv.agent_banner_surface = null;
+        _ = self;
     }
 
-    /// Hide the banner only if it currently points at `surface`. Lets one
-    /// surface's `end` dismiss its own banner without clobbering a banner that
-    /// another, still-waiting surface raised.
+    /// No-op (banner removed). See `showAgentBanner`.
     pub fn hideAgentBannerFor(self: *Window, surface: *Surface) void {
-        if (self.private().agent_banner_surface == surface) self.hideAgentBanner();
+        _ = self;
+        _ = surface;
     }
 
     /// Supacode (#11): append an agent attention event to the notification
@@ -2955,24 +2922,6 @@ pub const Window = extern struct {
     fn trimFirstLine(s: []const u8) []const u8 {
         const line = if (std.mem.indexOfScalar(u8, s, '\n')) |nl| s[0..nl] else s;
         return std.mem.trim(u8, line, " \t\r");
-    }
-
-    /// Banner "Open" clicked: teleport to the surface that raised the signal
-    /// (focus its tab + surface) and dismiss the banner.
-    fn agentBannerClicked(_: *adw.Banner, self: *Window) callconv(.c) void {
-        const priv = self.private();
-        if (priv.agent_banner_surface) |surface| {
-            if (ext.getAncestor(Tab, surface.as(gtk.Widget))) |tab| {
-                const view = self.viewForTab(tab);
-                const page = view.getPage(tab.as(gtk.Widget));
-                // Surface lives in a (possibly non-active) worktree view: make
-                // that view active first, then select the page.
-                self.switchToWorktreeView(view);
-                view.setSelectedPage(page);
-                _ = surface.as(gtk.Widget).grabFocus();
-            }
-        }
-        self.hideAgentBanner();
     }
 
     fn btnNewTab(_: *adw.SplitButton, self: *Self) callconv(.c) void {
@@ -3288,7 +3237,6 @@ pub const Window = extern struct {
             // (#22). removeSurfaceAgent decrements the per-worktree count.
             if (self.removeSurfaceAgent(s)) changed = true;
             if (self.clearSurfaceAttention(s)) changed = true;
-            if (priv.agent_banner_surface == s) self.hideAgentBanner();
         }
         if (changed) self.rebuildSidebarRows();
     }
@@ -3531,12 +3479,11 @@ pub const Window = extern struct {
         if (old_tree) |tree| {
             self.disconnectSurfaceHandlers(tree);
 
-            // Prune agent/banner state for any surface that left the tree
+            // Prune agent presence for any surface that left the tree
             // (e.g. a split pane closed without the whole tab closing). The
             // surface widget is about to be destroyed, so leaving a raw
-            // *Surface key in surface_agents or as the banner target would
-            // dangle and later cause a use-after-free in refreshTabAgentIcon
-            // / agentBannerClicked (trio CRITICAL C1).
+            // *Surface key in surface_agents would dangle and later cause a
+            // use-after-free in refreshTabAgentIcon (trio CRITICAL C1).
             var it = tree.iterator();
             while (it.next()) |entry| {
                 const surface = entry.view;
@@ -3545,9 +3492,6 @@ pub const Window = extern struct {
                 }
                 if (self.removeSurfaceAgent(surface)) changed = true;
                 _ = self.clearSurfaceAttention(surface);
-                if (self.private().agent_banner_surface == surface) {
-                    self.hideAgentBanner();
-                }
             }
         }
 
@@ -3914,7 +3858,6 @@ pub const Window = extern struct {
             class.bindTemplateChildPrivate("split_view", .{});
             class.bindTemplateChildPrivate("sidebar_list", .{});
             class.bindTemplateChildPrivate("sidebar_add_button", .{});
-            class.bindTemplateChildPrivate("agent_banner", .{});
             class.bindTemplateChildPrivate("identity_chip", .{});
             class.bindTemplateChildPrivate("identity_avatar", .{});
             class.bindTemplateChildPrivate("identity_branch", .{});
@@ -3927,7 +3870,6 @@ pub const Window = extern struct {
             // Template Callbacks
             class.bindTemplateCallback("realize", &windowRealize);
             class.bindTemplateCallback("sidebar_add_clicked", &sidebarAddClicked);
-            class.bindTemplateCallback("agent_banner_clicked", &agentBannerClicked);
             class.bindTemplateCallback("notification_row_activated", &notificationRowActivated);
             class.bindTemplateCallback("notification_clear_clicked", &notificationClearClicked);
             class.bindTemplateCallback("new_tab", &btnNewTab);
