@@ -22,9 +22,25 @@ pub const Store = struct {
     /// User-added project roots (absolute paths). Order is preserved.
     roots: std.ArrayListUnmanaged([:0]u8) = .empty,
 
+    /// Last directory the user browsed from in the `+` Add Folder picker
+    /// (absolute path). Used to reopen the picker where they left off so
+    /// adding several folders from the same parent doesn't re-navigate from
+    /// scratch. `null` until the first add.
+    last_folder: ?[:0]u8 = null,
+
     pub fn deinit(self: *Store, alloc: Allocator) void {
         for (self.roots.items) |r| alloc.free(r);
         self.roots.deinit(alloc);
+        if (self.last_folder) |lf| alloc.free(lf);
+    }
+
+    /// Record the directory the user just browsed from (typically the parent
+    /// of an added folder) so the picker reopens there. Replaces any prior
+    /// value. Takes ownership of a fresh copy of `path`.
+    pub fn setLastFolder(self: *Store, alloc: Allocator, path: []const u8) !void {
+        const copy = try alloc.dupeZ(u8, path);
+        if (self.last_folder) |lf| alloc.free(lf);
+        self.last_folder = copy;
     }
 
     /// True if `path` is already present in the roots list.
@@ -64,6 +80,7 @@ pub const Store = struct {
 const Wire = struct {
     schemaVersion: u32 = schema_version,
     roots: []const []const u8 = &.{},
+    lastFolder: ?[]const u8 = null,
 };
 
 /// Resolve `~/.simbacode/sidebar.json`. Caller owns the result. If the new
@@ -143,6 +160,17 @@ pub fn loadFrom(alloc: Allocator, path: []const u8) Store {
             continue;
         };
     }
+
+    // Restore the last-browsed folder for the `+` picker. Ignore non-absolute
+    // values (hand-edited / foreign files) — they'd be useless as an initial
+    // folder anyway.
+    if (parsed.value.lastFolder) |lf| {
+        if (lf.len > 0 and std.fs.path.isAbsolute(lf)) {
+            store.setLastFolder(alloc, lf) catch |err| {
+                log.debug("sidebar: cannot restore last folder: {}", .{err});
+            };
+        }
+    }
     return store;
 }
 
@@ -170,7 +198,11 @@ pub fn saveTo(alloc: Allocator, path: []const u8, store: *const Store) !void {
     var roots = try alloc.alloc([]const u8, store.roots.items.len);
     defer alloc.free(roots);
     for (store.roots.items, 0..) |r, i| roots[i] = r;
-    const wire: Wire = .{ .schemaVersion = schema_version, .roots = roots };
+    const wire: Wire = .{
+        .schemaVersion = schema_version,
+        .roots = roots,
+        .lastFolder = store.last_folder,
+    };
 
     const json = try std.json.Stringify.valueAlloc(alloc, wire, .{ .whitespace = .indent_2 });
     defer alloc.free(json);
@@ -244,6 +276,51 @@ test "saveTo then loadFrom round-trips roots" {
     try std.testing.expectEqual(@as(usize, 2), loaded.roots.items.len);
     try std.testing.expect(loaded.contains("/home/u/proj-a"));
     try std.testing.expect(loaded.contains("/home/u/proj-b"));
+}
+
+test "setLastFolder round-trips through saveTo/loadFrom" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir = try tmp.dir.realpathAlloc(alloc, ".");
+    defer alloc.free(dir);
+    const path = try std.fs.path.join(alloc, &.{ dir, ".simbacode", "sidebar.json" });
+    defer alloc.free(path);
+
+    {
+        var store: Store = .{};
+        defer store.deinit(alloc);
+        _ = try store.add(alloc, "/home/u/git/proj");
+        try store.setLastFolder(alloc, "/home/u/git");
+        // Replacing keeps only the latest value (no leak).
+        try store.setLastFolder(alloc, "/home/u/git");
+        try saveTo(alloc, path, &store);
+    }
+
+    var loaded = loadFrom(alloc, path);
+    defer loaded.deinit(alloc);
+    try std.testing.expect(loaded.last_folder != null);
+    try std.testing.expectEqualStrings("/home/u/git", loaded.last_folder.?);
+}
+
+test "loadFrom ignores non-absolute lastFolder" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir = try tmp.dir.realpathAlloc(alloc, ".");
+    defer alloc.free(dir);
+    const path = try std.fs.path.join(alloc, &.{ dir, "sidebar.json" });
+    defer alloc.free(path);
+    try tmp.dir.writeFile(.{
+        .sub_path = "sidebar.json",
+        .data =
+        \\{ "schemaVersion": 1, "roots": [], "lastFolder": "relative/dir" }
+        ,
+    });
+
+    var store = loadFrom(alloc, path);
+    defer store.deinit(alloc);
+    try std.testing.expect(store.last_folder == null);
 }
 
 test "loadFrom corrupt file yields empty store" {

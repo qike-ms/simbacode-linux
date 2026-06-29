@@ -1886,6 +1886,14 @@ pub const Window = extern struct {
         dialog.setTitle("Add Folder");
         dialog.setModal(@intFromBool(true));
 
+        // Reopen where the user last browsed so adding several folders from the
+        // same parent (e.g. ~/git) doesn't re-navigate from scratch each time.
+        if (self.private().sidebar_store.last_folder) |lf| {
+            const gfile = gio.File.newForPath(lf);
+            defer gfile.unref();
+            dialog.setInitialFolder(gfile);
+        }
+
         // Keep the window alive across the async callback.
         _ = self.ref();
         const root = self.as(gtk.Widget).getRoot();
@@ -1934,11 +1942,18 @@ pub const Window = extern struct {
             log.warn("sidebar: cannot add root {s}: {}", .{ path, err });
             return;
         };
-        if (!added) return; // already present
+
+        // Remember the parent directory so the next `+` reopens there. Done
+        // even when the folder was already present (still a useful location).
+        const parent_dir = std.fs.path.dirname(path) orelse path;
+        priv.sidebar_store.setLastFolder(alloc, parent_dir) catch |err| {
+            log.debug("sidebar: cannot record last folder: {}", .{err});
+        };
 
         sidebar_store.save(alloc, &priv.sidebar_store) catch |err| {
             log.warn("sidebar: cannot persist after add: {}", .{err});
         };
+        if (!added) return; // already present; nothing new to scan
         self.refreshSidebar();
     }
 
