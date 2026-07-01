@@ -880,6 +880,21 @@ pub const Application = extern struct {
         try loadRuntimeCss414(config, writer);
         try loadRuntimeCss416(config, writer);
 
+        // simbacode: bouncing indicator for a worktree with a busy agent. The
+        // sidebar attaches `.simbacode-agent-busy` to an agent glyph label
+        // while its OSC-3008 activity is `busy`, so the user sees at a glance
+        // that an agent is actively working (vs. idle/awaiting-input).
+        try writer.writeAll(
+            \\@keyframes simbacode-agent-bounce {
+            \\  0%, 100% { margin-bottom: 0px; margin-top: 0px; }
+            \\  50% { margin-bottom: 4px; margin-top: -4px; }
+            \\}
+            \\.simbacode-agent-busy {
+            \\  animation: simbacode-agent-bounce 0.6s ease-in-out infinite;
+            \\}
+            \\
+        );
+
         const unfocused_fill: CoreConfig.Color = config.@"unfocused-split-fill" orelse config.background;
 
         try writer.print(

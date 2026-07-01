@@ -2100,7 +2100,8 @@ pub const Window = extern struct {
         // any worktree in this group has a running agent. Only shown when the
         // group is COLLAPSED — when expanded the per-worktree rows carry their
         // own agent/diff/bell marks, so showing them here too is redundant (#1).
-        if (collapsed and self.groupHasAgent(group)) appendAgentIcon(box, .generic);
+        if (collapsed and self.groupHasAgent(group))
+            appendAgentIcon(box, .generic, self.groupHasBusyAgent(group));
 
         // Badge label (right): aggregated diff stat + attention bell, shown only
         // when collapsed (see above). Fixed size, right-aligned, so counters
@@ -2258,8 +2259,8 @@ pub const Window = extern struct {
         // this worktree, so a second agent in another tab of the same branch
         // doesn't overwrite the first. Drawn between the branch name and the
         // diff badges.
-        var agent_buf: [8]agentpkg.Agent = undefined;
-        for (self.agentsForPath(st.path, &agent_buf)) |a| appendAgentIcon(box, a);
+        var agent_buf: [8]AgentMark = undefined;
+        for (self.agentsForPath(st.path, &agent_buf)) |m| appendAgentIcon(box, m.agent, m.busy);
 
         // Badge label (right): fixed size, right-aligned, never clipped.
         if (badges.len > 0) {
@@ -2669,14 +2670,23 @@ pub const Window = extern struct {
         entry.pid = pid;
     }
 
+    /// A distinct agent running under a worktree, plus whether any of its
+    /// surfaces is currently `busy` (OSC-3008 activity). Busy drives the
+    /// bouncing sidebar indicator.
+    const AgentMark = struct {
+        agent: agentpkg.Agent,
+        busy: bool,
+    };
+
     /// Collect the distinct agents running in (or under) a worktree `path`,
     /// writing them into `out` and returning the slice. Multiple tabs in the
     /// same worktree can run different agents (e.g. pi in one, codex in
     /// another); each is shown so a second agent doesn't overwrite the first.
     /// A surface is mapped to its worktree via its owning TabView (the reliable
     /// association), falling back to the shell-reported pwd. Duplicates (two
-    /// tabs running the SAME agent) are collapsed. Order is unspecified.
-    fn agentsForPath(self: *Window, path: []const u8, out: *[8]agentpkg.Agent) []agentpkg.Agent {
+    /// tabs running the SAME agent) are collapsed, and the mark is `busy` if
+    /// ANY of that agent's surfaces is busy. Order is unspecified.
+    fn agentsForPath(self: *Window, path: []const u8, out: *[8]AgentMark) []AgentMark {
         const priv = self.private();
         var n: usize = 0;
         var it = priv.surface_agents.iterator();
@@ -2692,16 +2702,19 @@ pub const Window = extern struct {
                 false;
             if (!match) continue;
             const a = entry.value_ptr.agent;
-            // Dedup: skip an agent kind already collected.
+            const busy = entry.value_ptr.activity == .busy;
+            // Dedup: fold into an existing mark of the same agent kind, ORing
+            // busy so any busy surface makes the mark bounce.
             var dup = false;
-            for (out[0..n]) |existing| {
-                if (existing == a) {
+            for (out[0..n]) |*existing| {
+                if (existing.agent == a) {
+                    existing.busy = existing.busy or busy;
                     dup = true;
                     break;
                 }
             }
             if (!dup) {
-                out[n] = a;
+                out[n] = .{ .agent = a, .busy = busy };
                 n += 1;
             }
         }
@@ -2711,9 +2724,21 @@ pub const Window = extern struct {
     /// Whether any agent runs in (or under) any worktree in `group` (a repo's
     /// contiguous worktree run). Drives the repo-header bot icon (#4).
     fn groupHasAgent(self: *Window, group: []const sidebar.WorktreeStatus) bool {
-        var buf: [8]agentpkg.Agent = undefined;
+        var buf: [8]AgentMark = undefined;
         for (group) |*st| {
             if (self.agentsForPath(st.path, &buf).len > 0) return true;
+        }
+        return false;
+    }
+
+    /// Whether any agent under `group` is currently busy, so a collapsed repo
+    /// header can bounce its indicator too.
+    fn groupHasBusyAgent(self: *Window, group: []const sidebar.WorktreeStatus) bool {
+        var buf: [8]AgentMark = undefined;
+        for (group) |*st| {
+            for (self.agentsForPath(st.path, &buf)) |m| {
+                if (m.busy) return true;
+            }
         }
         return false;
     }
@@ -2725,7 +2750,7 @@ pub const Window = extern struct {
     /// path), whereas a text glyph is guaranteed to render \u2014 the same way the
     /// \u{1F514} attention bell already does in these rows. The distinct symbol lets
     /// the user tell which agent runs where at a glance. (#4)
-    fn appendAgentIcon(box: *gtk.Box, agent: agentpkg.Agent) void {
+    fn appendAgentIcon(box: *gtk.Box, agent: agentpkg.Agent, busy: bool) void {
         const alloc = Application.default().allocator();
         const markup = std.fmt.allocPrintSentinel(
             alloc,
@@ -2738,6 +2763,10 @@ pub const Window = extern struct {
         label.setMarkup(markup.ptr);
         label.as(gtk.Widget).setValign(.center);
         label.as(gtk.Widget).setTooltipText(agent.label().ptr);
+        // When the agent is actively working (OSC-3008 busy), bounce the glyph
+        // via the runtime `.simbacode-agent-busy` keyframe animation so the
+        // user can see at a glance which worktree has a running agent.
+        if (busy) label.as(gtk.Widget).addCssClass("simbacode-agent-busy");
         box.append(label.as(gtk.Widget));
     }
 
