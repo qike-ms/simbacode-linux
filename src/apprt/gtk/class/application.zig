@@ -886,8 +886,9 @@ pub const Application = extern struct {
         // that an agent is actively working (vs. idle/awaiting-input).
         try writer.writeAll(
             \\@keyframes simbacode-agent-bounce {
-            \\  0%, 100% { margin-bottom: 0px; margin-top: 0px; }
-            \\  50% { margin-bottom: 4px; margin-top: -4px; }
+            \\  0% { margin-top: 0px; margin-bottom: 0px; }
+            \\  50% { margin-top: -4px; margin-bottom: 4px; }
+            \\  100% { margin-top: 0px; margin-bottom: 0px; }
             \\}
             \\.simbacode-agent-busy {
             \\  animation: simbacode-agent-bounce 0.6s ease-in-out infinite;
