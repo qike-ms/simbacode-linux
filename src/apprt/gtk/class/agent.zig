@@ -97,6 +97,26 @@ pub const Agent = enum {
         };
     }
 
+    /// Per-agent Pango-markup styling for the sidebar symbol: a foreground
+    /// color and an optional background. Distinct styling (e.g. Claude's
+    /// orange, Codex's black-on-white "&gt;_" chip) lets the user tell which
+    /// agent runs where at a glance, beyond the glyph alone.
+    pub const SymbolStyle = struct {
+        foreground: []const u8,
+        background: ?[]const u8 = null,
+    };
+
+    pub fn symbolStyle(self: Agent) SymbolStyle {
+        return switch (self) {
+            // Claude: orange text (matches its brand mark).
+            .claude => .{ .foreground = "#e5883e" },
+            // Codex: black ">_" prompt on a white chip.
+            .codex => .{ .foreground = "#000000", .background = "#ffffff" },
+            // Everything else keeps the default blue.
+            else => .{ .foreground = "#7aa2f7" },
+        };
+    }
+
     /// A short human-readable label used in tooltips and notifications.
     pub fn label(self: Agent) [:0]const u8 {
         return switch (self) {

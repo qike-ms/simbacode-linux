@@ -2744,20 +2744,34 @@ pub const Window = extern struct {
     }
 
     /// Append a small per-agent indicator to a sidebar `box`. We use a
-    /// Pango-markup text mark (agent.symbol(), e.g. \u{03C0} for Pi) rather than a
-    /// Gtk.Image of the agent SVG: a raw-SVG BytesIcon does not reliably render
-    /// in a plain Gtk.Image (the Adw tab indicator renders it via a different
-    /// path), whereas a text glyph is guaranteed to render \u2014 the same way the
-    /// \u{1F514} attention bell already does in these rows. The distinct symbol lets
-    /// the user tell which agent runs where at a glance. (#4)
+    /// Pango-markup text mark (agent.symbol(), e.g. \u{03C0} for Pi, ">_" for
+    /// Codex) rather than a Gtk.Image of the agent SVG: a raw-SVG BytesIcon
+    /// does not reliably render in a plain Gtk.Image (the Adw tab indicator
+    /// renders it via a different path), whereas a text glyph is guaranteed to
+    /// render \u2014 the same way the \u{1F514} attention bell already does in
+    /// these rows. Each agent gets a distinct symbol AND color (agent.symbolStyle,
+    /// e.g. Claude orange, Codex black-on-white) so the user can tell which
+    /// agent runs where at a glance. (#4)
     fn appendAgentIcon(box: *gtk.Box, agent: agentpkg.Agent, busy: bool) void {
         const alloc = Application.default().allocator();
-        const markup = std.fmt.allocPrintSentinel(
-            alloc,
-            "<span size='small' foreground='#7aa2f7'>{s}</span>",
-            .{agent.symbol()},
-            0,
-        ) catch return;
+        const style = agent.symbolStyle();
+        // Per-agent colors: Claude orange, Codex black-on-white chip, others
+        // the default blue. A background (when set) gets a little padding so it
+        // reads as a chip rather than cramped text.
+        const markup = if (style.background) |bg|
+            std.fmt.allocPrintSentinel(
+                alloc,
+                "<span size='small' foreground='{s}' background='{s}'> {s} </span>",
+                .{ style.foreground, bg, agent.symbol() },
+                0,
+            ) catch return
+        else
+            std.fmt.allocPrintSentinel(
+                alloc,
+                "<span size='small' foreground='{s}'>{s}</span>",
+                .{ style.foreground, agent.symbol() },
+                0,
+            ) catch return;
         defer alloc.free(markup);
         const label = gtk.Label.new(null);
         label.setMarkup(markup.ptr);
