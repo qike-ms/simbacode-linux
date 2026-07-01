@@ -28,12 +28,19 @@ const Surface = @import("surface.zig").Surface;
 const Tab = @import("tab.zig").Tab;
 const sidebar = @import("sidebar.zig");
 const sidebar_store = @import("sidebar_store.zig");
+const agent_session_store = @import("agent_session_store.zig");
 const agentpkg = @import("agent.zig");
 const DebugWarning = @import("debug_warning.zig").DebugWarning;
 const CommandPalette = @import("command_palette.zig").CommandPalette;
 const WeakRef = @import("../weak_ref.zig").WeakRef;
 
 const log = std.log.scoped(.gtk_ghostty_window);
+
+/// Process-global guard so agent-session restore (issue #29) runs exactly once,
+/// on the first window to realize, not once per window. Multiple windows share
+/// a single persisted snapshot, so replaying it in every window would spawn
+/// duplicate agent tabs.
+var agent_sessions_restored: bool = false;
 
 pub const Window = extern struct {
     const Self = @This();
@@ -1287,6 +1294,132 @@ pub const Window = extern struct {
         self.updateIdentityChip();
     }
 
+    /// Persist the set of agents currently running in this window's tabs so
+    /// they can be relaunched and resumed after a restart (issue #29).
+    ///
+    /// The snapshot is process-global (one file), so this rewrites the whole
+    /// file from ALL windows' live agents, not just this one — otherwise a
+    /// second window's save would clobber the first's. Called whenever agent
+    /// presence changes (attach/detach/surface-finalize on a live window).
+    ///
+    /// We deliberately do NOT persist from `dispose`: on an app quit every
+    /// window disposes and its surfaces finalize, which would race us into
+    /// writing an empty snapshot and erase exactly the state we want to restore.
+    /// Instead the file always holds the last LIVE snapshot, which is precisely
+    /// "what was running before the restart". The tradeoff: closing one window
+    /// (of several) that has agents leaves those agents in the snapshot, so
+    /// they may be over-restored on the next launch — a benign extra tab.
+    fn persistAgentSessions(self: *Window) void {
+        // Don't persist while restoring or before restore has run: a partially
+        // restored state would be written back as the new snapshot and could
+        // drop not-yet-restored sessions. Once restore has run (or was a no-op)
+        // we own the snapshot and keep it current.
+        if (!agent_sessions_restored) return;
+        _ = self;
+
+        const alloc = Application.default().allocator();
+        var store: agent_session_store.Store = .{};
+        defer store.deinit(alloc);
+
+        // Walk every top-level window and collect its running agents. Keyed by
+        // surface so two tabs on the same worktree each get an entry. Skip
+        // windows mid-dispose: their surface_agents may already be torn down.
+        const list = gtk.Window.listToplevels();
+        defer list.free();
+        var node: ?*glib.List = list;
+        while (node) |n| : (node = n.f_next) {
+            const ptr = n.f_data orelse continue;
+            const win: *gtk.Window = @ptrCast(@alignCast(ptr));
+            if (!gobject.ext.isA(win, Window)) continue;
+            const w = gobject.ext.cast(Window, win) orelse continue;
+            if (w.private().disposing) continue;
+            w.collectAgentSessions(&store, alloc);
+        }
+
+        if (store.sessions.items.len == 0) {
+            // No agents anywhere: drop the file so a stale snapshot isn't
+            // replayed on the next launch.
+            agent_session_store.clear(alloc);
+            return;
+        }
+
+        agent_session_store.save(alloc, &store) catch |err| {
+            log.warn("failed to persist agent sessions: {}", .{err});
+        };
+    }
+
+    /// Append this window's running agents to `store`. Each recorded surface
+    /// contributes its agent name plus the cwd/worktree to relaunch it in.
+    fn collectAgentSessions(
+        self: *Window,
+        store: *agent_session_store.Store,
+        alloc: std.mem.Allocator,
+    ) void {
+        const priv = self.private();
+        var it = priv.surface_agents.iterator();
+        while (it.next()) |entry| {
+            const surface = entry.key_ptr.*;
+            const agent = entry.value_ptr.agent;
+            // Skip agents we can't relaunch (unknown/generic): restoring a tab
+            // we don't know how to start would just spawn a bare shell.
+            if (agent.resumeCommand() == null) continue;
+
+            // Prefer the owning worktree path; fall back to the surface's pwd.
+            const worktree: ?[]const u8 = self.worktreePathForSurface(surface);
+            const cwd: []const u8 = worktree orelse (surface.getPwd() orelse continue);
+            if (cwd.len == 0) continue;
+
+            store.add(alloc, agent.name(), cwd, worktree) catch |err| {
+                log.debug("agent-session: cannot record {s}: {}", .{ agent.name(), err });
+                continue;
+            };
+        }
+    }
+
+    /// Restore agents that were running before the last restart (issue #29).
+    /// Runs exactly once, on the first realized window. For each persisted
+    /// session we relaunch the agent (resuming its last conversation) in a tab
+    /// in the right worktree space, then clear the snapshot so it isn't
+    /// replayed again.
+    fn restoreAgentSessions(self: *Window) void {
+        if (agent_sessions_restored) return;
+        // Mark restored up-front so a failure partway through still flips us
+        // into "we own the snapshot" mode (persistAgentSessions will then keep
+        // the file current), and so re-entrancy from tab creation can't loop.
+        agent_sessions_restored = true;
+
+        const alloc = Application.default().allocator();
+        var store = agent_session_store.load(alloc);
+        defer store.deinit(alloc);
+        if (store.sessions.items.len == 0) return;
+
+        log.info("restoring {d} agent session(s)", .{store.sessions.items.len});
+
+        for (store.sessions.items) |*s| {
+            const agent = agentpkg.Agent.parse(s.agent) orelse continue;
+            const resume_cmd = agent.resumeCommand() orelse continue;
+
+            // Build a shell command that resumes the agent. Freed after the tab
+            // has duped it into its own config.
+            const cmd: configpkg.Command = .{ .shell = resume_cmd };
+
+            // Restore into the right worktree tab space when we know it.
+            const wt: ?[:0]const u8 = if (s.worktree) |w| w else null;
+            if (wt) |path| {
+                const view = self.ensureWorktreeView(path);
+                self.switchToWorktreeView(view);
+            }
+            self.newTabForWindow(null, .{
+                .command = cmd,
+                .working_directory = s.cwd,
+            });
+        }
+
+        // The snapshot has been consumed; drop the file. persistAgentSessions
+        // will rewrite it from the now-live agents as they announce presence.
+        agent_session_store.clear(alloc);
+    }
+
     /// Sync the tab binding group (title/subtitle/etc.) from the active view's
     /// selected page. Shared by the selected-page signal and view switching.
     fn refreshActiveTabBinding(self: *Self) void {
@@ -1783,6 +1916,11 @@ pub const Window = extern struct {
         // Start the agent-presence liveness sweep (AgentPresenceFeature
         // livenessSweepInterval = 2s). Reaps presence whose local pid is dead.
         priv.liveness_timer = glib.timeoutAdd(2000, livenessSweepTimer, self);
+
+        // Restore agents that were running before the last restart (issue #29).
+        // Runs once, on the first realized window; a no-op when there's nothing
+        // persisted.
+        self.restoreAgentSessions();
     }
 
     fn livenessSweepTimer(ud: ?*anyopaque) callconv(.c) c_int {
@@ -2523,6 +2661,8 @@ pub const Window = extern struct {
         self.refreshTabAgentIcon(surface);
         // Agent presence affects the sidebar bot icons (#4); rebuild rows.
         self.rebuildSidebarRows();
+        // Persist the running-agent snapshot so a restart can restore it (#29).
+        self.persistAgentSessions();
     }
 
     /// Remove a surface's agent entry. Returns true if an entry was present.
@@ -2569,7 +2709,12 @@ pub const Window = extern struct {
         // The surface is gone; refresh UI so its icon/bell disappears. We avoid
         // refreshTabAgentIcon (it would re-walk the dead surface's ancestry);
         // a full sidebar rebuild is keyed off live statuses only.
-        if (changed) self.rebuildSidebarRows();
+        if (changed) {
+            self.rebuildSidebarRows();
+            // Keep the persisted agent snapshot in sync now that a surface (and
+            // possibly its agent) is gone (#29).
+            self.persistAgentSessions();
+        }
     }
 
     /// Clear any agent presence recorded for a surface. Called on surface
@@ -2579,6 +2724,7 @@ pub const Window = extern struct {
         if (self.removeSurfaceAgent(surface)) {
             self.refreshTabAgentIcon(surface);
             self.rebuildSidebarRows();
+            self.persistAgentSessions();
         }
     }
 

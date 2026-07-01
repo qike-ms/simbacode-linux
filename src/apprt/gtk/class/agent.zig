@@ -41,12 +41,12 @@ pub const Agent = enum {
 
     /// Parse an agent name (case-insensitive, tolerant of common aliases) into
     /// a known Agent. Unrecognized non-empty names map to `.generic`.
-    pub fn parse(name: []const u8) ?Agent {
-        if (name.len == 0) return null;
+    pub fn parse(agent_name: []const u8) ?Agent {
+        if (agent_name.len == 0) return null;
         // Lowercase into a small stack buffer for comparison.
         var buf: [32]u8 = undefined;
-        const n = @min(name.len, buf.len);
-        for (name[0..n], 0..) |c, i| buf[i] = std.ascii.toLower(c);
+        const n = @min(agent_name.len, buf.len);
+        for (agent_name[0..n], 0..) |c, i| buf[i] = std.ascii.toLower(c);
         const lower = buf[0..n];
 
         if (contains(lower, "claude")) return .claude;
@@ -131,6 +131,48 @@ pub const Agent = enum {
         };
     }
 
+    /// A stable, machine-readable name for this agent. Used as the persisted
+    /// value in the agent-session store (issue #29) and to round-trip through
+    /// `parse`. Distinct from `label` (which is human-facing) so the on-disk
+    /// format stays terse and stable across UI copy changes.
+    pub fn name(self: Agent) [:0]const u8 {
+        return switch (self) {
+            .claude => "claude",
+            .codex => "codex",
+            .pi => "pi",
+            .kiro => "kiro",
+            .hermes => "hermes",
+            .opencode => "opencode",
+            .openclaw => "openclaw",
+            .generic => "generic",
+        };
+    }
+
+    /// The shell command that relaunches this agent and resumes its most
+    /// recent session (issue #29: restore running agents across a restart).
+    ///
+    /// These are best-effort per-agent "continue the last conversation"
+    /// invocations; when an agent has no known resume flag we fall back to
+    /// launching it bare (it will start fresh in the restored cwd, which is
+    /// still better than losing the tab entirely). `generic` returns null: we
+    /// don't know how to launch an unknown agent, so its tab is not restored.
+    pub fn resumeCommand(self: Agent) ?[:0]const u8 {
+        return switch (self) {
+            // `--continue` resumes the most recent conversation in the cwd.
+            .claude => "claude --continue",
+            // `codex resume --last` reopens the most recent session.
+            .codex => "codex resume --last",
+            // pi resumes the last session for the cwd on a bare launch.
+            .pi => "pi",
+            .kiro => "kiro",
+            .hermes => "hermes",
+            .opencode => "opencode",
+            .openclaw => "openclaw",
+            // Unknown agent: nothing safe to launch.
+            .generic => null,
+        };
+    }
+
     /// Build a new `gio.Icon` (BytesIcon) for this agent. Caller owns a
     /// reference and must `unref` it. Returns null on allocation failure.
     pub fn newIcon(self: Agent) ?*gio.Icon {
@@ -151,6 +193,24 @@ pub fn newBellIcon() ?*gio.Icon {
     defer bytes.unref();
     const icon = gio.BytesIcon.new(bytes);
     return icon.as(gio.Icon);
+}
+
+test "Agent.name round-trips through parse" {
+    const testing = std.testing;
+    inline for (.{
+        Agent.claude, Agent.codex,    Agent.pi,       Agent.kiro,
+        Agent.hermes, Agent.opencode, Agent.openclaw,
+    }) |a| {
+        try testing.expectEqual(a, Agent.parse(a.name()).?);
+    }
+    // Every non-generic agent must offer a resume command.
+    inline for (.{
+        Agent.claude, Agent.codex,    Agent.pi,       Agent.kiro,
+        Agent.hermes, Agent.opencode, Agent.openclaw,
+    }) |a| {
+        try testing.expect(a.resumeCommand() != null);
+    }
+    try testing.expect(Agent.generic.resumeCommand() == null);
 }
 
 test "Agent.parse known agents" {
