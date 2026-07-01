@@ -2756,12 +2756,12 @@ pub const Window = extern struct {
         const alloc = Application.default().allocator();
         const style = agent.symbolStyle();
         // Per-agent colors: Claude orange, Codex black-on-white chip, others
-        // the default blue. A background (when set) gets a little padding so it
-        // reads as a chip rather than cramped text.
+        // the default blue. The background (when set) hugs the glyph tightly so
+        // it stays narrow next to the branch name.
         const markup = if (style.background) |bg|
             std.fmt.allocPrintSentinel(
                 alloc,
-                "<span size='small' foreground='{s}' background='{s}'> {s} </span>",
+                "<span size='small' foreground='{s}' background='{s}'>{s}</span>",
                 .{ style.foreground, bg, agent.symbol() },
                 0,
             ) catch return
