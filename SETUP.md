@@ -22,7 +22,8 @@ PKG_CONFIG_PATH="$HOME/.local/lib/x86_64-linux-gnu/pkgconfig:$PKG_CONFIG_PATH" \
 LIBRARY_PATH="$HOME/.local/lib/x86_64-linux-gnu:$LIBRARY_PATH" \
 zig build -Demit-macos-app=false -Doptimize=ReleaseFast \
   --search-prefix "$HOME/.local" \
-  -Dpatch-rpath="$HOME/.local/lib/x86_64-linux-gnu"
+  -Dpatch-rpath="$HOME/.local/lib/x86_64-linux-gnu" \
+  -fsys=fontconfig
 ```
 
 - `-Doptimize=ReleaseFast` — max speed (no safety checks). Use `ReleaseSafe` for
@@ -30,6 +31,16 @@ zig build -Demit-macos-app=false -Doptimize=ReleaseFast \
 - `-Demit-macos-app=false` — skip the macOS app bundle (not needed on Linux).
 - `--search-prefix` + `-Dpatch-rpath` — find `gtk4-layer-shell` in `~/.local`
   and bake its path into the binary so it runs without `LD_LIBRARY_PATH`.
+- `-fsys=fontconfig` — **required on Linux.** Use the system `libfontconfig`
+  instead of the vendored copy. GTK/pango already pull in the system
+  `libfontconfig.so.1`, so statically linking the vendored fontconfig links
+  *two* different versions into one process (e.g. vendored 2.14.2 using
+  cache format `.cache-8` vs. system 2.15.0 using `.cache-9`). The vendored
+  `Fc*` symbols are exported globally and interpose over the system library,
+  so one version reads the other's mmap'd font caches with a mismatched struct
+  layout and **segfaults inside `FcCompare`** (seen when a second tab triggers
+  font fallback while pango renders a glyph on the main thread). Requires
+  `libfontconfig-dev` (`/usr/include/fontconfig/fontconfig.h`).
 - Wayland **and** X11 are both enabled (do not pass `-Dgtk-wayland=false`).
 
 Build takes ~90s. Binary lands at `zig-out/bin/ghostty`.
