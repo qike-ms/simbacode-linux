@@ -818,7 +818,13 @@ fn copilotFileSource(alloc: Allocator) ![]u8 {
 /// OpenCode loads JS/TS plugins; the plugin runs the same guarded shell command
 /// every other agent's hooks run. Caller owns the result.
 fn openCodePluginSource(alloc: Allocator) ![]u8 {
-    const session_start = try hooks.compositeCommandFull(alloc, &.{.session_start}, false, .opencode, true);
+    // OpenCode's plugin runs each command via `$`sh -c ...`` with NO stdin
+    // piped (unlike the shell-hook agents whose runners feed the hook JSON on
+    // stdin). So session capture (`__in=$(cat)`) must stay OFF here or the
+    // `cat` blocks forever and hangs OpenCode startup. OpenCode has no hook
+    // JSON to extract a session id from anyway; its tab falls back to the
+    // "continue last" resume form. (issue #29 regression fix)
+    const session_start = try hooks.compositeCommandFull(alloc, &.{.session_start}, false, .opencode, false);
     defer alloc.free(session_start);
     const session_end_idle = try hooks.compositeCommandFull(alloc, &.{ .session_end, .idle }, false, .opencode, false);
     defer alloc.free(session_end_idle);

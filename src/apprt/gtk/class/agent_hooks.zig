@@ -172,6 +172,15 @@ pub const osc_guard_expr = "[ -n \"${" ++ surface_env_var ++ ":-}\" ]";
 pub const notify_title_byte_budget = 160;
 pub const notify_body_byte_budget = 1000;
 
+/// Terminal-safe stdin capture: read the hook JSON into `$__in`, but ONLY when
+/// stdin is a pipe (`[ -t 0 ]` is false). Agents whose runners feed the hook
+/// JSON on stdin get the payload; agents that invoke the command with the tty
+/// on stdin and NOTHING piped (e.g. the OpenCode plugin's `$`sh -c ...``) skip
+/// the read instead of blocking forever on `cat` — which would hang startup.
+/// Leaves `$__in` empty in the no-pipe case, so downstream extraction just
+/// yields no session id / notify text (a benign no-op).
+pub const stdin_capture_snippet = "__in=\"\"; [ -t 0 ] || __in=$(cat)";
+
 /// Notify body source keys, in display precedence (AgentPresenceOSC.notifyBodyKeys).
 pub const notify_body_keys = "message,last_assistant_message,assistant_response";
 
@@ -211,7 +220,7 @@ pub fn emitNotifyShell(alloc: Allocator, agent: Agent, reads_stdin: bool) ![]u8 
             "-v budget={d} '{s}' | base64 | tr -d '\n'); " ++
             "printf '\\033]3008;start={s};kind=notify;title=%s;body=%s\\033\\\\' \"$__t\" \"$__b\" > \"$__tty\"",
         .{
-            if (reads_stdin) "__in=$(cat); " else "",
+            if (reads_stdin) stdin_capture_snippet ++ "; " else "",
             notify_title_byte_budget,
             notify_extract_awk,
             notify_body_keys,
@@ -297,7 +306,7 @@ fn sessionCaptureShell(alloc: Allocator, in_already_captured: bool) ![]u8 {
             "-v budget={d} '{s}'); " ++
             "__ss=\"\"; [ -n \"$__sid\" ] && __ss=\";sessionid=$__sid\"",
         .{
-            if (in_already_captured) "" else "__in=$(cat); ",
+            if (in_already_captured) "" else stdin_capture_snippet ++ "; ",
             session_id_keys,
             session_id_byte_budget,
             notify_extract_awk,
