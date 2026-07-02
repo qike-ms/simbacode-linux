@@ -131,6 +131,19 @@ pub const tty_resolve_snippet =
     "__pt=$(ps -o tty= -p \"$PPID\" 2>/dev/null | tr -d '[:space:]'); " ++
     "case \"$__pt\" in *[0-9]*) __tty=\"/dev/${__pt#/dev/}\";; *) __tty=\"/dev/tty\";; esac; fi";
 
+/// Where a hook command sources the agent's session id from (issue #29). The
+/// session id is the per-tab identity that lets a restart resume the EXACT
+/// conversation each tab was in, rather than every same-agent tab "resuming
+/// last" into one session.
+///   - `.none`  : no session capture; the payload is the classic presence shape.
+///   - `.stdin` : extract it from the agent's hook JSON piped on stdin (the
+///                shell-hook agents: Claude, Codex, Kiro, Copilot). Guarded so
+///                it never blocks when stdin is a terminal.
+///   - `.argv`  : take it from shell positional `$1`. Used by the OpenCode
+///                plugin, which knows `input.sessionID` in JS and passes it as
+///                an argument (no stdin to read, so nothing can block).
+pub const SessionSource = enum { none, stdin, argv };
+
 /// Build the shell `printf` that emits the OSC 3008 presence sequence for
 /// `event`. Verbatim port of `AgentPresenceOSC.emitShell`: written to the
 /// `$__tty` device, with the `pid=$PPID` suffix gated on the socket-path env
@@ -238,51 +251,59 @@ pub fn emitNotifyShell(alloc: Allocator, agent: Agent, reads_stdin: bool) ![]u8 
 /// extended with an optional session-id capture leg (issue #29).
 /// Caller owns the returned string.
 ///
-/// When `capture_session` is true the command first reads the agent's hook
-/// JSON from stdin (unless the notify leg already captured it into `$__in`),
-/// extracts a bounded session id via the shared awk, and carries it as
-/// `;sessionid=<id>` on every presence emit. This is the per-tab session
-/// identity that lets a restart resume the exact conversation each tab was in,
-/// rather than every same-agent tab "resuming last" into one session.
+/// `session` selects where the per-tab session id comes from (see
+/// `SessionSource`). When it is not `.none`, a capture leg builds the
+/// `;sessionid=<id>` suffix that each presence emit carries, so a restart can
+/// resume the exact conversation each tab was in rather than every same-agent
+/// tab "resuming last" into one session.
 pub fn compositeCommandFull(
     alloc: Allocator,
     events: []const HookEvent,
     forward_stdin_as_notification: bool,
     agent: Agent,
-    capture_session: bool,
+    session: SessionSource,
 ) ![]u8 {
     std.debug.assert(events.len > 0 or forward_stdin_as_notification);
+
+    const with_session = session != .none;
 
     var steps: std.ArrayListUnmanaged(u8) = .empty;
     defer steps.deinit(alloc);
 
     try steps.appendSlice(alloc, tty_resolve_snippet);
 
-    // Session-id capture leg: read stdin (once), extract a bounded session id,
-    // and build the `$__ss` suffix used by each session-aware emit. We reuse
-    // `$__in` when the notify leg will also read stdin, so we never `cat` twice
-    // (a second cat would block/return empty). The awk is the same field
-    // extractor the notify leg uses. `$__ss` stays empty when no id is found,
-    // leaving the payload byte-for-byte identical to the no-session shape.
-    if (capture_session) {
-        // The capture leg runs first, so it always owns the `__in=$(cat)`.
-        const cap = try sessionCaptureShell(alloc, false);
-        defer alloc.free(cap);
-        try steps.appendSlice(alloc, "; ");
-        try steps.appendSlice(alloc, cap);
+    // Session-id capture leg: build the `$__ss` suffix used by each
+    // session-aware emit. For `.stdin` we read the hook JSON (terminal-safe)
+    // and awk out the id; for `.argv` we take it from shell positional `$1`.
+    // `$__ss` stays empty when no id is found, leaving the payload
+    // byte-for-byte identical to the no-session shape.
+    switch (session) {
+        .none => {},
+        .stdin => {
+            // The capture leg runs first, so it always owns the stdin read.
+            const cap = try sessionCaptureShell(alloc, false);
+            defer alloc.free(cap);
+            try steps.appendSlice(alloc, "; ");
+            try steps.appendSlice(alloc, cap);
+        },
+        .argv => {
+            try steps.appendSlice(alloc, "; ");
+            try steps.appendSlice(alloc, session_argv_snippet);
+        },
     }
 
     for (events) |event| {
         try steps.appendSlice(alloc, "; ");
-        const emit = try emitShell(alloc, event, agent, capture_session);
+        const emit = try emitShell(alloc, event, agent, with_session);
         defer alloc.free(emit);
         try steps.appendSlice(alloc, emit);
     }
     if (forward_stdin_as_notification) {
         try steps.appendSlice(alloc, "; ");
         // The notify leg reads stdin itself only when the session-capture leg
-        // didn't already (they share `$__in`).
-        const notify = try emitNotifyShell(alloc, agent, !capture_session);
+        // didn't already (they share `$__in`). Only `.stdin` capture reads
+        // stdin; `.argv`/`.none` leave it for the notify leg.
+        const notify = try emitNotifyShell(alloc, agent, session != .stdin);
         defer alloc.free(notify);
         try steps.appendSlice(alloc, notify);
     }
@@ -294,17 +315,37 @@ pub fn compositeCommandFull(
     );
 }
 
+/// Session-id-from-argv snippet: take the session id from shell positional
+/// `$1`, bound its length, sanitize it, and precompute the `;sessionid=<id>`
+/// suffix into `$__ss` (empty when `$1` is empty). Used by the OpenCode plugin,
+/// which passes `input.sessionID` as the command argument — no stdin is read,
+/// so this can never block.
+pub const session_argv_snippet =
+    "__sid=$(printf '%s' \"${1:-}\" | cut -c1-" ++
+    std.fmt.comptimePrint("{d}", .{session_id_byte_budget}) ++
+    "); " ++ session_sanitize_snippet;
+
+/// Sanitize `$__sid` and build the `$__ss` suffix. The id is restricted to the
+/// OSC-safe alphabet [A-Za-z0-9._-] via `tr -cd`, which strips `;` (the OSC
+/// field separator, else a hostile id could inject a fake metadata field —
+/// TRIO-REVIEW simbacode-signal precedent), whitespace, and control bytes.
+/// Real session ids (UUID/ULID) pass through unchanged. `$__ss` stays empty
+/// when nothing survives sanitization.
+pub const session_sanitize_snippet =
+    "__sid=$(printf '%s' \"$__sid\" | LC_ALL=C tr -cd 'A-Za-z0-9._-'); " ++
+    "__ss=\"\"; [ -n \"$__sid\" ] && __ss=\";sessionid=$__sid\"";
+
 /// Build the session-id capture shell: read the hook JSON on stdin into `$__in`
 /// (only when it isn't already captured), extract a bounded session id via the
-/// shared awk into `$__sid`, and precompute the `;sessionid=<id>` suffix into
-/// `$__ss` (empty when no id). Caller owns the returned string.
+/// shared awk into `$__sid`, sanitize it, and precompute the `;sessionid=<id>`
+/// suffix into `$__ss` (empty when no id). Caller owns the returned string.
 fn sessionCaptureShell(alloc: Allocator, in_already_captured: bool) ![]u8 {
     return std.fmt.allocPrint(
         alloc,
         "{s}" ++
             "__sid=$(printf '%s' \"$__in\" | LC_ALL=C awk -v keys=\"{s}\" " ++
             "-v budget={d} '{s}'); " ++
-            "__ss=\"\"; [ -n \"$__sid\" ] && __ss=\";sessionid=$__sid\"",
+            session_sanitize_snippet,
         .{
             if (in_already_captured) "" else stdin_capture_snippet ++ "; ",
             session_id_keys,
@@ -318,7 +359,7 @@ fn sessionCaptureShell(alloc: Allocator, in_already_captured: bool) ![]u8 {
 /// Convenience wrapper over compositeCommandFull. Caller owns the returned
 /// string.
 pub fn compositeCommand(alloc: Allocator, events: []const HookEvent, agent: Agent) ![]u8 {
-    return compositeCommandFull(alloc, events, false, agent, false);
+    return compositeCommandFull(alloc, events, false, agent, .none);
 }
 
 /// True when a command string was installed by simbacode. The trailing sentinel
@@ -419,17 +460,17 @@ test "compositeCommand exact shape matches macOS AgentHookSettingsCommand" {
     try testing.expectEqualStrings(expected, cmd);
 }
 
-test "compositeCommandFull capture_session adds sessionid leg" {
+test "compositeCommandFull .stdin adds sessionid leg" {
     const testing = std.testing;
     const alloc = testing.allocator;
 
-    // A session_start slot with capture_session=true reads stdin, extracts the
-    // session id, and carries it as `;sessionid=$__sid` on the presence emit.
-    const cmd = try compositeCommandFull(alloc, &.{.session_start}, false, .codex, true);
+    // A session_start slot with .stdin capture reads stdin (terminal-safe),
+    // extracts the session id, and carries it as `;sessionid=$__sid`.
+    const cmd = try compositeCommandFull(alloc, &.{.session_start}, false, .codex, .stdin);
     defer alloc.free(cmd);
 
-    // Reads the hook JSON from stdin (no notify leg, so this leg captures it).
-    try testing.expect(std.mem.indexOf(u8, cmd, "__in=$(cat)") != null);
+    // Reads the hook JSON from stdin, guarded so it never blocks on a terminal.
+    try testing.expect(std.mem.indexOf(u8, cmd, "[ -t 0 ] || __in=$(cat)") != null);
     // Extracts the session id via awk over the session-id keys.
     try testing.expect(std.mem.indexOf(u8, cmd, "__sid=$(printf") != null);
     try testing.expect(std.mem.indexOf(u8, cmd, "session_id") != null);
@@ -440,14 +481,52 @@ test "compositeCommandFull capture_session adds sessionid leg" {
     try testing.expect(std.mem.indexOf(u8, cmd, "start=codex;event=session_start") != null);
 }
 
-test "compositeCommandFull capture_session shares stdin with notify leg" {
+test "compositeCommandFull .argv sources session id from positional $1" {
     const testing = std.testing;
     const alloc = testing.allocator;
 
-    // With both capture_session and the notify leg, stdin must be captured
-    // exactly ONCE (a second `cat` would block/return empty). The capture leg
-    // owns the `__in=$(cat)`, and the notify leg reuses `$__in`.
-    const cmd = try compositeCommandFull(alloc, &.{.idle}, true, .claude, true);
+    // The OpenCode path: session id comes from shell argv `$1`, NOT stdin, so
+    // the command must never contain a `cat` (which would block the plugin's
+    // `$`sh -c ...`` invocation that has the terminal on stdin).
+    const cmd = try compositeCommandFull(alloc, &.{.session_start}, false, .opencode, .argv);
+    defer alloc.free(cmd);
+
+    // No stdin read at all.
+    try testing.expect(std.mem.indexOf(u8, cmd, "cat") == null);
+    // Session id sourced from positional $1, length-capped.
+    try testing.expect(std.mem.indexOf(u8, cmd, "${1:-}") != null);
+    try testing.expect(std.mem.indexOf(u8, cmd, "__ss=\";sessionid=$__sid\"") != null);
+    // Carried on the presence emit.
+    try testing.expect(std.mem.indexOf(u8, cmd, "\"$__sp\" \"$__ss\"") != null);
+    try testing.expect(std.mem.indexOf(u8, cmd, "start=opencode;event=session_start") != null);
+}
+
+test "both session paths sanitize the id to the OSC-safe alphabet" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    // A `;` in the session id would inject a fake OSC metadata field app-side
+    // (fieldValue splits on `;`); control chars/whitespace would corrupt the
+    // wire. Both the argv and stdin capture paths must strip the id down to
+    // [A-Za-z0-9._-] via `tr -cd` before building the sessionid suffix
+    // (TRIO-REVIEW simbacode-signal sanitization precedent).
+    const argv = try compositeCommandFull(alloc, &.{.session_start}, false, .opencode, .argv);
+    defer alloc.free(argv);
+    const stdin = try compositeCommandFull(alloc, &.{.session_start}, false, .codex, .stdin);
+    defer alloc.free(stdin);
+    for ([_][]const u8{ argv, stdin }) |cmd| {
+        try testing.expect(std.mem.indexOf(u8, cmd, "tr -cd 'A-Za-z0-9._-'") != null);
+    }
+}
+
+test "compositeCommandFull .stdin capture shares stdin with notify leg" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    // With both .stdin capture and the notify leg, stdin must be captured
+    // exactly ONCE (a second read would block/return empty). The capture leg
+    // owns the read, and the notify leg reuses `$__in`.
+    const cmd = try compositeCommandFull(alloc, &.{.idle}, true, .claude, .stdin);
     defer alloc.free(cmd);
 
     var it = std.mem.splitSequence(u8, cmd, "__in=$(cat)");

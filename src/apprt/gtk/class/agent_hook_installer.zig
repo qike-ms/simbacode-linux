@@ -697,7 +697,7 @@ fn appendCanonicalSlots(
     format: HookFormat,
 ) !void {
     for (slots) |slot| {
-        const command = try hooks.compositeCommandFull(aa, slot.events, slot.notify, agent, slot.capture_session);
+        const command = try hooks.compositeCommandFull(aa, slot.events, slot.notify, agent, if (slot.capture_session) .stdin else .none);
 
         const group: std.json.Value = switch (format) {
             .flat => flat: {
@@ -795,7 +795,7 @@ fn copilotFileSource(alloc: Allocator) ![]u8 {
 
     var hooks_obj: std.json.ObjectMap = .init(aa);
     for (copilot_slots) |slot| {
-        const command = try hooks.compositeCommandFull(aa, slot.events, slot.notify, .copilot, slot.capture_session);
+        const command = try hooks.compositeCommandFull(aa, slot.events, slot.notify, .copilot, if (slot.capture_session) .stdin else .none);
         var hook: std.json.ObjectMap = .init(aa);
         try hook.put("type", .{ .string = "command" });
         try hook.put("bash", .{ .string = command });
@@ -817,22 +817,25 @@ fn copilotFileSource(alloc: Allocator) ![]u8 {
 /// Build `~/.config/opencode/plugins/simbacode-presence.js` (OpenCodePluginContent).
 /// OpenCode loads JS/TS plugins; the plugin runs the same guarded shell command
 /// every other agent's hooks run. Caller owns the result.
+///
+/// Session id (issue #29): OpenCode's plugin API exposes `input.sessionID` on
+/// its hook inputs (tool.execute.*, permission.ask) and `event.properties`.
+/// The plugin tracks the latest sessionID in JS and passes it to the
+/// session_start command as a shell ARGUMENT (`.argv` source), so the emit
+/// carries `;sessionid=<id>` for restore. We must NOT read stdin here (the
+/// plugin runs commands via `$`sh -c ...`` with the terminal on stdin and
+/// nothing piped, so a `cat` would block and hang startup) — the argv path
+/// avoids stdin entirely.
 fn openCodePluginSource(alloc: Allocator) ![]u8 {
-    // OpenCode's plugin runs each command via `$`sh -c ...`` with NO stdin
-    // piped (unlike the shell-hook agents whose runners feed the hook JSON on
-    // stdin). So session capture (`__in=$(cat)`) must stay OFF here or the
-    // `cat` blocks forever and hangs OpenCode startup. OpenCode has no hook
-    // JSON to extract a session id from anyway; its tab falls back to the
-    // "continue last" resume form. (issue #29 regression fix)
-    const session_start = try hooks.compositeCommandFull(alloc, &.{.session_start}, false, .opencode, false);
+    const session_start = try hooks.compositeCommandFull(alloc, &.{.session_start}, false, .opencode, .argv);
     defer alloc.free(session_start);
-    const session_end_idle = try hooks.compositeCommandFull(alloc, &.{ .session_end, .idle }, false, .opencode, false);
+    const session_end_idle = try hooks.compositeCommandFull(alloc, &.{ .session_end, .idle }, false, .opencode, .none);
     defer alloc.free(session_end_idle);
-    const busy = try hooks.compositeCommandFull(alloc, &.{.busy}, false, .opencode, false);
+    const busy = try hooks.compositeCommandFull(alloc, &.{.busy}, false, .opencode, .none);
     defer alloc.free(busy);
-    const idle = try hooks.compositeCommandFull(alloc, &.{.idle}, false, .opencode, false);
+    const idle = try hooks.compositeCommandFull(alloc, &.{.idle}, false, .opencode, .none);
     defer alloc.free(idle);
-    const awaiting = try hooks.compositeCommandFull(alloc, &.{.awaiting_input}, false, .opencode, false);
+    const awaiting = try hooks.compositeCommandFull(alloc, &.{.awaiting_input}, false, .opencode, .none);
     defer alloc.free(awaiting);
 
     const j_ss = try jsString(alloc, session_start);
@@ -853,23 +856,43 @@ fn openCodePluginSource(alloc: Allocator) ![]u8 {
         \\// simbacode's OSC 3008 agent-presence protocol by running the same guarded
         \\// shell command simbacode installs for every other agent. The command checks
         \\// SIMBACODE_SURFACE_ID first, so it is inert outside a simbacode surface.
+        \\// Session id (issue #29): OpenCode exposes input.sessionID on hook inputs and
+        \\// event.properties.sessionID. We track the latest and pass it to the
+        \\// session_start command as argv $1, so a restart resumes the exact session.
         \\export const SimbacodePresence = async ({{ $ }}) => {{
-        \\  const emit = (command) => $`sh -c ${{command}}`.quiet().nothrow()
-        \\  await emit({s})
+        \\  let sessionID = ""
+        \\  const emit = (command) => $`sh -c ${{command}} sh ${{sessionID}}`.quiet().nothrow()
+        \\  const sessionStartCmd = {s}
+        \\  // sessionID is unknown at plugin load (PluginInput is project-scoped),
+        \\  // so the initial session_start below carries no id. The first time a
+        \\  // hook/event reveals the id we re-emit session_start WITH it, which the
+        \\  // app treats as idempotent presence and uses to record the id (#29).
+        \\  const learn = (id) => {{
+        \\    if (typeof id === "string" && id && id !== sessionID) {{
+        \\      sessionID = id
+        \\      return emit(sessionStartCmd)
+        \\    }}
+        \\  }}
+        \\  const track = (input) => learn(input && input.sessionID)
+        \\  await emit(sessionStartCmd)
         \\  return {{
         \\    dispose: async () => {{
         \\      await emit({s})
         \\    }},
-        \\    "tool.execute.before": async () => {{
+        \\    "tool.execute.before": async (input) => {{
+        \\      track(input)
         \\      await emit({s})
         \\    }},
-        \\    "tool.execute.after": async () => {{
+        \\    "tool.execute.after": async (input) => {{
+        \\      track(input)
         \\      await emit({s})
         \\    }},
-        \\    "permission.ask": async () => {{
+        \\    "permission.ask": async (input) => {{
+        \\      track(input)
         \\      await emit({s})
         \\    }},
         \\    event: async ({{ event }}) => {{
+        \\      if (event && event.properties) await learn(event.properties.sessionID)
         \\      if (event.type === "session.idle") {{
         \\        await emit({s})
         \\      }} else if (event.type === "permission.replied") {{
