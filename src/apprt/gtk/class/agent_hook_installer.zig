@@ -41,6 +41,12 @@ pub const HookSlot = struct {
     notify: bool = false,
     /// Hook timeout in seconds (Claude/Codex/Copilot) — Kiro uses ms (×1000).
     timeout: u32 = 5,
+    /// Whether this slot captures the agent's session id from the hook JSON on
+    /// stdin and carries it as `sessionid=` on the presence emit (issue #29).
+    /// Set on the session_start slot so the per-tab session identity is
+    /// recorded, enabling a restart to resume the exact conversation rather
+    /// than every same-agent tab "resuming last" into one session.
+    capture_session: bool = false,
 };
 
 // ===========================================================================
@@ -52,7 +58,7 @@ pub const HookSlot = struct {
 /// -> awaiting_input, Notification -> awaiting_input + notify, Stop -> idle +
 /// notify, SessionEnd -> session_end + idle.
 pub const claude_slots = [_]HookSlot{
-    .{ .event_key = "SessionStart", .events = &.{.session_start}, .timeout = 5 },
+    .{ .event_key = "SessionStart", .events = &.{.session_start}, .timeout = 5, .capture_session = true },
     .{ .event_key = "UserPromptSubmit", .events = &.{.busy}, .timeout = 10 },
     .{ .event_key = "PreToolUse", .matcher = "", .events = &.{.busy}, .timeout = 5 },
     // Array-order: matched-by-name fires AFTER matcher-"", so awaiting wins.
@@ -67,7 +73,7 @@ pub const claude_slots = [_]HookSlot{
 /// UserPromptSubmit -> busy, Stop -> idle + notify. No SessionEnd (clears via
 /// the pid liveness sweep).
 pub const codex_slots = [_]HookSlot{
-    .{ .event_key = "SessionStart", .events = &.{.session_start}, .timeout = 5 },
+    .{ .event_key = "SessionStart", .events = &.{.session_start}, .timeout = 5, .capture_session = true },
     .{ .event_key = "UserPromptSubmit", .events = &.{.busy}, .timeout = 10 },
     .{ .event_key = "Stop", .events = &.{.idle}, .notify = true, .timeout = 10 },
 };
@@ -76,7 +82,7 @@ pub const codex_slots = [_]HookSlot{
 /// session_start, userPromptSubmit -> busy, stop -> idle + notify. Timeouts in
 /// ms in the file (×1000 from these seconds).
 pub const kiro_slots = [_]HookSlot{
-    .{ .event_key = "agentSpawn", .events = &.{.session_start}, .timeout = 5 },
+    .{ .event_key = "agentSpawn", .events = &.{.session_start}, .timeout = 5, .capture_session = true },
     .{ .event_key = "userPromptSubmit", .events = &.{.busy}, .timeout = 10 },
     .{ .event_key = "stop", .events = &.{.idle}, .notify = true, .timeout = 10 },
 };
@@ -93,7 +99,7 @@ pub const kiro_slots = [_]HookSlot{
 /// presence/activity but not the dedicated needs-you banner until ported. See
 /// dist/linux/simbacode/SOURCE-PARITY.md deferred items.
 pub const copilot_slots = [_]HookSlot{
-    .{ .event_key = "sessionStart", .events = &.{.session_start}, .timeout = 5 },
+    .{ .event_key = "sessionStart", .events = &.{.session_start}, .timeout = 5, .capture_session = true },
     .{ .event_key = "userPromptSubmitted", .events = &.{.busy}, .timeout = 10 },
     .{ .event_key = "preToolUse", .events = &.{.busy}, .timeout = 5 },
     .{ .event_key = "postToolUse", .events = &.{.busy}, .timeout = 5 },
@@ -353,6 +359,8 @@ fn hermesScriptSource(alloc: Allocator) ![]u8 {
         \\__in=$(cat 2>/dev/null)
         \\[ -n "${{SIMBACODE_SURFACE_ID:-}}" ] || {{ printf '{{}}\n'; exit 0; }}
         \\__ev=$(printf '%s' "$__in" | sed -n 's/.*"hook_event_name"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | head -n1)
+        \\__sid=$(printf '%s' "$__in" | sed -n 's/.*"session_id"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | head -n1)
+        \\__ss=""; [ -n "$__sid" ] && __ss=";sessionid=$__sid"
         \\case "$__ev" in
         \\  on_session_start) __osc=session_start; __act=start;;
         \\  pre_tool_call|pre_llm_call) __osc=busy; __act=start;;
@@ -360,7 +368,7 @@ fn hermesScriptSource(alloc: Allocator) ![]u8 {
         \\  on_session_end|on_session_finalize) __osc=session_end; __act=end;;
         \\  *) printf '{{}}\n'; exit 0;;
         \\esac
-        \\{{ {s}; __sp=""; [ -n "${{SIMBACODE_SOCKET_PATH:-}}" ] && __sp=";pid=$PPID"; printf '\033]3008;%s=hermes;event=%s%s\033\\' "$__act" "$__osc" "$__sp" > "$__tty"; }} >/dev/null 2>&1 || true
+        \\{{ {s}; __sp=""; [ -n "${{SIMBACODE_SOCKET_PATH:-}}" ] && __sp=";pid=$PPID"; printf '\033]3008;%s=hermes;event=%s%s%s\033\\' "$__act" "$__osc" "$__sp" "$__ss" > "$__tty"; }} >/dev/null 2>&1 || true
         \\printf '{{}}\n'
         \\
     , .{ hooks.ownership_marker, hooks.tty_resolve_snippet });
@@ -689,7 +697,7 @@ fn appendCanonicalSlots(
     format: HookFormat,
 ) !void {
     for (slots) |slot| {
-        const command = try hooks.compositeCommandFull(aa, slot.events, slot.notify, agent);
+        const command = try hooks.compositeCommandFull(aa, slot.events, slot.notify, agent, slot.capture_session);
 
         const group: std.json.Value = switch (format) {
             .flat => flat: {
@@ -787,7 +795,7 @@ fn copilotFileSource(alloc: Allocator) ![]u8 {
 
     var hooks_obj: std.json.ObjectMap = .init(aa);
     for (copilot_slots) |slot| {
-        const command = try hooks.compositeCommandFull(aa, slot.events, slot.notify, .copilot);
+        const command = try hooks.compositeCommandFull(aa, slot.events, slot.notify, .copilot, slot.capture_session);
         var hook: std.json.ObjectMap = .init(aa);
         try hook.put("type", .{ .string = "command" });
         try hook.put("bash", .{ .string = command });
@@ -810,15 +818,15 @@ fn copilotFileSource(alloc: Allocator) ![]u8 {
 /// OpenCode loads JS/TS plugins; the plugin runs the same guarded shell command
 /// every other agent's hooks run. Caller owns the result.
 fn openCodePluginSource(alloc: Allocator) ![]u8 {
-    const session_start = try hooks.compositeCommandFull(alloc, &.{.session_start}, false, .opencode);
+    const session_start = try hooks.compositeCommandFull(alloc, &.{.session_start}, false, .opencode, true);
     defer alloc.free(session_start);
-    const session_end_idle = try hooks.compositeCommandFull(alloc, &.{ .session_end, .idle }, false, .opencode);
+    const session_end_idle = try hooks.compositeCommandFull(alloc, &.{ .session_end, .idle }, false, .opencode, false);
     defer alloc.free(session_end_idle);
-    const busy = try hooks.compositeCommandFull(alloc, &.{.busy}, false, .opencode);
+    const busy = try hooks.compositeCommandFull(alloc, &.{.busy}, false, .opencode, false);
     defer alloc.free(busy);
-    const idle = try hooks.compositeCommandFull(alloc, &.{.idle}, false, .opencode);
+    const idle = try hooks.compositeCommandFull(alloc, &.{.idle}, false, .opencode, false);
     defer alloc.free(idle);
-    const awaiting = try hooks.compositeCommandFull(alloc, &.{.awaiting_input}, false, .opencode);
+    const awaiting = try hooks.compositeCommandFull(alloc, &.{.awaiting_input}, false, .opencode, false);
     defer alloc.free(awaiting);
 
     const j_ss = try jsString(alloc, session_start);
@@ -1094,6 +1102,31 @@ const pi_extension_index_ts =
     \\  writeToTerminal(`\x1b]3008;${action}=${AGENT};${meta}\x1b\\`);
     \\}
     \\
+    \\// Best-effort per-session identity so simbacode can resume THIS conversation
+    \\// (not just "the last one") after a restart. Pi exposes the id in a few
+    \\// shapes across versions; probe each and fall back to empty (no sessionid).
+    \\function sessionIdOf(ctx: any): string {
+    \\  try {
+    \\    const cand =
+    \\      ctx?.sessionId ??
+    \\      ctx?.session?.id ??
+    \\      ctx?.sessionManager?.sessionId ??
+    \\      ctx?.sessionManager?.getSessionId?.() ??
+    \\      ctx?.sessionManager?.session?.id;
+    \\    if (typeof cand === "string" && cand.length > 0) return cand.slice(0, 128);
+    \\  } catch {
+    \\    // ignore — identity is optional
+    \\  }
+    \\  return "";
+    \\}
+    \\
+    \\function emitPresenceWithSession(event: string, sessionId: string): void {
+    \\  const action = event === "session_end" ? "end" : "start";
+    \\  const sid = sessionId ? `;sessionid=${sessionId}` : "";
+    \\  const meta = `event=${event}${localPidSuffix()}${sid}`;
+    \\  writeToTerminal(`\x1b]3008;${action}=${AGENT};${meta}\x1b\\`);
+    \\}
+    \\
     \\function notifyField(value: string, budget: number): string {
     \\  const escaped = JSON.stringify(value).slice(1, -1);
     \\  const buf = Buffer.from(escaped, "utf8");
@@ -1129,7 +1162,10 @@ const pi_extension_index_ts =
     \\
     \\export default function (pi: ExtensionAPI) {
     \\  if (!isSimbacodeSurface()) return;
-    \\  emitPresence("session_start");
+    \\  // Emit session_start carrying this session's id when available, so a
+    \\  // restart can resume the exact conversation (issue #29). Fall back to a
+    \\  // bare session_start (no id) when Pi doesn't expose one.
+    \\  emitPresenceWithSession("session_start", sessionIdOf(pi));
     \\
     \\  pi.on("agent_start", (_event, _ctx) => {
     \\    emitPresence("busy");
@@ -1411,7 +1447,10 @@ test "opencode plugin + pi extension carry sentinel and events" {
     const pi_src = try piExtensionSource(alloc);
     defer alloc.free(pi_src);
     try testing.expect(std.mem.indexOf(u8, pi_src, hooks.ownership_marker) != null);
-    try testing.expect(std.mem.indexOf(u8, pi_src, "emitPresence(\"session_start\")") != null);
+    try testing.expect(std.mem.indexOf(u8, pi_src, "emitPresenceWithSession(\"session_start\"") != null);
+    // The pi extension probes for a session id so restore can resume the exact
+    // conversation (issue #29).
+    try testing.expect(std.mem.indexOf(u8, pi_src, "sessionid=") != null);
     try testing.expect(std.mem.indexOf(u8, pi_src, "emitNotification") != null);
 }
 

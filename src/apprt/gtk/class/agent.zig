@@ -148,29 +148,59 @@ pub const Agent = enum {
         };
     }
 
-    /// The shell command that relaunches this agent and resumes its most
-    /// recent session (issue #29: restore running agents across a restart).
+    /// The shell command that relaunches this agent and resumes a session
+    /// (issue #29: restore running agents across a restart).
     ///
-    /// These are best-effort per-agent "continue the last conversation"
-    /// invocations; when an agent has no known resume flag we fall back to
-    /// launching it bare (it will start fresh in the restored cwd, which is
-    /// still better than losing the tab entirely). `generic` returns null: we
-    /// don't know how to launch an unknown agent, so its tab is not restored.
-    pub fn resumeCommand(self: Agent) ?[:0]const u8 {
+    /// When `session_id` is non-null we build a session-SPECIFIC resume so a
+    /// restart reopens the EXACT conversation each tab was in — critical when
+    /// several tabs run the same agent (two `codex` tabs must not both reopen
+    /// the single most-recent session). When it is null we fall back to the
+    /// agent's "continue last" form (best-effort for agents/tabs that never
+    /// reported a session id). `generic` returns null: we don't know how to
+    /// launch an unknown agent, so its tab is not restored.
+    ///
+    /// `buf` is scratch the caller owns; the returned slice may point into it
+    /// (session-specific forms) or be a static literal (fallbacks). It is
+    /// always NUL-terminated so it can be used directly as a `Command.shell`.
+    pub fn resumeCommand(self: Agent, session_id: ?[]const u8, buf: []u8) ?[:0]const u8 {
+        // Session-specific resume when we have an id.
+        if (session_id) |sid| {
+            if (sid.len > 0) {
+                // Per-agent "resume this exact session" prefix; the id is
+                // appended verbatim. Null means the agent has no per-session
+                // resume flag, so we fall through to "continue last" below.
+                const prefix: ?[]const u8 = switch (self) {
+                    .claude => "claude --resume ",
+                    .codex => "codex resume ",
+                    // pi resumes a specific session by id.
+                    .pi => "pi --resume ",
+                    // opencode reopens a session by id.
+                    .opencode => "opencode --session ",
+                    .kiro, .hermes, .openclaw, .generic => null,
+                };
+                if (prefix) |p| {
+                    return std.fmt.bufPrintZ(buf, "{s}{s}", .{ p, sid }) catch null;
+                }
+            }
+        }
+        // Fallback: continue the most recent conversation in the cwd.
         return switch (self) {
-            // `--continue` resumes the most recent conversation in the cwd.
             .claude => "claude --continue",
-            // `codex resume --last` reopens the most recent session.
             .codex => "codex resume --last",
-            // pi resumes the last session for the cwd on a bare launch.
             .pi => "pi",
             .kiro => "kiro",
             .hermes => "hermes",
             .opencode => "opencode",
             .openclaw => "openclaw",
-            // Unknown agent: nothing safe to launch.
             .generic => null,
         };
+    }
+
+    /// Whether this agent can be relaunched at all (has at least a fallback
+    /// resume form). Used to decide whether a tab is worth persisting.
+    pub fn canResume(self: Agent) bool {
+        var buf: [0]u8 = undefined;
+        return self.resumeCommand(null, &buf) != null;
     }
 
     /// Build a new `gio.Icon` (BytesIcon) for this agent. Caller owns a
@@ -208,9 +238,31 @@ test "Agent.name round-trips through parse" {
         Agent.claude, Agent.codex,    Agent.pi,       Agent.kiro,
         Agent.hermes, Agent.opencode, Agent.openclaw,
     }) |a| {
-        try testing.expect(a.resumeCommand() != null);
+        try testing.expect(a.canResume());
     }
-    try testing.expect(Agent.generic.resumeCommand() == null);
+    try testing.expect(!Agent.generic.canResume());
+    var buf: [128]u8 = undefined;
+    try testing.expect(Agent.generic.resumeCommand(null, &buf) == null);
+    // Session-specific resume for agents that support it.
+    try testing.expectEqualStrings(
+        "claude --resume abc123",
+        Agent.claude.resumeCommand("abc123", &buf).?,
+    );
+    try testing.expectEqualStrings(
+        "codex resume xyz",
+        Agent.codex.resumeCommand("xyz", &buf).?,
+    );
+    // Agent without a per-session flag falls back to "continue last" even when
+    // given an id.
+    try testing.expectEqualStrings(
+        "kiro",
+        Agent.kiro.resumeCommand("someid", &buf).?,
+    );
+    // Null id -> fallback form.
+    try testing.expectEqualStrings(
+        "claude --continue",
+        Agent.claude.resumeCommand(null, &buf).?,
+    );
 }
 
 test "Agent.parse known agents" {

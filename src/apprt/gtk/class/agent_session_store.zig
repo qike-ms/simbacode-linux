@@ -38,11 +38,17 @@ pub const Session = struct {
     /// Optional worktree path the tab belonged to, used to restore the tab
     /// into the right per-worktree tab space. Falls back to `cwd` when empty.
     worktree: ?[:0]u8 = null,
+    /// Optional agent session id (issue #29). When present the restore builds
+    /// a session-SPECIFIC resume (e.g. `claude --resume <id>`) so the EXACT
+    /// conversation reopens — essential when several tabs run the same agent.
+    /// When absent we fall back to the agent's "continue last" form.
+    session_id: ?[:0]u8 = null,
 
     pub fn deinit(self: *const Session, alloc: Allocator) void {
         alloc.free(self.agent);
         alloc.free(self.cwd);
         if (self.worktree) |w| alloc.free(w);
+        if (self.session_id) |s| alloc.free(s);
     }
 };
 
@@ -63,14 +69,16 @@ pub const Store = struct {
     }
 
     /// Append a session, taking ownership of fresh copies of the given strings.
-    /// `agent` and `cwd` are required; `worktree` is optional. Absolute cwd is
-    /// enforced by the caller/loader — an empty cwd is rejected here.
+    /// `agent` and `cwd` are required; `worktree` and `session_id` are
+    /// optional. Absolute cwd is enforced by the caller/loader — an empty cwd
+    /// is rejected here.
     pub fn add(
         self: *Store,
         alloc: Allocator,
         agent: []const u8,
         cwd: []const u8,
         worktree: ?[]const u8,
+        session_id: ?[]const u8,
     ) !void {
         if (agent.len == 0 or cwd.len == 0) return;
         const agent_copy = try alloc.dupeZ(u8, agent);
@@ -82,10 +90,16 @@ pub const Store = struct {
         else
             null;
         errdefer if (wt_copy) |w| alloc.free(w);
+        const sid_copy: ?[:0]u8 = if (session_id) |sid|
+            (if (sid.len > 0) try alloc.dupeZ(u8, sid) else null)
+        else
+            null;
+        errdefer if (sid_copy) |sid| alloc.free(sid);
         try self.sessions.append(alloc, .{
             .agent = agent_copy,
             .cwd = cwd_copy,
             .worktree = wt_copy,
+            .session_id = sid_copy,
         });
     }
 };
@@ -96,6 +110,7 @@ const WireSession = struct {
     agent: []const u8 = "",
     cwd: []const u8 = "",
     worktree: ?[]const u8 = null,
+    sessionId: ?[]const u8 = null,
 };
 
 const Wire = struct {
@@ -156,7 +171,7 @@ pub fn loadFrom(alloc: Allocator, path: []const u8) Store {
             (if (w.len > 0 and std.fs.path.isAbsolute(w)) w else null)
         else
             null;
-        store.add(alloc, s.agent, s.cwd, wt) catch |err| {
+        store.add(alloc, s.agent, s.cwd, wt, s.sessionId) catch |err| {
             log.debug("agent-session: skipping entry: {}", .{err});
             continue;
         };
@@ -187,6 +202,7 @@ pub fn saveTo(alloc: Allocator, path: []const u8, store: *const Store) !void {
             .agent = s.agent,
             .cwd = s.cwd,
             .worktree = if (s.worktree) |w| w else null,
+            .sessionId = if (s.session_id) |sid| sid else null,
         };
     }
     const wire: Wire = .{
@@ -224,10 +240,10 @@ test "add rejects empty agent or cwd" {
     const alloc = std.testing.allocator;
     var store: Store = .{};
     defer store.deinit(alloc);
-    try store.add(alloc, "", "/tmp", null);
-    try store.add(alloc, "claude", "", null);
+    try store.add(alloc, "", "/tmp", null, null);
+    try store.add(alloc, "claude", "", null, null);
     try std.testing.expectEqual(@as(usize, 0), store.sessions.items.len);
-    try store.add(alloc, "claude", "/tmp/x", null);
+    try store.add(alloc, "claude", "/tmp/x", null, null);
     try std.testing.expectEqual(@as(usize, 1), store.sessions.items.len);
 }
 
@@ -243,8 +259,8 @@ test "saveTo then loadFrom round-trips sessions" {
     {
         var store: Store = .{};
         defer store.deinit(alloc);
-        try store.add(alloc, "claude", "/home/u/proj-a", "/home/u/proj-a");
-        try store.add(alloc, "codex", "/home/u/proj-b", null);
+        try store.add(alloc, "claude", "/home/u/proj-a", "/home/u/proj-a", "sess-a");
+        try store.add(alloc, "codex", "/home/u/proj-b", null, null);
         try saveTo(alloc, path, &store);
     }
 
@@ -255,8 +271,11 @@ test "saveTo then loadFrom round-trips sessions" {
     try std.testing.expectEqualStrings("/home/u/proj-a", loaded.sessions.items[0].cwd);
     try std.testing.expect(loaded.sessions.items[0].worktree != null);
     try std.testing.expectEqualStrings("/home/u/proj-a", loaded.sessions.items[0].worktree.?);
+    try std.testing.expect(loaded.sessions.items[0].session_id != null);
+    try std.testing.expectEqualStrings("sess-a", loaded.sessions.items[0].session_id.?);
     try std.testing.expectEqualStrings("codex", loaded.sessions.items[1].agent);
     try std.testing.expect(loaded.sessions.items[1].worktree == null);
+    try std.testing.expect(loaded.sessions.items[1].session_id == null);
 }
 
 test "loadFrom missing file yields empty store" {
@@ -318,11 +337,11 @@ test "clearSessions frees entries and keeps capacity" {
     const alloc = std.testing.allocator;
     var store: Store = .{};
     defer store.deinit(alloc);
-    try store.add(alloc, "claude", "/a", null);
-    try store.add(alloc, "codex", "/b", null);
+    try store.add(alloc, "claude", "/a", null, null);
+    try store.add(alloc, "codex", "/b", null, null);
     store.clearSessions(alloc);
     try std.testing.expectEqual(@as(usize, 0), store.sessions.items.len);
     // Reusable after clear.
-    try store.add(alloc, "pi", "/c", null);
+    try store.add(alloc, "pi", "/c", null, null);
     try std.testing.expectEqual(@as(usize, 1), store.sessions.items.len);
 }

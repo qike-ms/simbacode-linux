@@ -250,6 +250,13 @@ pub const Window = extern struct {
             /// crashed local agent that never sent session_end is cleaned up.
             /// Mirrors AgentPresenceFeature.PresenceRecord.pids + livenessSweep.
             pid: ?std.posix.pid_t = null,
+            /// simbacode (#29): the agent's own session id, carried on the OSC
+            /// `sessionid=` field of session_start. Owned (duped) NUL-terminated
+            /// string, or null when the agent didn't supply one. This is the
+            /// per-tab session identity persisted so a restart can resume the
+            /// EXACT conversation each tab was in (e.g. `claude --resume <id>`),
+            /// rather than every same-agent tab "resuming last" into one session.
+            session_id: ?[:0]u8 = null,
         };
 
         /// simbacode (#11): one entry in the notification bell history. Owns its
@@ -1362,14 +1369,15 @@ pub const Window = extern struct {
             const agent = entry.value_ptr.agent;
             // Skip agents we can't relaunch (unknown/generic): restoring a tab
             // we don't know how to start would just spawn a bare shell.
-            if (agent.resumeCommand() == null) continue;
+            if (!agent.canResume()) continue;
 
             // Prefer the owning worktree path; fall back to the surface's pwd.
             const worktree: ?[]const u8 = self.worktreePathForSurface(surface);
             const cwd: []const u8 = worktree orelse (surface.getPwd() orelse continue);
             if (cwd.len == 0) continue;
 
-            store.add(alloc, agent.name(), cwd, worktree) catch |err| {
+            const sid: ?[]const u8 = if (entry.value_ptr.session_id) |s| s else null;
+            store.add(alloc, agent.name(), cwd, worktree, sid) catch |err| {
                 log.debug("agent-session: cannot record {s}: {}", .{ agent.name(), err });
                 continue;
             };
@@ -1397,7 +1405,11 @@ pub const Window = extern struct {
 
         for (store.sessions.items) |*s| {
             const agent = agentpkg.Agent.parse(s.agent) orelse continue;
-            const resume_cmd = agent.resumeCommand() orelse continue;
+            // Build the resume command, session-specific when we have an id so
+            // two same-agent tabs reopen their OWN conversations (#29).
+            var cmd_buf: [512]u8 = undefined;
+            const sid: ?[]const u8 = if (s.session_id) |x| x else null;
+            const resume_cmd = agent.resumeCommand(sid, &cmd_buf) orelse continue;
 
             // Build a shell command that resumes the agent. Freed after the tab
             // has duped it into its own config.
@@ -1783,6 +1795,11 @@ pub const Window = extern struct {
         }
         priv.sidebar_rows.deinit(alloc);
         priv.sidebar_rows = .empty;
+        {
+            // Free owned agent session ids (#29) before dropping the map.
+            var it = priv.surface_agents.valueIterator();
+            while (it.next()) |v| if (v.session_id) |sid| alloc.free(sid);
+        }
         priv.surface_agents.deinit(alloc);
         priv.surface_agents = .empty;
 
@@ -2650,9 +2667,12 @@ pub const Window = extern struct {
             const gop = priv.surface_agents.getOrPut(alloc, surface) catch return;
             gop.value_ptr.* = .{
                 .agent = a,
-                // Preserve activity + pid across a re-attach on the same surface.
+                // Preserve activity + pid + session id across a re-attach on the
+                // same surface (the session id is set separately, right after a
+                // session_start, and must survive a bare presence refresh).
                 .activity = if (gop.found_existing) gop.value_ptr.activity else .idle,
                 .pid = if (gop.found_existing) gop.value_ptr.pid else null,
+                .session_id = if (gop.found_existing) gop.value_ptr.session_id else null,
             };
         } else {
             _ = self.removeSurfaceAgent(surface);
@@ -2666,11 +2686,31 @@ pub const Window = extern struct {
     }
 
     /// Remove a surface's agent entry. Returns true if an entry was present.
-    /// The single chokepoint for agent removal. Does NOT refresh the tab icon;
-    /// callers do that.
+    /// The single chokepoint for agent removal. Frees the owned session id.
+    /// Does NOT refresh the tab icon; callers do that.
     fn removeSurfaceAgent(self: *Window, surface: *Surface) bool {
         const priv = self.private();
-        return priv.surface_agents.remove(surface);
+        if (priv.surface_agents.fetchRemove(surface)) |kv| {
+            if (kv.value.session_id) |sid| Application.default().allocator().free(sid);
+            return true;
+        }
+        return false;
+    }
+
+    /// Record (or replace) the agent session id for a surface (issue #29).
+    /// No-op if no agent is attached. Takes ownership of a fresh copy of `sid`;
+    /// frees any prior id. Persists the snapshot so the id lands on disk.
+    pub fn setSurfaceAgentSession(self: *Window, surface: *Surface, sid: []const u8) void {
+        const priv = self.private();
+        const alloc = Application.default().allocator();
+        const entry = priv.surface_agents.getPtr(surface) orelse return;
+        if (sid.len == 0) return;
+        const copy = alloc.dupeZ(u8, sid) catch return;
+        if (entry.session_id) |old| alloc.free(old);
+        entry.session_id = copy;
+        // The session id is what makes restore resume the right conversation;
+        // persist immediately so a crash right after start still has it.
+        self.persistAgentSessions();
     }
 
     /// Register a GObject weak-ref on `surface` (once) so that when the surface
@@ -2703,7 +2743,7 @@ pub const Window = extern struct {
             return;
         }
         var changed = false;
-        if (priv.surface_agents.remove(surface)) changed = true;
+        if (self.removeSurfaceAgent(surface)) changed = true;
         if (self.clearSurfaceAttention(surface)) changed = true;
         _ = priv.tracked_surfaces.remove(surface);
         // The surface is gone; refresh UI so its icon/bell disappears. We avoid

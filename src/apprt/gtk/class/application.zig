@@ -2630,6 +2630,12 @@ const Action = struct {
                     // pid-less session_start must NOT clobber a previously
                     // tracked pid (AgentPresenceFeature pid-less branch).
                     if (local_pid != null) win.setSurfaceAgentPid(surface, local_pid);
+                    // Record this tab's agent session id (issue #29) so a
+                    // restart resumes the EXACT conversation, not just "last".
+                    // Carried only on session_start; absent -> no id recorded.
+                    if (fieldValue(value.metadata, "sessionid")) |sid| {
+                        win.setSurfaceAgentSession(surface, sid);
+                    }
                 }
                 // A fresh session clears any stale attention on this surface.
                 clearSurfaceAttention(self, window, surface);
