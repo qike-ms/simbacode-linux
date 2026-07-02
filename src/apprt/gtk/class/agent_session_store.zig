@@ -102,6 +102,71 @@ pub const Store = struct {
             .session_id = sid_copy,
         });
     }
+
+    /// Find the index of the entry with `session_id`, or null. Session id is
+    /// the durable key (issue #29 design): globally unique per agent run.
+    pub fn indexOfSessionId(self: *const Store, session_id: []const u8) ?usize {
+        for (self.sessions.items, 0..) |*s, i| {
+            if (s.session_id) |sid| {
+                if (std.mem.eql(u8, sid, session_id)) return i;
+            }
+        }
+        return null;
+    }
+
+    /// Insert-or-update the entry for `session_id` (the durable key). Requires a
+    /// non-empty session id and cwd (principle: no id = nothing to resume).
+    /// Returns true if the store changed (so the caller can persist). Idempotent
+    /// when the same (agent, cwd, worktree, id) is upserted again.
+    pub fn upsertBySessionId(
+        self: *Store,
+        alloc: Allocator,
+        agent: []const u8,
+        cwd: []const u8,
+        worktree: ?[]const u8,
+        session_id: []const u8,
+    ) !bool {
+        if (agent.len == 0 or cwd.len == 0 or session_id.len == 0) return false;
+        if (self.indexOfSessionId(session_id)) |i| {
+            // Update in place if any field differs (cwd/worktree can change).
+            const s = &self.sessions.items[i];
+            const wt_same = blk: {
+                if (s.worktree) |w| {
+                    break :blk if (worktree) |nw| std.mem.eql(u8, w, nw) else false;
+                } else break :blk worktree == null;
+            };
+            if (std.mem.eql(u8, s.agent, agent) and
+                std.mem.eql(u8, s.cwd, cwd) and wt_same) return false;
+            // Replace the entry's mutable fields.
+            const agent_copy = try alloc.dupeZ(u8, agent);
+            errdefer alloc.free(agent_copy);
+            const cwd_copy = try alloc.dupeZ(u8, cwd);
+            errdefer alloc.free(cwd_copy);
+            const wt_copy: ?[:0]u8 = if (worktree) |w|
+                (if (w.len > 0) try alloc.dupeZ(u8, w) else null)
+            else
+                null;
+            alloc.free(s.agent);
+            alloc.free(s.cwd);
+            if (s.worktree) |w| alloc.free(w);
+            s.agent = agent_copy;
+            s.cwd = cwd_copy;
+            s.worktree = wt_copy;
+            return true;
+        }
+        try self.add(alloc, agent, cwd, worktree, session_id);
+        return true;
+    }
+
+    /// Remove the entry with `session_id`. Returns true if one was removed.
+    pub fn removeBySessionId(self: *Store, alloc: Allocator, session_id: []const u8) bool {
+        if (self.indexOfSessionId(session_id)) |i| {
+            var removed = self.sessions.orderedRemove(i);
+            removed.deinit(alloc);
+            return true;
+        }
+        return false;
+    }
 };
 
 /// JSON wire shape. Forward-compatible: unknown fields are ignored on load,
@@ -343,5 +408,44 @@ test "clearSessions frees entries and keeps capacity" {
     try std.testing.expectEqual(@as(usize, 0), store.sessions.items.len);
     // Reusable after clear.
     try store.add(alloc, "pi", "/c", null, null);
+    try std.testing.expectEqual(@as(usize, 1), store.sessions.items.len);
+}
+
+test "upsertBySessionId inserts, updates, and is idempotent" {
+    const alloc = std.testing.allocator;
+    var store: Store = .{};
+    defer store.deinit(alloc);
+
+    // Insert.
+    try std.testing.expect(try store.upsertBySessionId(alloc, "claude", "/a", "/a", "sid-1"));
+    try std.testing.expectEqual(@as(usize, 1), store.sessions.items.len);
+    // Idempotent: same fields -> no change, no duplicate.
+    try std.testing.expect(!try store.upsertBySessionId(alloc, "claude", "/a", "/a", "sid-1"));
+    try std.testing.expectEqual(@as(usize, 1), store.sessions.items.len);
+    // Update cwd for the same session id -> changed, still one entry.
+    try std.testing.expect(try store.upsertBySessionId(alloc, "claude", "/b", "/b", "sid-1"));
+    try std.testing.expectEqual(@as(usize, 1), store.sessions.items.len);
+    try std.testing.expectEqualStrings("/b", store.sessions.items[0].cwd);
+    // A different session id -> a new entry.
+    try std.testing.expect(try store.upsertBySessionId(alloc, "codex", "/c", null, "sid-2"));
+    try std.testing.expectEqual(@as(usize, 2), store.sessions.items.len);
+    // Empty id / cwd / agent are rejected (no id = nothing to resume).
+    try std.testing.expect(!try store.upsertBySessionId(alloc, "pi", "/d", null, ""));
+    try std.testing.expect(!try store.upsertBySessionId(alloc, "pi", "", null, "sid-3"));
+    try std.testing.expectEqual(@as(usize, 2), store.sessions.items.len);
+}
+
+test "removeBySessionId + indexOfSessionId" {
+    const alloc = std.testing.allocator;
+    var store: Store = .{};
+    defer store.deinit(alloc);
+    try std.testing.expect(try store.upsertBySessionId(alloc, "claude", "/a", null, "sid-1"));
+    try std.testing.expect(try store.upsertBySessionId(alloc, "codex", "/b", null, "sid-2"));
+    try std.testing.expect(store.indexOfSessionId("sid-2") != null);
+    try std.testing.expect(store.removeBySessionId(alloc, "sid-1"));
+    try std.testing.expect(store.indexOfSessionId("sid-1") == null);
+    try std.testing.expectEqual(@as(usize, 1), store.sessions.items.len);
+    // Removing a missing id is a no-op.
+    try std.testing.expect(!store.removeBySessionId(alloc, "nope"));
     try std.testing.expectEqual(@as(usize, 1), store.sessions.items.len);
 }

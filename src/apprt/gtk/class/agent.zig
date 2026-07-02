@@ -148,63 +148,57 @@ pub const Agent = enum {
         };
     }
 
-    /// The shell command that relaunches this agent and resumes a session
-    /// (issue #29: restore running agents across a restart).
+    /// The shell command that relaunches this agent and resumes the EXACT
+    /// session `session_id` (issue #29). simbacode NEVER starts a fresh agent
+    /// session on restore: if we can't resume the exact conversation there is
+    /// nothing to restore, so this returns null when the agent has no verified
+    /// resume-by-id form or when `session_id` is empty. There is deliberately
+    /// NO "continue last" / bare-launch fallback — those would start a new
+    /// session, which is forbidden in simbacode.
     ///
-    /// When `session_id` is non-null we build a session-SPECIFIC resume so a
-    /// restart reopens the EXACT conversation each tab was in — critical when
-    /// several tabs run the same agent (two `codex` tabs must not both reopen
-    /// the single most-recent session). When it is null we fall back to the
-    /// agent's "continue last" form (best-effort for agents/tabs that never
-    /// reported a session id). `generic` returns null: we don't know how to
-    /// launch an unknown agent, so its tab is not restored.
+    /// Only agents whose session-id capture AND resume-by-id have been
+    /// live-verified are eligible (see `canResumeExact`); everything else
+    /// returns null and is never recorded/restored.
     ///
-    /// `buf` is scratch the caller owns; the returned slice may point into it
-    /// (session-specific forms) or be a static literal (fallbacks). It is
-    /// always NUL-terminated so it can be used directly as a `Command.shell`.
-    pub fn resumeCommand(self: Agent, session_id: ?[]const u8, buf: []u8) ?[:0]const u8 {
-        // Session-specific resume when we have an id.
-        if (session_id) |sid| {
-            if (sid.len > 0) {
-                // Per-agent "resume this exact session" prefix; the id is
-                // appended verbatim. Null means the agent has no per-session
-                // resume flag, so we fall through to "continue last" below.
-                const prefix: ?[]const u8 = switch (self) {
-                    .claude => "claude --resume ",
-                    .codex => "codex resume ",
-                    // pi: `--session <id>` reopens a specific session by (partial
-                    // or full) UUID. NOT `--resume`, which is interactive
-                    // selection and takes no argument.
-                    .pi => "pi --session ",
-                    // opencode reopens a session by id.
-                    .opencode => "opencode --session ",
-                    .kiro, .hermes, .openclaw, .generic => null,
-                };
-                if (prefix) |p| {
-                    return std.fmt.bufPrintZ(buf, "{s}{s}", .{ p, sid }) catch null;
-                }
-            }
-        }
-        // Fallback: continue the most recent conversation in the cwd.
-        return switch (self) {
-            .claude => "claude --continue",
-            .codex => "codex resume --last",
-            // pi: `--continue` reopens the most recent session for this cwd.
-            // Bare `pi` would start a FRESH session, losing the conversation.
-            .pi => "pi --continue",
-            .kiro => "kiro",
-            .hermes => "hermes",
-            .opencode => "opencode",
-            .openclaw => "openclaw",
-            .generic => null,
+    /// `buf` is caller-owned scratch; the returned slice points into it and is
+    /// NUL-terminated so it can be used directly as a `Command.shell`.
+    pub fn resumeCommand(self: Agent, session_id: []const u8, buf: []u8) ?[:0]const u8 {
+        if (session_id.len == 0) return null;
+        // Per-agent "resume THIS exact session" prefix; the id is appended
+        // verbatim (the emit side sanitizes the id to [A-Za-z0-9._-]).
+        const prefix: ?[]const u8 = switch (self) {
+            // `claude --resume <id>` reopens a specific session by id.
+            .claude => "claude --resume ",
+            // `codex resume <id>` reopens a specific rollout by id.
+            .codex => "codex resume ",
+            // pi: `--session <id>` reopens a specific session by (partial or
+            // full) UUID. NOT `--resume`, which is an interactive picker.
+            .pi => "pi --session ",
+            // opencode: `--session <id>` (`-s`) reopens a specific session.
+            .opencode => "opencode --session ",
+            // hermes: `--resume <SESSION>` reopens by id or title.
+            .hermes => "hermes --resume ",
+            // Not live-verified (capture and/or resume-by-id unknown). Under
+            // "never start new", these are NOT restorable until verified.
+            .kiro, .openclaw, .generic => null,
         };
+        const p = prefix orelse return null;
+        return std.fmt.bufPrintZ(buf, "{s}{s}", .{ p, session_id }) catch null;
     }
 
-    /// Whether this agent can be relaunched at all (has at least a fallback
-    /// resume form). Used to decide whether a tab is worth persisting.
-    pub fn canResume(self: Agent) bool {
-        var buf: [0]u8 = undefined;
-        return self.resumeCommand(null, &buf) != null;
+    /// Whether this agent has a live-verified session-id capture AND a
+    /// resume-by-EXACT-id command, i.e. it is eligible to be recorded and
+    /// restored. Gates capture, persist, and restore in ONE place so an
+    /// unverified agent can never be fake-restored into a fresh session.
+    ///
+    /// Verified this session (see legion-wiki design doc): pi, claude, codex,
+    /// opencode, hermes. NOT verified: kiro, copilot, openclaw, generic.
+    /// (`copilot` is only in the installer enum, not this UI enum.)
+    pub fn canResumeExact(self: Agent) bool {
+        return switch (self) {
+            .claude, .codex, .pi, .opencode, .hermes => true,
+            .kiro, .openclaw, .generic => false,
+        };
     }
 
     /// Build a new `gio.Icon` (BytesIcon) for this agent. Caller owns a
@@ -237,17 +231,23 @@ test "Agent.name round-trips through parse" {
     }) |a| {
         try testing.expectEqual(a, Agent.parse(a.name()).?);
     }
-    // Every non-generic agent must offer a resume command.
+    // Only live-verified agents are eligible for exact-id resume.
     inline for (.{
-        Agent.claude, Agent.codex,    Agent.pi,       Agent.kiro,
-        Agent.hermes, Agent.opencode, Agent.openclaw,
+        Agent.claude, Agent.codex, Agent.pi, Agent.opencode, Agent.hermes,
     }) |a| {
-        try testing.expect(a.canResume());
+        try testing.expect(a.canResumeExact());
     }
-    try testing.expect(!Agent.generic.canResume());
+    // Unverified agents must NOT be resumable (never fake-restore into fresh).
+    inline for (.{ Agent.kiro, Agent.openclaw, Agent.generic }) |a| {
+        try testing.expect(!a.canResumeExact());
+    }
     var buf: [128]u8 = undefined;
-    try testing.expect(Agent.generic.resumeCommand(null, &buf) == null);
-    // Session-specific resume for agents that support it.
+    // Empty id -> nothing to resume.
+    try testing.expect(Agent.claude.resumeCommand("", &buf) == null);
+    // Ineligible agent -> null even with an id (never starts fresh).
+    try testing.expect(Agent.kiro.resumeCommand("someid", &buf) == null);
+    try testing.expect(Agent.generic.resumeCommand("someid", &buf) == null);
+    // Exact-id resume commands per verified agent.
     try testing.expectEqualStrings(
         "claude --resume abc123",
         Agent.claude.resumeCommand("abc123", &buf).?,
@@ -261,21 +261,14 @@ test "Agent.name round-trips through parse" {
         "pi --session 019f-abc",
         Agent.pi.resumeCommand("019f-abc", &buf).?,
     );
-    // pi's no-id fallback is `--continue` (bare `pi` would start fresh).
     try testing.expectEqualStrings(
-        "pi --continue",
-        Agent.pi.resumeCommand(null, &buf).?,
+        "opencode --session ses_1",
+        Agent.opencode.resumeCommand("ses_1", &buf).?,
     );
-    // Agent without a per-session flag falls back to "continue last" even when
-    // given an id.
+    // hermes now resumes by exact id (previously bugged to bare `hermes`).
     try testing.expectEqualStrings(
-        "kiro",
-        Agent.kiro.resumeCommand("someid", &buf).?,
-    );
-    // Null id -> fallback form.
-    try testing.expectEqualStrings(
-        "claude --continue",
-        Agent.claude.resumeCommand(null, &buf).?,
+        "hermes --resume 20260101_120000_abcd",
+        Agent.hermes.resumeCommand("20260101_120000_abcd", &buf).?,
     );
 }
 

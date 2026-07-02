@@ -897,12 +897,15 @@ fn openCodePluginSource(alloc: Allocator) ![]u8 {
         \\        await emit({s})
         \\      }} else if (event.type === "permission.replied") {{
         \\        await emit({s})
+        \\      }} else if (event.type === "session.deleted") {{
+        \\        // Session gone -> remove its durable restore entry (#29).
+        \\        await emit({s})
         \\      }}
         \\    }},
         \\  }}
         \\}}
         \\
-    , .{ hooks.ownership_marker, j_ss, j_sei, j_busy, j_idle, j_await, j_idle, j_busy });
+    , .{ hooks.ownership_marker, j_ss, j_sei, j_busy, j_idle, j_await, j_idle, j_busy, j_sei });
 }
 
 /// JSON-encode `value` as a double-quoted JS string literal (escapes `"`, `\`,
