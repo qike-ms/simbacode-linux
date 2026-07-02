@@ -1102,20 +1102,19 @@ const pi_extension_index_ts =
     \\  writeToTerminal(`\x1b]3008;${action}=${AGENT};${meta}\x1b\\`);
     \\}
     \\
-    \\// Best-effort per-session identity so simbacode can resume THIS conversation
-    \\// (not just "the last one") after a restart. Pi exposes the id in a few
-    \\// shapes across versions; probe each and fall back to empty (no sessionid).
+    \\// Per-session identity so simbacode can resume THIS conversation (not just
+    \\// "the last one") after a restart. The authoritative source is the
+    \\// ReadonlySessionManager on the extension context: getSessionId() returns
+    \\// the current session's stable id, which changes on resume/fork (so we
+    \\// read it from the ctx handed to the session_start handler, not once at
+    \\// load). Falls back to empty (no sessionid) if unavailable.
     \\function sessionIdOf(ctx: any): string {
     \\  try {
-    \\    const cand =
-    \\      ctx?.sessionId ??
-    \\      ctx?.session?.id ??
-    \\      ctx?.sessionManager?.sessionId ??
-    \\      ctx?.sessionManager?.getSessionId?.() ??
-    \\      ctx?.sessionManager?.session?.id;
-    \\    if (typeof cand === "string" && cand.length > 0) return cand.slice(0, 128);
+    \\    const sm = ctx?.sessionManager;
+    \\    const id = typeof sm?.getSessionId === "function" ? sm.getSessionId() : "";
+    \\    if (typeof id === "string" && id.length > 0) return id.slice(0, 128);
     \\  } catch {
-    \\    // ignore — identity is optional
+    \\    // ignore identity is optional
     \\  }
     \\  return "";
     \\}
@@ -1162,10 +1161,14 @@ const pi_extension_index_ts =
     \\
     \\export default function (pi: ExtensionAPI) {
     \\  if (!isSimbacodeSurface()) return;
-    \\  // Emit session_start carrying this session's id when available, so a
-    \\  // restart can resume the exact conversation (issue #29). Fall back to a
-    \\  // bare session_start (no id) when Pi doesn't expose one.
-    \\  emitPresenceWithSession("session_start", sessionIdOf(pi));
+    \\
+    \\  // Emit session_start from the session_start event so we can read the
+    \\  // session id off ctx.sessionManager (it isn't known at load time, and it
+    \\  // changes on resume/fork). This carries sessionid= so a restart can
+    \\  // resume the EXACT conversation (issue #29). Fired for new/resume/fork.
+    \\  pi.on("session_start", (_event, ctx) => {
+    \\    emitPresenceWithSession("session_start", sessionIdOf(ctx));
+    \\  });
     \\
     \\  pi.on("agent_start", (_event, _ctx) => {
     \\    emitPresence("busy");

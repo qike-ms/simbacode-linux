@@ -172,8 +172,10 @@ pub const Agent = enum {
                 const prefix: ?[]const u8 = switch (self) {
                     .claude => "claude --resume ",
                     .codex => "codex resume ",
-                    // pi resumes a specific session by id.
-                    .pi => "pi --resume ",
+                    // pi: `--session <id>` reopens a specific session by (partial
+                    // or full) UUID. NOT `--resume`, which is interactive
+                    // selection and takes no argument.
+                    .pi => "pi --session ",
                     // opencode reopens a session by id.
                     .opencode => "opencode --session ",
                     .kiro, .hermes, .openclaw, .generic => null,
@@ -187,7 +189,9 @@ pub const Agent = enum {
         return switch (self) {
             .claude => "claude --continue",
             .codex => "codex resume --last",
-            .pi => "pi",
+            // pi: `--continue` reopens the most recent session for this cwd.
+            // Bare `pi` would start a FRESH session, losing the conversation.
+            .pi => "pi --continue",
             .kiro => "kiro",
             .hermes => "hermes",
             .opencode => "opencode",
@@ -251,6 +255,16 @@ test "Agent.name round-trips through parse" {
     try testing.expectEqualStrings(
         "codex resume xyz",
         Agent.codex.resumeCommand("xyz", &buf).?,
+    );
+    // pi uses `--session <id>` (not `--resume`, which is interactive).
+    try testing.expectEqualStrings(
+        "pi --session 019f-abc",
+        Agent.pi.resumeCommand("019f-abc", &buf).?,
+    );
+    // pi's no-id fallback is `--continue` (bare `pi` would start fresh).
+    try testing.expectEqualStrings(
+        "pi --continue",
+        Agent.pi.resumeCommand(null, &buf).?,
     );
     // Agent without a per-session flag falls back to "continue last" even when
     // given an id.
