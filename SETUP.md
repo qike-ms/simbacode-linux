@@ -47,6 +47,23 @@ Build takes ~90s. Binary lands at `zig-out/bin/ghostty`.
 
 ## Install the binary for everyday use
 
+Use the install script — it builds with the right env and installs atomically,
+so it works **even while an old simbacode is still running** (a plain `cp`
+fails with `Text file busy`/ETXTBSY when the target is mapped by a live
+process):
+
+```bash
+scripts/install-binary.sh              # build (ReleaseFast) + install
+scripts/install-binary.sh --no-build   # install the existing zig-out binary
+```
+
+It writes `~/.local/bin/simbacode.new.$$`, then `mv -f` over the target: the
+running process keeps its old inode, and the **next launch** picks up the new
+binary. If a simbacode is still running the old build, the script says so —
+fully quit and relaunch to pick up the new one.
+
+Manual equivalent (fails with `Text file busy` if simbacode is running):
+
 ```bash
 cp zig-out/bin/ghostty ~/.local/bin/simbacode
 chmod +x ~/.local/bin/simbacode
