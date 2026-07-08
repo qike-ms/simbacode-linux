@@ -397,7 +397,7 @@ pub const Window = extern struct {
         toast_overlay: *adw.ToastOverlay,
         split_view: *adw.OverlaySplitView,
         sidebar_list: *gtk.ListBox,
-        sidebar_add_button: *gtk.Button,
+        sidebar_add_button: *adw.SplitButton,
 
         /// simbacode (#10): title-bar repo + user identity chip widgets.
         identity_chip: *gtk.Box,
@@ -545,6 +545,9 @@ pub const Window = extern struct {
             // TODO: accept the surface that toggled the command palette
             .init("toggle-command-palette", actionToggleCommandPalette, null),
             .init("toggle-inspector", actionToggleInspector, null),
+            // simbacode (#31): sidebar Add-Folder menu entries. The string
+            // parameter is the directory to open the picker at ("" = last).
+            .init("sidebar-add-at", actionSidebarAddAt, s_variant_type),
         };
 
         ext.actions.add(Self, self, &actions);
@@ -1919,6 +1922,10 @@ pub const Window = extern struct {
         self.refreshSidebar();
         priv.sidebar_timer = glib.timeoutAdd(5000, sidebarPollTimer, self);
 
+        // Build the Add-Folder menu now that the store (and its last_folder)
+        // is loaded (#31).
+        self.rebuildSidebarAddMenu();
+
         // Start the agent-presence liveness sweep (AgentPresenceFeature
         // livenessSweepInterval = 2s). Reaps presence whose local pid is dead.
         priv.liveness_timer = glib.timeoutAdd(2000, livenessSweepTimer, self);
@@ -2021,21 +2028,109 @@ pub const Window = extern struct {
         }
     }
 
-    /// Handler for the sidebar header `+` button: present a folder picker and,
-    /// on selection, add the chosen path to the persisted store and rescan.
-    fn sidebarAddClicked(_: *gtk.Button, self: *Window) callconv(.c) void {
+    /// Rebuild the sidebar Add-Folder dropdown menu (#31). The primary button
+    /// click browses at the last-used location; this dropdown lists the
+    /// last-used folder and each of its ancestor directories up to the
+    /// filesystem root, so the user can jump straight to a grandparent (e.g.
+    /// ~/git) rather than re-navigating from the last child folder.
+    ///
+    /// Called on realize and after every add (the ancestor list depends on the
+    /// last-used folder, which changes on add). The menu is attached to the
+    /// `sidebar_add_button` SplitButton dropdown.
+    fn rebuildSidebarAddMenu(self: *Window) void {
+        const priv = self.private();
+        const alloc = Application.default().allocator();
+        const menu = gio.Menu.new();
+        defer menu.unref();
+
+        // The last-used folder and its ancestors, each opening the picker
+        // rooted there. Ordered nearest-first, ascending to the filesystem
+        // root. Capped so a pathological path can't build a huge menu. When
+        // there is no last folder yet the dropdown is empty (the primary click
+        // still browses from $HOME).
+        var n_items: usize = 0;
+        if (priv.sidebar_store.last_folder) |lf| {
+            var dir: []const u8 = std.mem.sliceTo(lf, 0);
+            // Trim trailing slashes (keep a lone "/").
+            while (dir.len > 1 and dir[dir.len - 1] == '/') dir = dir[0 .. dir.len - 1];
+
+            while (n_items < 24) : (n_items += 1) {
+                const label_z = alloc.dupeZ(u8, dir) catch break;
+                defer alloc.free(label_z);
+
+                const item = gio.MenuItem.new(label_z, null);
+                defer item.unref();
+                // set_action_and_target_value consumes the floating variant.
+                const target = glib.Variant.newString(label_z);
+                item.setActionAndTargetValue("win.sidebar-add-at", target);
+                menu.appendItem(item);
+
+                // Ascend to the parent; stop once we can't go higher.
+                const parent = std.fs.path.dirname(dir) orelse break;
+                if (parent.len == 0 or std.mem.eql(u8, parent, dir)) break;
+                dir = parent;
+            }
+        }
+
+        // Attach the menu only when it has entries; otherwise leave the
+        // dropdown without a model so it presents nothing rather than an empty
+        // popover (first run, before any folder has been added).
+        if (n_items > 0) {
+            priv.sidebar_add_button.setMenuModel(menu.as(gio.MenuModel));
+        } else {
+            priv.sidebar_add_button.setMenuModel(null);
+        }
+    }
+
+    /// Primary-click handler for the sidebar Add-Folder SplitButton (#21, #31):
+    /// open the native folder picker at the last-used location.
+    fn sidebarAddClicked(_: *adw.SplitButton, self: *Window) callconv(.c) void {
+        self.presentAddFolderPicker(null);
+    }
+
+    /// Action handler for a sidebar Add-Folder menu entry (#31). The string
+    /// parameter is the directory to open the native picker at; an empty
+    /// string means "use the last-used location".
+    fn actionSidebarAddAt(
+        _: *gio.SimpleAction,
+        param_: ?*glib.Variant,
+        self: *Window,
+    ) callconv(.c) void {
+        var start_dir: ?[]const u8 = null;
+        if (param_) |param| {
+            var str: ?[*:0]const u8 = null;
+            param.get("&s", &str);
+            if (str) |s| {
+                const slice = std.mem.span(s);
+                if (slice.len > 0) start_dir = slice;
+            }
+        }
+        self.presentAddFolderPicker(start_dir);
+    }
+
+    /// Present the native folder picker for adding a sidebar root (#21, #31).
+    /// `start_dir`, when non-null, is the directory to open at; otherwise it
+    /// falls back to the last-used folder.
+    fn presentAddFolderPicker(self: *Window, start_dir: ?[]const u8) void {
         const dialog = gtk.FileDialog.new();
         // The dialog holds its own ref while presented; release ours after.
         defer dialog.unref();
         dialog.setTitle("Add Folder");
         dialog.setModal(@intFromBool(true));
 
-        // Reopen where the user last browsed so adding several folders from the
-        // same parent (e.g. ~/git) doesn't re-navigate from scratch each time.
-        if (self.private().sidebar_store.last_folder) |lf| {
-            const gfile = gio.File.newForPath(lf);
-            defer gfile.unref();
-            dialog.setInitialFolder(gfile);
+        // Open at the requested directory, else where the user last browsed so
+        // adding several folders from the same parent (e.g. ~/git) doesn't
+        // re-navigate from scratch each time.
+        const initial: ?[]const u8 = start_dir orelse
+            (if (self.private().sidebar_store.last_folder) |lf| std.mem.sliceTo(lf, 0) else null);
+        if (initial) |path| {
+            const path_z = Application.default().allocator().dupeZ(u8, path) catch null;
+            if (path_z) |pz| {
+                defer Application.default().allocator().free(pz);
+                const gfile = gio.File.newForPath(pz);
+                defer gfile.unref();
+                dialog.setInitialFolder(gfile);
+            }
         }
 
         // Keep the window alive across the async callback.
@@ -2097,6 +2192,9 @@ pub const Window = extern struct {
         sidebar_store.save(alloc, &priv.sidebar_store) catch |err| {
             log.warn("sidebar: cannot persist after add: {}", .{err});
         };
+        // Refresh the Add-Folder menu: its ancestor list keys off last_folder,
+        // which we just updated (#31).
+        self.rebuildSidebarAddMenu();
         if (!added) return; // already present; nothing new to scan
         self.refreshSidebar();
     }

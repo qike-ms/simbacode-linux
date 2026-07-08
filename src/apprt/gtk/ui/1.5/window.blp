@@ -29,11 +29,15 @@ template $GhosttyWindow: Adw.ApplicationWindow {
           title: _("Worktrees");
         };
 
-        // simbacode (#21): add a project folder to the sidebar. Opens a
-        // Gtk.FileDialog folder picker; the chosen root is persisted to
-        // ~/.simbacode/sidebar.json and scanned for worktrees.
+        // simbacode (#21, #31): add a project folder to the sidebar. Primary
+        // click opens the native folder picker at the last-used location; the
+        // dropdown offers one-click entries for the last-used folder and each
+        // of its ancestor directories, so you can jump straight to e.g. ~/git
+        // instead of re-navigating. The chosen root is persisted to
+        // ~/.simbacode/sidebar.json and scanned for worktrees. The menu-model
+        // is built dynamically in window.zig.
         [end]
-        Gtk.Button sidebar_add_button {
+        Adw.SplitButton sidebar_add_button {
           icon-name: "list-add-symbolic";
           tooltip-text: _("Add Folder…");
           clicked => $sidebar_add_clicked();
