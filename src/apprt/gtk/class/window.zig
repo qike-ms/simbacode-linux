@@ -549,6 +549,7 @@ pub const Window = extern struct {
             // simbacode (#31): sidebar Add-Folder menu entries. The string
             // parameter is the directory to open the picker at ("" = last).
             .init("sidebar-add-at", actionSidebarAddAt, s_variant_type),
+            .init("sidebar-add-remote", actionSidebarAddRemote, null),
         };
 
         ext.actions.add(Self, self, &actions);
@@ -2044,13 +2045,25 @@ pub const Window = extern struct {
         const menu = gio.Menu.new();
         defer menu.unref();
 
+        // Section: remote repositories (#32). Always present so a remote can be
+        // added even before any local folder exists.
+        {
+            const remote_section = gio.Menu.new();
+            defer remote_section.unref();
+            const item = gio.MenuItem.new("Add Remote (SSH)…", "win.sidebar-add-remote");
+            defer item.unref();
+            remote_section.appendItem(item);
+            menu.appendSection(null, remote_section.as(gio.MenuModel));
+        }
+
         // The last-used folder and its ancestors, each opening the picker
         // rooted there. Ordered nearest-first, ascending to the filesystem
-        // root. Capped so a pathological path can't build a huge menu. When
-        // there is no last folder yet the dropdown is empty (the primary click
-        // still browses from $HOME).
+        // root. Capped so a pathological path can't build a huge menu. Placed
+        // in its own section (below the remote entry).
         var n_items: usize = 0;
         if (priv.sidebar_store.last_folder) |lf| {
+            const ancestors = gio.Menu.new();
+            defer ancestors.unref();
             var dir: []const u8 = std.mem.sliceTo(lf, 0);
             // Trim trailing slashes (keep a lone "/").
             while (dir.len > 1 and dir[dir.len - 1] == '/') dir = dir[0 .. dir.len - 1];
@@ -2064,23 +2077,18 @@ pub const Window = extern struct {
                 // set_action_and_target_value consumes the floating variant.
                 const target = glib.Variant.newString(label_z);
                 item.setActionAndTargetValue("win.sidebar-add-at", target);
-                menu.appendItem(item);
+                ancestors.appendItem(item);
 
                 // Ascend to the parent; stop once we can't go higher.
                 const parent = std.fs.path.dirname(dir) orelse break;
                 if (parent.len == 0 or std.mem.eql(u8, parent, dir)) break;
                 dir = parent;
             }
+            if (n_items > 0) menu.appendSection("Recent locations", ancestors.as(gio.MenuModel));
         }
 
-        // Attach the menu only when it has entries; otherwise leave the
-        // dropdown without a model so it presents nothing rather than an empty
-        // popover (first run, before any folder has been added).
-        if (n_items > 0) {
-            priv.sidebar_add_button.setMenuModel(menu.as(gio.MenuModel));
-        } else {
-            priv.sidebar_add_button.setMenuModel(null);
-        }
+        // The menu always has at least the remote entry, so always attach it.
+        priv.sidebar_add_button.setMenuModel(menu.as(gio.MenuModel));
     }
 
     /// Primary-click handler for the sidebar Add-Folder SplitButton (#21, #31):
@@ -2107,6 +2115,126 @@ pub const Window = extern struct {
             }
         }
         self.presentAddFolderPicker(start_dir);
+    }
+
+    /// Heap context carrying the form's entry rows from the dialog handler to
+    /// the async response callback (#32). Freed in the callback.
+    const AddRemoteCtx = struct {
+        window: *Window,
+        host_row: *adw.EntryRow,
+        user_row: *adw.EntryRow,
+        port_row: *adw.EntryRow,
+        path_row: *adw.EntryRow,
+    };
+
+    /// Action handler for "Add Remote (SSH)…" (#32): present a small form
+    /// (host, user, port, remote path) and, on confirm, add a remote root and
+    /// rescan. The remote path must be absolute.
+    fn actionSidebarAddRemote(
+        _: *gio.SimpleAction,
+        _: ?*glib.Variant,
+        self: *Window,
+    ) callconv(.c) void {
+        const dialog = adw.AlertDialog.new("Add Remote Repository", null);
+        dialog.setBody("Connect to a repository over SSH. The host is an ssh alias or hostname; the path is the absolute path to the repository on that host.");
+
+        const group = adw.PreferencesGroup.new();
+        const host_row = adw.EntryRow.new();
+        host_row.as(gtk.ListBoxRow).setSelectable(@intFromBool(false));
+        host_row.as(adw.PreferencesRow).setTitle("Host (ssh alias or hostname)");
+        const user_row = adw.EntryRow.new();
+        user_row.as(adw.PreferencesRow).setTitle("User (optional)");
+        const port_row = adw.EntryRow.new();
+        port_row.as(adw.PreferencesRow).setTitle("Port (optional)");
+        const path_row = adw.EntryRow.new();
+        path_row.as(adw.PreferencesRow).setTitle("Remote path (absolute)");
+        group.add(host_row.as(gtk.Widget));
+        group.add(user_row.as(gtk.Widget));
+        group.add(port_row.as(gtk.Widget));
+        group.add(path_row.as(gtk.Widget));
+        dialog.setExtraChild(group.as(gtk.Widget));
+
+        dialog.addResponse("cancel", "Cancel");
+        dialog.addResponse("add", "Add");
+        dialog.setResponseAppearance("add", .suggested);
+        dialog.setDefaultResponse("add");
+        dialog.setCloseResponse("cancel");
+
+        const alloc = Application.default().allocator();
+        const ctx = alloc.create(AddRemoteCtx) catch return;
+        ctx.* = .{
+            .window = self,
+            .host_row = host_row,
+            .user_row = user_row,
+            .port_row = port_row,
+            .path_row = path_row,
+        };
+        // Keep the window alive across the async callback.
+        _ = self.ref();
+        dialog.choose(self.as(gtk.Widget), null, addRemoteResponse, ctx);
+    }
+
+    fn addRemoteResponse(
+        source: ?*gobject.Object,
+        res: *gio.AsyncResult,
+        ud: ?*anyopaque,
+    ) callconv(.c) void {
+        const ctx: *AddRemoteCtx = @ptrCast(@alignCast(ud orelse return));
+        const alloc = Application.default().allocator();
+        defer alloc.destroy(ctx);
+        const self = ctx.window;
+        defer self.unref();
+        const dialog = gobject.ext.cast(adw.AlertDialog, source orelse return) orelse return;
+        const response = dialog.chooseFinish(res);
+        if (!std.mem.eql(u8, std.mem.span(response), "add")) return;
+
+        // Read the form fields (Editable.getText on each EntryRow).
+        const host_text = std.mem.span(ctx.host_row.as(gtk.Editable).getText());
+        const user_text = std.mem.span(ctx.user_row.as(gtk.Editable).getText());
+        const port_text = std.mem.span(ctx.port_row.as(gtk.Editable).getText());
+        const path_text = std.mem.span(ctx.path_row.as(gtk.Editable).getText());
+
+        const host_trim = std.mem.trim(u8, host_text, " \t");
+        const path_trim = std.mem.trim(u8, path_text, " \t");
+        const user_trim = std.mem.trim(u8, user_text, " \t");
+        const port_trim = std.mem.trim(u8, port_text, " \t");
+
+        if (host_trim.len == 0) {
+            self.addToast("Remote host is required");
+            return;
+        }
+        if (path_trim.len == 0 or !std.fs.path.isAbsolute(path_trim)) {
+            self.addToast("Remote path must be absolute");
+            return;
+        }
+        const port: ?u16 = if (port_trim.len > 0)
+            (std.fmt.parseInt(u16, port_trim, 10) catch {
+                self.addToast("Port must be a number");
+                return;
+            })
+        else
+            null;
+
+        const priv = self.private();
+        const spec: sidebar_store.RemoteSpec = .{
+            .alias = alloc.dupeZ(u8, host_trim) catch return,
+            .username = if (user_trim.len > 0) (alloc.dupeZ(u8, user_trim) catch null) else null,
+            .port = port,
+        };
+        defer spec.deinit(alloc);
+
+        const added = priv.sidebar_store.addRemote(alloc, spec, path_trim) catch |err| {
+            log.warn("sidebar: cannot add remote root {s}: {}", .{ path_trim, err });
+            return;
+        };
+        sidebar_store.save(alloc, &priv.sidebar_store) catch |err| {
+            log.warn("sidebar: cannot persist after add remote: {}", .{err});
+        };
+        if (!added) {
+            self.addToast("That remote is already in the sidebar");
+            return;
+        }
+        self.refreshSidebar();
     }
 
     /// Present the native folder picker for adding a sidebar root (#21, #31).
@@ -2578,9 +2706,28 @@ pub const Window = extern struct {
         const had_tabs = view.getNPages() > 0;
         self.switchToWorktreeView(view);
 
-        // First visit: open an initial terminal in the worktree's cwd.
+        // First visit: open an initial terminal in the worktree's cwd. For a
+        // remote worktree (#32) the terminal is an ssh session cd'd into the
+        // remote path (over the shared ControlMaster); for a local worktree we
+        // just set the working directory.
         if (!had_tabs) {
-            self.newTabForWindow(null, .{ .working_directory = st.path });
+            if (st.host) |*h| {
+                const alloc = Application.default().allocator();
+                const ssh_host = h.asSshHost();
+                const cmd_line = ssh_command.terminalCommandLine(
+                    alloc,
+                    ssh_host,
+                    st.path,
+                    ssh_command.default_control_path,
+                ) catch |err| {
+                    log.warn("worktree: cannot build ssh command for {s}: {}", .{ st.path, err });
+                    return;
+                };
+                defer alloc.free(cmd_line);
+                self.newTabForWindow(null, .{ .command = .{ .shell = cmd_line } });
+            } else {
+                self.newTabForWindow(null, .{ .working_directory = st.path });
+            }
         } else if (self.getActiveSurface()) |surface| {
             // Existing view: focus its active surface's input so the user can
             // type immediately (not the outer widget — see grabFocus note).

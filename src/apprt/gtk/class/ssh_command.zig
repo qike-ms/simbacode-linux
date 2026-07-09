@@ -249,7 +249,7 @@ pub fn terminalCommandLine(
     host: RemoteHost,
     working_directory: ?[]const u8,
     control_path: []const u8,
-) ![]u8 {
+) ![:0]u8 {
     // The remote command is a login shell; cd into the worktree first.
     const remote_script: []u8 = if (working_directory) |wd| blk: {
         const dir_q = try shellQuote(alloc, wd);
@@ -286,7 +286,7 @@ pub fn terminalCommandLine(
     try line.append(alloc, ' ');
     try line.appendSlice(alloc, script_q);
 
-    return line.toOwnedSlice(alloc);
+    return line.toOwnedSliceSentinel(alloc, 0);
 }
 
 /// Free an argv produced by `invocation`.
