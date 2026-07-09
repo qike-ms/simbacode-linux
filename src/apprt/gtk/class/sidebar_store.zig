@@ -14,13 +14,51 @@ const Allocator = std.mem.Allocator;
 
 const log = std.log.scoped(.simbacode_sidebar);
 
-/// Current on-disk schema version for the Linux sidebar store.
-pub const schema_version: u32 = 1;
+/// Current on-disk schema version for the Linux sidebar store. v2 adds an
+/// optional per-root `host` for remote (SSH) repositories (#32); v1 files
+/// (flat string roots) still load — a v1 root becomes a local Root.
+pub const schema_version: u32 = 2;
+
+/// A remote SSH host a root can live on (#32). Mirrors ssh_command.RemoteHost
+/// but owns its strings for persistence. `null` host on a Root means local.
+pub const RemoteSpec = struct {
+    alias: [:0]u8,
+    username: ?[:0]u8 = null,
+    port: ?u16 = null,
+
+    pub fn deinit(self: *const RemoteSpec, alloc: Allocator) void {
+        alloc.free(self.alias);
+        if (self.username) |u| alloc.free(u);
+    }
+
+    fn dupe(self: *const RemoteSpec, alloc: Allocator) !RemoteSpec {
+        const alias_copy = try alloc.dupeZ(u8, self.alias);
+        errdefer alloc.free(alias_copy);
+        const user_copy: ?[:0]u8 = if (self.username) |u| try alloc.dupeZ(u8, u) else null;
+        return .{ .alias = alias_copy, .username = user_copy, .port = self.port };
+    }
+};
+
+/// A user-added project root. `path` is absolute (local filesystem path, or
+/// the remote absolute path when `host` is set). `host` null = local.
+pub const Root = struct {
+    path: [:0]u8,
+    host: ?RemoteSpec = null,
+
+    pub fn deinit(self: *const Root, alloc: Allocator) void {
+        alloc.free(self.path);
+        if (self.host) |*h| h.deinit(alloc);
+    }
+
+    pub fn isRemote(self: *const Root) bool {
+        return self.host != null;
+    }
+};
 
 /// In-memory model of the persisted sidebar state. Owns its strings.
 pub const Store = struct {
-    /// User-added project roots (absolute paths). Order is preserved.
-    roots: std.ArrayListUnmanaged([:0]u8) = .empty,
+    /// User-added project roots. Order is preserved.
+    roots: std.ArrayListUnmanaged(Root) = .empty,
 
     /// Last directory the user browsed from in the `+` Add Folder picker
     /// (absolute path). Used to reopen the picker where they left off so
@@ -29,7 +67,7 @@ pub const Store = struct {
     last_folder: ?[:0]u8 = null,
 
     pub fn deinit(self: *Store, alloc: Allocator) void {
-        for (self.roots.items) |r| alloc.free(r);
+        for (self.roots.items) |*r| r.deinit(alloc);
         self.roots.deinit(alloc);
         if (self.last_folder) |lf| alloc.free(lf);
     }
@@ -43,42 +81,109 @@ pub const Store = struct {
         self.last_folder = copy;
     }
 
-    /// True if `path` is already present in the roots list.
-    pub fn contains(self: *const Store, path: []const u8) bool {
-        for (self.roots.items) |r| {
-            if (std.mem.eql(u8, r, path)) return true;
+    /// Index of the root whose path matches (local roots only, since a remote
+    /// path can collide with a local one). Returns null if absent.
+    fn indexOfLocal(self: *const Store, path: []const u8) ?usize {
+        for (self.roots.items, 0..) |*r, i| {
+            if (r.host == null and std.mem.eql(u8, r.path, path)) return i;
         }
-        return false;
+        return null;
     }
 
-    /// Add `path` if not already present. Returns true if it was added.
+    /// True if a LOCAL root with `path` is already present.
+    pub fn contains(self: *const Store, path: []const u8) bool {
+        return self.indexOfLocal(path) != null;
+    }
+
+    /// Add a LOCAL `path` if not already present. Returns true if it was added.
     /// Takes ownership of a fresh copy of `path`.
     pub fn add(self: *Store, alloc: Allocator, path: []const u8) !bool {
         if (self.contains(path)) return false;
         const copy = try alloc.dupeZ(u8, path);
         errdefer alloc.free(copy);
-        try self.roots.append(alloc, copy);
+        try self.roots.append(alloc, .{ .path = copy, .host = null });
         return true;
     }
 
-    /// Remove `path` if present. Returns true if it was removed.
+    /// True if a REMOTE root with the same host authority + path is present.
+    pub fn containsRemote(self: *const Store, host: RemoteSpec, path: []const u8) bool {
+        return self.indexOfRemote(host, path) != null;
+    }
+
+    fn indexOfRemote(self: *const Store, host: RemoteSpec, path: []const u8) ?usize {
+        for (self.roots.items, 0..) |*r, i| {
+            const rh = r.host orelse continue;
+            if (!std.mem.eql(u8, r.path, path)) continue;
+            if (!std.mem.eql(u8, rh.alias, host.alias)) continue;
+            const user_same = blk: {
+                if (rh.username) |a| {
+                    break :blk if (host.username) |b| std.mem.eql(u8, a, b) else false;
+                } else break :blk host.username == null;
+            };
+            if (!user_same) continue;
+            if (rh.port != host.port) continue;
+            return i;
+        }
+        return null;
+    }
+
+    /// Add a REMOTE root (host + absolute remote path). Returns true if added.
+    /// Takes ownership of fresh copies of all strings.
+    pub fn addRemote(self: *Store, alloc: Allocator, host: RemoteSpec, path: []const u8) !bool {
+        if (self.containsRemote(host, path)) return false;
+        const host_copy = try host.dupe(alloc);
+        errdefer host_copy.deinit(alloc);
+        const path_copy = try alloc.dupeZ(u8, path);
+        errdefer alloc.free(path_copy);
+        try self.roots.append(alloc, .{ .path = path_copy, .host = host_copy });
+        return true;
+    }
+
+    /// Remove a LOCAL root by `path` if present. Returns true if it was removed.
     pub fn remove(self: *Store, alloc: Allocator, path: []const u8) bool {
-        for (self.roots.items, 0..) |r, i| {
-            if (std.mem.eql(u8, r, path)) {
-                const removed = self.roots.orderedRemove(i);
-                alloc.free(removed);
-                return true;
-            }
+        if (self.indexOfLocal(path)) |i| {
+            var removed = self.roots.orderedRemove(i);
+            removed.deinit(alloc);
+            return true;
+        }
+        return false;
+    }
+
+    /// Remove a REMOTE root by host + path if present. Returns true if removed.
+    pub fn removeRemote(self: *Store, alloc: Allocator, host: RemoteSpec, path: []const u8) bool {
+        if (self.indexOfRemote(host, path)) |i| {
+            var removed = self.roots.orderedRemove(i);
+            removed.deinit(alloc);
+            return true;
         }
         return false;
     }
 };
 
-/// JSON wire shape. Kept intentionally minimal and forward-compatible: unknown
-/// fields are ignored on load, and absence of the file means "start empty"
-/// (issue #21 migration rule: do NOT auto-import `~/git`).
+/// JSON wire shape. Forward-compatible: unknown fields are ignored on load.
+/// v1 used `roots: []string`; v2 uses `roots: []WireRoot`. We accept BOTH on
+/// load (see loadFrom) by trying the structured shape first, then the legacy
+/// string shape, so old files upgrade transparently.
+const WireRemote = struct {
+    alias: []const u8 = "",
+    username: ?[]const u8 = null,
+    port: ?u16 = null,
+};
+
+const WireRoot = struct {
+    path: []const u8 = "",
+    host: ?WireRemote = null,
+};
+
 const Wire = struct {
     schemaVersion: u32 = schema_version,
+    roots: []const WireRoot = &.{},
+    lastFolder: ?[]const u8 = null,
+};
+
+/// Legacy v1 wire shape (flat string roots), accepted on load for migration.
+const WireV1 = struct {
+    schemaVersion: u32 = 1,
     roots: []const []const u8 = &.{},
     lastFolder: ?[]const u8 = null,
 };
@@ -134,41 +239,87 @@ pub fn loadFrom(alloc: Allocator, path: []const u8) Store {
     };
     defer alloc.free(data);
 
+    // Parse the v2 shape first (structured roots). If that fails, fall back
+    // to the legacy v1 shape (flat string roots) so old files upgrade
+    // transparently. A file that parses as neither yields an empty store.
     const parsed = std.json.parseFromSlice(
         Wire,
         alloc,
         data,
         .{ .ignore_unknown_fields = true },
-    ) catch |err| {
-        log.warn("sidebar: cannot parse {s}: {} (starting empty)", .{ path, err });
-        return store;
+    ) catch {
+        return loadV1(alloc, data);
     };
     defer parsed.deinit();
 
     for (parsed.value.roots) |r| {
-        // Skip empty and non-absolute entries. `scanPaths` feeds roots to
-        // `std.fs.openDirAbsolute`, whose `assert(isAbsolute)` would PANIC
-        // (not return an error) on a relative path — a hand-edited or foreign
-        // `sidebar.json` must never be able to crash startup. This upholds the
-        // module's crash-tolerance contract.
-        if (r.len == 0 or !std.fs.path.isAbsolute(r)) {
-            if (r.len > 0) log.warn("sidebar: skipping non-absolute root {s}", .{r});
+        // Skip empty and non-absolute paths. `scanPaths` feeds local roots to
+        // `std.fs.openDirAbsolute`, whose `assert(isAbsolute)` would PANIC on a
+        // relative path — a hand-edited/foreign file must never crash startup.
+        if (r.path.len == 0 or !std.fs.path.isAbsolute(r.path)) {
+            if (r.path.len > 0) log.warn("sidebar: skipping non-absolute root {s}", .{r.path});
             continue;
         }
-        _ = store.add(alloc, r) catch |err| {
-            log.debug("sidebar: skipping root {s}: {}", .{ r, err });
-            continue;
-        };
+        if (r.host) |h| {
+            if (h.alias.len == 0) {
+                log.warn("sidebar: skipping remote root with empty host: {s}", .{r.path});
+                continue;
+            }
+            const spec: RemoteSpec = .{
+                .alias = alloc.dupeZ(u8, h.alias) catch continue,
+                .username = if (h.username) |u| (if (u.len > 0) alloc.dupeZ(u8, u) catch null else null) else null,
+                .port = h.port,
+            };
+            // addRemote dupes its inputs, so free our temporary spec after.
+            defer spec.deinit(alloc);
+            _ = store.addRemote(alloc, spec, r.path) catch |err| {
+                log.debug("sidebar: skipping remote root {s}: {}", .{ r.path, err });
+                continue;
+            };
+        } else {
+            _ = store.add(alloc, r.path) catch |err| {
+                log.debug("sidebar: skipping root {s}: {}", .{ r.path, err });
+                continue;
+            };
+        }
     }
 
     // Restore the last-browsed folder for the `+` picker. Ignore non-absolute
-    // values (hand-edited / foreign files) — they'd be useless as an initial
-    // folder anyway.
+    // values (hand-edited / foreign files) — useless as an initial folder.
     if (parsed.value.lastFolder) |lf| {
         if (lf.len > 0 and std.fs.path.isAbsolute(lf)) {
             store.setLastFolder(alloc, lf) catch |err| {
                 log.debug("sidebar: cannot restore last folder: {}", .{err});
             };
+        }
+    }
+    return store;
+}
+
+/// Load the legacy v1 shape (flat string roots). Returns an empty store on
+/// parse failure. Local-only (v1 had no remote concept).
+fn loadV1(alloc: Allocator, data: []const u8) Store {
+    var store: Store = .{};
+    const parsed = std.json.parseFromSlice(
+        WireV1,
+        alloc,
+        data,
+        .{ .ignore_unknown_fields = true },
+    ) catch |err| {
+        log.warn("sidebar: cannot parse (v1) {} (starting empty)", .{err});
+        return store;
+    };
+    defer parsed.deinit();
+    for (parsed.value.roots) |r| {
+        if (r.len == 0 or !std.fs.path.isAbsolute(r)) {
+            if (r.len > 0) log.warn("sidebar: skipping non-absolute root {s}", .{r});
+            continue;
+        }
+        _ = store.add(alloc, r) catch continue;
+    }
+    if (parsed.value.lastFolder) |lf| {
+        if (lf.len > 0 and std.fs.path.isAbsolute(lf)) {
+            store.setLastFolder(alloc, lf) catch {};
         }
     }
     return store;
@@ -194,13 +345,22 @@ pub fn saveTo(alloc: Allocator, path: []const u8, store: *const Store) !void {
         };
     }
 
-    // Build the JSON payload.
-    var roots = try alloc.alloc([]const u8, store.roots.items.len);
-    defer alloc.free(roots);
-    for (store.roots.items, 0..) |r, i| roots[i] = r;
+    // Build the JSON payload (v2 structured roots).
+    var wire_roots = try alloc.alloc(WireRoot, store.roots.items.len);
+    defer alloc.free(wire_roots);
+    for (store.roots.items, 0..) |*r, i| {
+        wire_roots[i] = .{
+            .path = r.path,
+            .host = if (r.host) |*h| WireRemote{
+                .alias = h.alias,
+                .username = if (h.username) |u| u else null,
+                .port = h.port,
+            } else null,
+        };
+    }
     const wire: Wire = .{
         .schemaVersion = schema_version,
-        .roots = roots,
+        .roots = wire_roots,
         .lastFolder = store.last_folder,
     };
 
@@ -237,7 +397,7 @@ test "store add/remove/contains" {
     try std.testing.expect(store.remove(alloc, "/a"));
     try std.testing.expect(!store.remove(alloc, "/a"));
     try std.testing.expectEqual(@as(usize, 1), store.roots.items.len);
-    try std.testing.expect(std.mem.eql(u8, store.roots.items[0], "/b"));
+    try std.testing.expect(std.mem.eql(u8, store.roots.items[0].path, "/b"));
 }
 
 test "loadFrom missing file yields empty store" {
@@ -360,4 +520,95 @@ test "loadFrom skips non-absolute roots" {
     try std.testing.expectEqual(@as(usize, 1), store.roots.items.len);
     try std.testing.expect(store.contains("/abs/keep"));
     try std.testing.expect(!store.contains("relative/path"));
+}
+
+test "loadFrom migrates a v1 (flat string roots) file" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir = try tmp.dir.realpathAlloc(alloc, ".");
+    defer alloc.free(dir);
+    const path = try std.fs.path.join(alloc, &.{ dir, "sidebar.json" });
+    defer alloc.free(path);
+    try tmp.dir.writeFile(.{
+        .sub_path = "sidebar.json",
+        .data =
+        \\{ "schemaVersion": 1, "roots": ["/home/u/a", "/home/u/b"], "lastFolder": "/home/u" }
+        ,
+    });
+
+    var store = loadFrom(alloc, path);
+    defer store.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 2), store.roots.items.len);
+    try std.testing.expect(store.contains("/home/u/a"));
+    try std.testing.expect(store.contains("/home/u/b"));
+    try std.testing.expect(store.roots.items[0].host == null);
+    try std.testing.expect(store.last_folder != null);
+    try std.testing.expectEqualStrings("/home/u", store.last_folder.?);
+}
+
+test "addRemote + containsRemote + remove distinguish host" {
+    const alloc = std.testing.allocator;
+    var store: Store = .{};
+    defer store.deinit(alloc);
+
+    const host_a: RemoteSpec = .{ .alias = try alloc.dupeZ(u8, "server"), .username = try alloc.dupeZ(u8, "alice"), .port = 2222 };
+    defer host_a.deinit(alloc);
+    const host_b: RemoteSpec = .{ .alias = try alloc.dupeZ(u8, "server"), .username = null, .port = null };
+    defer host_b.deinit(alloc);
+
+    try std.testing.expect(try store.addRemote(alloc, host_a, "/srv/proj"));
+    // Same host + path again: rejected.
+    try std.testing.expect(!try store.addRemote(alloc, host_a, "/srv/proj"));
+    // Same path, different host identity: added as distinct.
+    try std.testing.expect(try store.addRemote(alloc, host_b, "/srv/proj"));
+    try std.testing.expectEqual(@as(usize, 2), store.roots.items.len);
+
+    // A local root with the same path does not collide with the remotes.
+    try std.testing.expect(try store.add(alloc, "/srv/proj"));
+    try std.testing.expectEqual(@as(usize, 3), store.roots.items.len);
+    try std.testing.expect(store.contains("/srv/proj"));
+
+    try std.testing.expect(store.containsRemote(host_a, "/srv/proj"));
+    try std.testing.expect(store.removeRemote(alloc, host_a, "/srv/proj"));
+    try std.testing.expect(!store.containsRemote(host_a, "/srv/proj"));
+    try std.testing.expectEqual(@as(usize, 2), store.roots.items.len);
+}
+
+test "saveTo then loadFrom round-trips a remote root" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir = try tmp.dir.realpathAlloc(alloc, ".");
+    defer alloc.free(dir);
+    const path = try std.fs.path.join(alloc, &.{ dir, "sidebar.json" });
+    defer alloc.free(path);
+
+    {
+        var store: Store = .{};
+        defer store.deinit(alloc);
+        _ = try store.add(alloc, "/home/u/local");
+        const host: RemoteSpec = .{ .alias = try alloc.dupeZ(u8, "box"), .username = try alloc.dupeZ(u8, "bob"), .port = 22 };
+        defer host.deinit(alloc);
+        _ = try store.addRemote(alloc, host, "/remote/proj");
+        try saveTo(alloc, path, &store);
+    }
+
+    var loaded = loadFrom(alloc, path);
+    defer loaded.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 2), loaded.roots.items.len);
+    // Local root preserved.
+    try std.testing.expect(loaded.contains("/home/u/local"));
+    // Remote root preserved with host fields.
+    var found_remote = false;
+    for (loaded.roots.items) |*r| {
+        if (r.host) |h| {
+            found_remote = true;
+            try std.testing.expectEqualStrings("box", h.alias);
+            try std.testing.expectEqualStrings("bob", h.username.?);
+            try std.testing.expectEqual(@as(u16, 22), h.port.?);
+            try std.testing.expectEqualStrings("/remote/proj", r.path);
+        }
+    }
+    try std.testing.expect(found_remote);
 }

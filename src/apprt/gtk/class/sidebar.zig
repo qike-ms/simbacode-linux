@@ -12,6 +12,8 @@
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
+const sidebar_store = @import("sidebar_store.zig");
+const ssh_command = @import("ssh_command.zig");
 
 const log = std.log.scoped(.simbacode_sidebar);
 
@@ -42,6 +44,10 @@ pub const WorktreeStatus = struct {
     repo_root: [:0]const u8,
     /// Display name of the owning repository (basename of repo_root).
     repo_name: []const u8,
+    /// Remote SSH host this worktree lives on (#32), or null for a local
+    /// worktree. Owned. When set, the worktree's terminal is opened over ssh
+    /// and its git status was gathered over ssh.
+    host: ?RemoteHost = null,
 
     pub fn deinit(self: *const WorktreeStatus, alloc: Allocator) void {
         alloc.free(self.name);
@@ -49,11 +55,36 @@ pub const WorktreeStatus = struct {
         alloc.free(self.branch);
         alloc.free(self.repo_root);
         alloc.free(self.repo_name);
+        if (self.host) |*h| h.deinit(alloc);
     }
 
     /// A worktree that has commits to push (ahead of upstream, has upstream).
     pub fn pushable(self: *const WorktreeStatus) bool {
         return self.ahead > 0 and !self.no_upstream;
+    }
+
+    /// True if this worktree lives on a remote SSH host.
+    pub fn isRemote(self: *const WorktreeStatus) bool {
+        return self.host != null;
+    }
+};
+
+/// An owned remote-host spec attached to a WorktreeStatus (#32). Mirrors
+/// sidebar_store.RemoteSpec but lives here so sidebar consumers don't need the
+/// store type. Owns its strings.
+pub const RemoteHost = struct {
+    alias: [:0]u8,
+    username: ?[:0]u8 = null,
+    port: ?u16 = null,
+
+    pub fn deinit(self: *const RemoteHost, alloc: Allocator) void {
+        alloc.free(self.alias);
+        if (self.username) |u| alloc.free(u);
+    }
+
+    /// Borrow as an ssh_command.RemoteHost for command construction.
+    pub fn asSshHost(self: *const RemoteHost) ssh_command.RemoteHost {
+        return .{ .alias = self.alias, .username = self.username, .port = self.port };
     }
 };
 
@@ -252,6 +283,22 @@ fn scanRepo(
     }
 }
 
+/// Scan a REMOTE (SSH) root over ssh (#32). Placeholder until B3: the full
+/// implementation runs `git -C <path> worktree list --porcelain` and per-
+/// worktree status over ssh, tagging each WorktreeStatus with `host`.
+fn scanRemoteRoot(
+    alloc: Allocator,
+    path: []const u8,
+    host: sidebar_store.RemoteSpec,
+    results: *std.ArrayListUnmanaged(WorktreeStatus),
+) !void {
+    _ = alloc;
+    _ = path;
+    _ = host;
+    _ = results;
+    // Implemented in B3.
+}
+
 /// Sort scan results by repo name, then main-checkout-first, then worktree
 /// name, grouping worktrees under their owning repo for the grouped sidebar.
 fn sortResults(results: []WorktreeStatus) void {
@@ -271,14 +318,23 @@ fn sortResults(results: []WorktreeStatus) void {
 /// subdirectories are scanned (so adding a parent folder like `~/git` still
 /// discovers the repos beneath it). Caller owns the returned slice and must
 /// call `freeStatuses`.
-pub fn scanPaths(alloc: Allocator, roots: []const [:0]const u8) ![]WorktreeStatus {
+pub fn scanPaths(alloc: Allocator, roots: []const sidebar_store.Root) ![]WorktreeStatus {
     var results: std.ArrayListUnmanaged(WorktreeStatus) = .empty;
     errdefer {
         for (results.items) |*s| s.deinit(alloc);
         results.deinit(alloc);
     }
 
-    for (roots) |root| {
+    for (roots) |*root_entry| {
+        // Remote (SSH) roots are scanned over ssh (#32, B3).
+        if (root_entry.host) |host| {
+            scanRemoteRoot(alloc, root_entry.path, host, &results) catch |err| {
+                log.warn("sidebar: remote scan failed root={s} err={}", .{ root_entry.path, err });
+            };
+            continue;
+        }
+
+        const root = root_entry.path;
         // Defensive: `openDirAbsolute` below asserts (panics) on a relative
         // path. The store already filters these on load, but guard here too so
         // no caller can crash the scan with a relative root.
