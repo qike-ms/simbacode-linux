@@ -338,6 +338,18 @@ pub const Window = extern struct {
         /// ListBox row index for row-activation -> open-worktree mapping.
         sidebar_statuses: []sidebar.WorktreeStatus = &.{},
 
+        /// simbacode (#32): true while a background sidebar scan is in flight.
+        /// The poll timer skips starting another scan while one is running, so
+        /// a slow remote host can't pile up worker threads. Set on the main
+        /// thread only.
+        sidebar_scanning: bool = false,
+
+        /// simbacode (#32): set true during teardown so an in-flight scan's
+        /// idle callback drops its result instead of touching a disposing
+        /// window. The worker holds a window ref, so the Window object stays
+        /// alive until the callback runs.
+        sidebar_scan_abandoned: bool = false,
+
         /// simbacode (#21): user-curated set of project roots persisted to
         /// `~/.simbacode/sidebar.json`. The sidebar scans ONLY these roots —
         /// never a blanket `~/git` walk. Loaded on startup; written on
@@ -1762,6 +1774,10 @@ pub const Window = extern struct {
 
         // simbacode sidebar teardown: stop the poll timer and free owned state.
         const alloc = Application.default().allocator();
+        // Signal any in-flight background scan (#32) to drop its result instead
+        // of touching this disposing window. The worker holds a window ref, so
+        // the object stays alive until its idle callback runs and unrefs.
+        priv.sidebar_scan_abandoned = true;
         if (priv.sidebar_timer) |timer| {
             _ = glib.Source.remove(timer);
             priv.sidebar_timer = null;
@@ -1995,23 +2011,98 @@ pub const Window = extern struct {
         return std.fs.path.join(alloc, &.{ home, "git" }) catch null;
     }
 
+    /// Context handed to the background sidebar-scan thread (#32). Carries an
+    /// owned deep-copy of the roots (so the worker never touches store memory
+    /// the main thread may mutate) and, on completion, the owned scan result.
+    /// A window ref is held for the whole in-flight window and released by the
+    /// idle callback.
+    const SidebarScanCtx = struct {
+        window: *Window,
+        roots: []sidebar_store.Root,
+        result: []sidebar.WorktreeStatus = &.{},
+    };
+
     /// Rescan the user-curated project roots and rebuild the sidebar rows.
     /// Issue #21: scans ONLY the persisted roots in `sidebar_store`, never a
     /// blanket `~/git` walk. An empty store yields an empty sidebar.
+    ///
+    /// The scan runs on a background thread (#32): remote (SSH) roots do
+    /// blocking network I/O, which must never stall the GTK main loop. We
+    /// snapshot the roots, scan off-main, then apply the result on the main
+    /// thread via a g_idle callback. Only one scan runs at a time.
     fn refreshSidebar(self: *Window) void {
         const priv = self.private();
         const alloc = Application.default().allocator();
 
-        const statuses = sidebar.scanPaths(alloc, priv.sidebar_store.roots.items) catch |err| {
-            log.warn("sidebar: scan failed err={}", .{err});
+        // Don't stack scans: if one is in flight, let it finish. The 5s poll
+        // will pick up any change on its next tick.
+        if (priv.sidebar_scanning) return;
+
+        // Snapshot the roots for the worker (owned deep copy).
+        const roots = sidebar_store.cloneRoots(alloc, priv.sidebar_store.roots.items) catch |err| {
+            log.warn("sidebar: cannot snapshot roots: {}", .{err});
             return;
         };
+
+        const ctx = alloc.create(SidebarScanCtx) catch {
+            sidebar_store.freeRootsSlice(alloc, roots);
+            return;
+        };
+        ctx.* = .{ .window = self, .roots = roots };
+
+        priv.sidebar_scanning = true;
+        // Keep the window alive until the idle callback runs.
+        _ = self.ref();
+
+        const thread = std.Thread.spawn(.{}, sidebarScanWorker, .{ctx}) catch |err| {
+            log.warn("sidebar: cannot spawn scan thread: {} (scanning inline)", .{err});
+            // Fallback: run synchronously so the sidebar still updates (local
+            // roots only would block; acceptable as a rare degraded path).
+            sidebarScanWorker(ctx);
+            return;
+        };
+        thread.detach();
+    }
+
+    /// Background worker: run the (possibly remote) scan, then post the result
+    /// back to the main thread. Runs OFF the GTK main thread.
+    fn sidebarScanWorker(ctx: *SidebarScanCtx) void {
+        const alloc = Application.default().allocator();
+        ctx.result = sidebar.scanPaths(alloc, ctx.roots) catch |err| blk: {
+            log.warn("sidebar: scan failed err={}", .{err});
+            break :blk &.{};
+        };
+        // Marshal back to the main thread. g_idle_add is thread-safe.
+        _ = glib.idleAdd(sidebarScanFinish, ctx);
+    }
+
+    /// Main-thread idle callback: apply a completed scan result (#32). Frees
+    /// the worker context and the roots snapshot, and releases the window ref.
+    fn sidebarScanFinish(ud: ?*anyopaque) callconv(.c) c_int {
+        const ctx: *SidebarScanCtx = @ptrCast(@alignCast(ud orelse return 0));
+        const self = ctx.window;
+        const alloc = Application.default().allocator();
+        defer {
+            sidebar_store.freeRootsSlice(alloc, ctx.roots);
+            alloc.destroy(ctx);
+            self.private().sidebar_scanning = false;
+            self.unref();
+        }
+
+        const priv = self.private();
+
+        // If the window is tearing down, drop the result untouched.
+        if (priv.sidebar_scan_abandoned) {
+            if (ctx.result.len > 0) sidebar.freeStatuses(alloc, ctx.result);
+            return 0;
+        }
 
         // Replace stored statuses (free the previous scan).
         if (priv.sidebar_statuses.len > 0) {
             sidebar.freeStatuses(alloc, priv.sidebar_statuses);
         }
-        priv.sidebar_statuses = statuses;
+        priv.sidebar_statuses = ctx.result;
+        ctx.result = &.{}; // ownership transferred to the window
 
         self.rebuildSidebarRows();
         // Refresh the identity chip now that branch/repo labels are available (#10).
@@ -2022,12 +2113,13 @@ pub const Window = extern struct {
         // default space (which is confusing — agents started there show in no
         // sidebar folder). Only when the user is still on the default space, so
         // we never yank them out of a worktree they navigated to.
-        if (!priv.did_initial_worktree_open and statuses.len > 0) {
+        if (!priv.did_initial_worktree_open and priv.sidebar_statuses.len > 0) {
             priv.did_initial_worktree_open = true;
             if (self.activeWorktreePath() == null) {
-                self.openWorktree(&statuses[0]);
+                self.openWorktree(&priv.sidebar_statuses[0]);
             }
         }
+        return 0;
     }
 
     /// Rebuild the sidebar Add-Folder dropdown menu (#31). The primary button

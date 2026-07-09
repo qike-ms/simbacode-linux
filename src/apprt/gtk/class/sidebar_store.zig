@@ -31,7 +31,7 @@ pub const RemoteSpec = struct {
         if (self.username) |u| alloc.free(u);
     }
 
-    fn dupe(self: *const RemoteSpec, alloc: Allocator) !RemoteSpec {
+    pub fn dupe(self: *const RemoteSpec, alloc: Allocator) !RemoteSpec {
         const alias_copy = try alloc.dupeZ(u8, self.alias);
         errdefer alloc.free(alias_copy);
         const user_copy: ?[:0]u8 = if (self.username) |u| try alloc.dupeZ(u8, u) else null;
@@ -53,7 +53,36 @@ pub const Root = struct {
     pub fn isRemote(self: *const Root) bool {
         return self.host != null;
     }
+
+    /// Deep-copy this root (owned strings) for use on another thread. Caller
+    /// owns the result and must `deinit` it.
+    pub fn clone(self: *const Root, alloc: Allocator) !Root {
+        const path_copy = try alloc.dupeZ(u8, self.path);
+        errdefer alloc.free(path_copy);
+        const host_copy: ?RemoteSpec = if (self.host) |*h| try h.dupe(alloc) else null;
+        return .{ .path = path_copy, .host = host_copy };
+    }
 };
+
+/// Deep-copy a slice of roots into a freshly-allocated owned slice, for
+/// handing to a background scan thread without sharing the store's memory.
+/// Caller frees via `freeRootsSlice`.
+pub fn cloneRoots(alloc: Allocator, roots: []const Root) ![]Root {
+    const out = try alloc.alloc(Root, roots.len);
+    errdefer alloc.free(out);
+    var n: usize = 0;
+    errdefer for (out[0..n]) |*r| r.deinit(alloc);
+    while (n < roots.len) : (n += 1) {
+        out[n] = try roots[n].clone(alloc);
+    }
+    return out;
+}
+
+/// Free a slice produced by `cloneRoots`.
+pub fn freeRootsSlice(alloc: Allocator, roots: []Root) void {
+    for (roots) |*r| r.deinit(alloc);
+    alloc.free(roots);
+}
 
 /// In-memory model of the persisted sidebar state. Owns its strings.
 pub const Store = struct {
@@ -378,6 +407,31 @@ pub fn saveTo(alloc: Allocator, path: []const u8, store: *const Store) !void {
         try file.writeAll(json);
     }
     try std.fs.cwd().rename(tmp, path);
+}
+
+test "cloneRoots deep-copies local and remote roots" {
+    const alloc = std.testing.allocator;
+    var store: Store = .{};
+    defer store.deinit(alloc);
+    _ = try store.add(alloc, "/home/u/local");
+    const host: RemoteSpec = .{ .alias = try alloc.dupeZ(u8, "box"), .username = try alloc.dupeZ(u8, "bob"), .port = 2022 };
+    defer host.deinit(alloc);
+    _ = try store.addRemote(alloc, host, "/remote/proj");
+
+    const clones = try cloneRoots(alloc, store.roots.items);
+    defer freeRootsSlice(alloc, clones);
+    try std.testing.expectEqual(@as(usize, 2), clones.len);
+    // Local clone.
+    try std.testing.expectEqualStrings("/home/u/local", clones[0].path);
+    try std.testing.expect(clones[0].host == null);
+    // Remote clone with independent (non-aliased) memory.
+    try std.testing.expectEqualStrings("/remote/proj", clones[1].path);
+    try std.testing.expect(clones[1].host != null);
+    try std.testing.expectEqualStrings("box", clones[1].host.?.alias);
+    try std.testing.expectEqualStrings("bob", clones[1].host.?.username.?);
+    try std.testing.expectEqual(@as(u16, 2022), clones[1].host.?.port.?);
+    try std.testing.expect(clones[1].path.ptr != store.roots.items[1].path.ptr);
+    try std.testing.expect(clones[1].host.?.alias.ptr != store.roots.items[1].host.?.alias.ptr);
 }
 
 test "store add/remove/contains" {
