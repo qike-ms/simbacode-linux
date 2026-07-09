@@ -29,6 +29,7 @@ const Tab = @import("tab.zig").Tab;
 const sidebar = @import("sidebar.zig");
 const sidebar_store = @import("sidebar_store.zig");
 const agent_session_store = @import("agent_session_store.zig");
+const ssh_command = @import("ssh_command.zig");
 const agentpkg = @import("agent.zig");
 const DebugWarning = @import("debug_warning.zig").DebugWarning;
 const CommandPalette = @import("command_palette.zig").CommandPalette;
