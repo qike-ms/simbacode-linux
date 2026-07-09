@@ -2328,10 +2328,7 @@ pub const Window = extern struct {
         self.refreshSidebar();
     }
 
-    /// Remove a project root from the sidebar store and rescan. Used by the
-    /// repo-header remove (✕) button, which only appears for repos whose root
-    /// is an exact store entry (#21 removal). An exact match is therefore the
-    /// only case we need to handle.
+    /// Remove a LOCAL project root from the sidebar store and rescan.
     fn removeSidebarRoot(self: *Window, repo_root: []const u8) void {
         const alloc = Application.default().allocator();
         const priv = self.private();
@@ -2342,6 +2339,41 @@ pub const Window = extern struct {
             log.warn("sidebar: cannot persist after remove: {}", .{err});
         };
         self.refreshSidebar();
+    }
+
+    /// Remove a REMOTE project root (identified by host authority + path) from
+    /// the sidebar store and rescan (#32).
+    fn removeSidebarRemoteRoot(self: *Window, authority: []const u8, repo_root: []const u8) void {
+        const alloc = Application.default().allocator();
+        const priv = self.private();
+
+        const parsed = ssh_command.RemoteHost.parseAuthority(authority) orelse return;
+        const spec: sidebar_store.RemoteSpec = .{
+            .alias = alloc.dupeZ(u8, parsed.alias) catch return,
+            .username = if (parsed.username) |u| (alloc.dupeZ(u8, u) catch null) else null,
+            .port = parsed.port,
+        };
+        defer spec.deinit(alloc);
+
+        if (!priv.sidebar_store.removeRemote(alloc, spec, repo_root)) return;
+
+        sidebar_store.save(alloc, &priv.sidebar_store) catch |err| {
+            log.warn("sidebar: cannot persist after remove remote: {}", .{err});
+        };
+        self.refreshSidebar();
+    }
+
+    /// Build a `[user@]host[:port]` authority string for a worktree's host, used
+    /// as the durable key attached to the remove button. Caller owns result.
+    fn remoteAuthorityString(self: *Window, h: *const sidebar.RemoteHost) ![:0]u8 {
+        _ = self;
+        const alloc = Application.default().allocator();
+        const user_prefix: []const u8 = if (h.username) |u| u else "";
+        const at: []const u8 = if (h.username != null) "@" else "";
+        if (h.port) |p| {
+            return std.fmt.allocPrintSentinel(alloc, "{s}{s}{s}:{d}", .{ user_prefix, at, h.alias, p }, 0);
+        }
+        return std.fmt.allocPrintSentinel(alloc, "{s}{s}{s}", .{ user_prefix, at, h.alias }, 0);
     }
 
     /// Rebuild the ListBox rows from `sidebar_statuses`, grouping worktrees
@@ -2506,7 +2538,15 @@ pub const Window = extern struct {
         // is attached as glib-owned data so the handler knows which root to
         // remove without index bookkeeping.
         const repo_root_str = if (group.len > 0) group[0].repo_root else "";
-        if (repo_root_str.len > 0 and self.private().sidebar_store.contains(repo_root_str)) {
+        const group_host = if (group.len > 0) group[0].host else null;
+        const removable = repo_root_str.len > 0 and blk: {
+            if (group_host) |*h| {
+                const spec: sidebar_store.RemoteSpec = .{ .alias = h.alias, .username = h.username, .port = h.port };
+                break :blk self.private().sidebar_store.containsRemote(spec, repo_root_str);
+            }
+            break :blk self.private().sidebar_store.contains(repo_root_str);
+        };
+        if (removable) {
             const remove_btn = gtk.Button.new();
             remove_btn.setIconName("window-close-symbolic");
             remove_btn.as(gtk.Widget).addCssClass("flat");
@@ -2519,6 +2559,18 @@ pub const Window = extern struct {
                 glib.strdup(root_z.ptr),
                 glibFreeData,
             );
+            // For a remote root, also attach the host authority so the handler
+            // removes the correct (host, path) entry rather than a local one.
+            if (group_host) |*h| {
+                if (self.remoteAuthorityString(h)) |a| {
+                    defer alloc.free(a);
+                    remove_btn.as(gobject.Object).setDataFull(
+                        "simbacode-repo-host",
+                        glib.strdup(a.ptr),
+                        glibFreeData,
+                    );
+                } else |_| {}
+            }
             _ = gtk.Button.signals.clicked.connect(
                 remove_btn,
                 *Window,
@@ -2547,6 +2599,15 @@ pub const Window = extern struct {
         const alloc = Application.default().allocator();
         const path = alloc.dupe(u8, std.mem.sliceTo(cstr, 0)) catch return;
         defer alloc.free(path);
+
+        // A remote root also carries a host authority; remove by (host, path).
+        if (btn.as(gobject.Object).getData("simbacode-repo-host")) |host_data| {
+            const host_cstr: [*:0]const u8 = @ptrCast(host_data);
+            const authority = alloc.dupe(u8, std.mem.sliceTo(host_cstr, 0)) catch return;
+            defer alloc.free(authority);
+            self.removeSidebarRemoteRoot(authority, path);
+            return;
+        }
         self.removeSidebarRoot(path);
     }
 
