@@ -6,14 +6,14 @@ agents at once: a git-worktree sidebar, live per-agent presence and activity,
 and click-to-jump notifications — so you always know, at a glance, which agent
 is working, which is waiting, and which needs you.
 
-> [!WARNING]
+> [!NOTE]
 >
-> **Status: alpha / prototype.** This is an experimental build for developers
-> comfortable building from source and with an app that integrates with your
-> AI-agent config files. There are **no packaged releases yet** (no AppImage,
-> Flatpak, or `.deb`), and the integration modifies files under your home
-> directory (see [Security model](#security-model) below). Use it if you like
-> living on the edge; don't yet treat it as a finished product.
+> **Status: v0.1.0 (first tagged release).** simbacode-linux is a young but
+> working build. You install it by building from source (no AppImage / Flatpak
+> / `.deb` yet), and it integrates with your AI-agent config files by installing
+> small, reversible presence hooks under your home directory (see
+> [Security model](#security-model)). Everything below is implemented and in
+> daily use.
 
 ## What it does
 
@@ -21,21 +21,36 @@ is working, which is waiting, and which needs you.
   by repo, showing branch, dirty state, and ahead/behind + insertion/deletion
   counts. Click a worktree to jump to its terminal.
 - **Live agent presence** — when a coding agent starts working in a terminal,
-  its icon appears next to the worktree; activity (busy / waiting) updates live.
+  its icon appears next to the worktree; activity (busy / waiting) updates live,
+  and a busy agent's indicator gently bounces so it's obvious across many rows.
 - **"Needs you" notifications** — when an agent finishes or needs input, you get
   an attention bell on the sidebar row and tab, a desktop notification, and a
   sound. Click to jump straight to that agent.
+- **Session restore across restarts** — running agents are remembered and, on
+  the next launch, each is resumed into its exact prior session (never a fresh
+  one), in the right worktree.
+- **Remote repositories over SSH** — add a repository that lives on another host
+  and work with its worktrees exactly like local ones: status is gathered over
+  SSH and each worktree's terminal opens as an SSH session, all multiplexed over
+  a single shared connection.
 - **Multi-agent aware** — several agents across many repos/worktrees at once,
-  each with its own indicator.
+  each with its own colored indicator.
 
 ### Implemented today
 
-- Worktree-grouped sidebar with branch / dirty / ahead-behind / diff stats
+- Worktree-grouped sidebar with branch / dirty / ahead-behind / diff stats, and
+  a per-worktree status dot (clean / dirty / pushable / behind)
+- **Remote (SSH) repositories & worktrees** — scan and open worktrees on a
+  remote host over a multiplexed SSH ControlMaster connection
 - OSC-3008 agent-presence protocol + per-agent hook installers for
   **Claude Code, Codex, Copilot, Kiro, OpenCode, Pi, and Hermes**
-- Per-agent presence icons, attention bells (sidebar + tab), desktop
-  notifications + sound, click-to-jump
-- Per-worktree tab spaces; persisted sidebar state
+- Per-agent presence icons with per-agent colors, a bouncing busy indicator,
+  attention bells (sidebar + tab), desktop notifications + sound, click-to-jump
+- **Agent session persistence & restore** across restarts (exact-session resume
+  for Pi, Claude, Codex, OpenCode, and Hermes)
+- Per-worktree tab spaces; persisted, user-curated sidebar
+- **Add Folder** with an ancestor quick-pick (jump straight to a parent like
+  `~/git`) and last-location memory
 
 ### Not implemented yet
 
@@ -44,7 +59,7 @@ the umbrella tracking issue
 [#6](https://github.com/qike-ms/simbacode-linux/issues/6). Highlights:
 
 - **Settings UI + agent-integration manager** (opt-in install / preview /
-  uninstall of hooks) — _planned P0_, see
+  uninstall of hooks, with backup/restore) — _planned P0_, see
   [#7](https://github.com/qike-ms/simbacode-linux/issues/7)
 - Command palette, worktree creation from the sidebar, PR/check status badges
 - Phone control + Matrix/Telegram/Signal notifications over Tailnet
@@ -54,19 +69,42 @@ the umbrella tracking issue
 
 ## Install
 
-There are no packaged releases yet — you build from source. See
-[SETUP.md](SETUP.md) for the full instructions (build deps, build flags, run).
-In short:
+You build from source (no packaged releases yet). See [SETUP.md](SETUP.md) for
+the full instructions (build deps, build flags, run). In short:
 
 ```bash
-scripts/install-build-deps.sh         # one-time: blueprint-compiler + gtk4-layer-shell into ~/.local
-zig build -Demit-macos-app=false -Doptimize=ReleaseFast \
-  --search-prefix "$HOME/.local" -Dpatch-rpath "$HOME/.local/lib/x86_64-linux-gnu"
-cp zig-out/bin/ghostty ~/.local/bin/simbacode
+scripts/install-build-deps.sh   # one-time: blueprint-compiler + gtk4-layer-shell into ~/.local
+scripts/install-binary.sh       # build (ReleaseFast) + install to ~/.local/bin/simbacode
 simbacode
 ```
 
-Requires zig 0.15.2 and system GTK4 / libadwaita. No nix required.
+`scripts/install-binary.sh` builds with the correct flags and installs
+atomically, so it works even while an older simbacode is still running (a plain
+`cp` fails with `Text file busy`). Pass `--no-build` to install an
+already-built binary. Requires zig 0.15.2 and system GTK4 / libadwaita. No nix
+required.
+
+## Remote repositories (SSH)
+
+To work with a repository that lives on another machine, open the sidebar
+**➕** dropdown and choose **Add Remote (SSH)…**. Enter the host (an
+`~/.ssh/config` alias or a hostname), optionally a user and port, and the
+absolute path to the repository on that host. Its worktrees then appear in the
+sidebar like any local repo, and clicking one opens a terminal SSH'd into that
+worktree.
+
+All git status queries and the worktree terminals share a single SSH
+[ControlMaster](https://man.openbsd.org/ssh_config#ControlMaster) connection
+(`~/.ssh/simbacode-%C`), so you authenticate once. Status is gathered on a
+background thread, so a slow or unreachable host never freezes the UI.
+
+> [!TIP]
+>
+> For a brand-new host, background status queries use `BatchMode` and won't
+> prompt, so worktrees may not appear until the host key is known. Open the
+> worktree terminal once (which _can_ prompt) to accept the key, after which
+> status populates normally. Passwordless auth (an SSH key or agent) is
+> recommended.
 
 ## Security model
 
@@ -105,7 +143,8 @@ than via an explicit opt-in dialog, and there is not yet a backup/restore or a
 settings page to preview/disable it. Making installation explicit opt-in, with
 a preview of changed files and backup/restore, is the planned **P0** work in
 [#7](https://github.com/qike-ms/simbacode-linux/issues/7). If you'd rather not
-have any config modified, don't run simbacode yet.
+have any config modified, set `"enabled": false` in `~/.simbacode/hooks.json`
+(or don't run simbacode).
 
 **Uninstall.** To remove all hooks and integration state:
 
