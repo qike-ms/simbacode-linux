@@ -43,6 +43,18 @@ const log = std.log.scoped(.gtk_ghostty_window);
 /// duplicate agent tabs.
 var agent_sessions_restored: bool = false;
 
+/// Process-global timestamp (ms, monotonic) after which the reconcile is
+/// allowed to REMOVE durable entries (issue #29 fix). Set when restore runs.
+/// Until it passes, reconcile may only add/update — never drop — so restored
+/// tabs whose agents are still starting up (and haven't re-announced their
+/// session_start yet) can't be wiped from the store, and quitting during that
+/// window can't lose them. 0 means "no restore happened, removals allowed".
+var agent_reconcile_prune_after_ms: i64 = 0;
+
+/// Grace period after restore before reconcile may prune (ms). Generous: agent
+/// CLIs (pi/claude/…) can take several seconds to boot and emit session_start.
+const agent_reconcile_grace_ms: i64 = 30_000;
+
 /// True if `path` is an existing directory. Used to avoid launching a restored
 /// tab in a cwd that no longer exists (issue #29). Never panics.
 fn dirExists(path: [:0]const u8) bool {
@@ -1330,45 +1342,17 @@ pub const Window = extern struct {
     /// known, exact-resumable session id (issue #29, incremental model). Called
     /// when a surface first learns (or changes) its session id. No-op unless the
     /// agent is exact-resumable and the id is non-empty. Persists on change.
+    /// Add-or-update the durable store for a surface that just learned (or
+    /// changed) its agent session id (issue #29). Delegates to the single
+    /// authoritative reconcile so the on-disk list always mirrors the live set
+    /// (one entry per worktree, newest session winning).
     fn addSessionEntry(self: *Window, surface: *Surface) void {
         const priv = self.private();
         const entry = priv.surface_agents.getPtr(surface) orelse return;
         if (!entry.agent.canResumeExact()) return;
         const sid = entry.session_id orelse return;
         if (sid.len == 0) return;
-
-        const worktree: ?[]const u8 = self.worktreePathForSurface(surface);
-        const cwd: []const u8 = worktree orelse (surface.getPwd() orelse return);
-        if (cwd.len == 0) return;
-
-        const alloc = Application.default().allocator();
-        // Load, upsert by session id, save. The file is the durable list; we
-        // mutate it incrementally rather than rewriting from live state, so a
-        // restore (tabs not yet re-announced) can never wipe it (principle #3).
-        var store = agent_session_store.load(alloc);
-        defer store.deinit(alloc);
-        const changed = store.upsertBySessionId(alloc, entry.agent.name(), cwd, worktree, sid) catch |err| {
-            log.warn("agent-session: upsert failed: {}", .{err});
-            return;
-        };
-        if (changed) agent_session_store.save(alloc, &store) catch |err| {
-            log.warn("agent-session: save failed: {}", .{err});
-        };
-    }
-
-    /// Remove the durable session entry for `session_id` (agent ended). Persists
-    /// on change.
-    fn removeSessionEntryById(self: *Window, session_id: []const u8) void {
-        _ = self;
-        if (session_id.len == 0) return;
-        const alloc = Application.default().allocator();
-        var store = agent_session_store.load(alloc);
-        defer store.deinit(alloc);
-        if (store.removeBySessionId(alloc, session_id)) {
-            agent_session_store.save(alloc, &store) catch |err| {
-                log.warn("agent-session: save-after-remove failed: {}", .{err});
-            };
-        }
+        self.reconcileSessionStore();
     }
 
     /// Restore agents that were running before the last restart (issue #29).
@@ -1387,6 +1371,10 @@ pub const Window = extern struct {
         // Mark restored up-front so re-entrancy from tab creation (each restored
         // tab's agent will emit session_start -> persist) can't loop.
         agent_sessions_restored = true;
+        // Block reconcile from PRUNING entries until the grace window passes, so
+        // restored tabs whose agents are still booting (not yet re-announced)
+        // can't be wiped from the durable store (issue #29 fix).
+        agent_reconcile_prune_after_ms = std.time.milliTimestamp() + agent_reconcile_grace_ms;
 
         const alloc = Application.default().allocator();
         var store = agent_session_store.load(alloc);
@@ -1395,10 +1383,22 @@ pub const Window = extern struct {
 
         log.info("restoring {d} agent session(s)", .{store.sessions.items.len});
 
+        // Belt-and-suspenders dedup: even if the on-disk list somehow carries
+        // two entries for one worktree (older buggy writes), restore each
+        // worktree at most once so a worktree can never reopen twice.
+        var seen_worktrees: std.StringHashMapUnmanaged(void) = .empty;
+        defer seen_worktrees.deinit(alloc);
+
         for (store.sessions.items) |*s| {
             const agent = agentpkg.Agent.parse(s.agent) orelse continue;
             const sid = s.session_id orelse continue;
             if (sid.len == 0) continue;
+            const wt_key: []const u8 = if (s.worktree) |w| w else s.cwd;
+            if (seen_worktrees.contains(wt_key)) {
+                log.warn("agent-session: skipping duplicate restore for worktree {s}", .{wt_key});
+                continue;
+            }
+            seen_worktrees.put(alloc, wt_key, {}) catch {};
             // Resume the EXACT session. If the agent isn't exact-resumable, the
             // command is null and we skip it (never start a fresh session).
             var cmd_buf: [1024]u8 = undefined;
@@ -1999,6 +1999,12 @@ pub const Window = extern struct {
     fn sidebarPollTimer(ud: ?*anyopaque) callconv(.c) c_int {
         const self: *Window = @ptrCast(@alignCast(ud orelse return 0));
         self.refreshSidebar();
+        // Periodic self-heal of the durable agent-session store (issue #29):
+        // rewrite it from the live agent set so an already-running agent that
+        // never re-emitted a session_start (e.g. resumed before this process,
+        // or missed during a churn) is still captured, and any orphan is
+        // dropped. Cheap: only writes when the set actually changed.
+        self.reconcileSessionStore();
         // Return true to keep the timer firing.
         return @intFromBool(true);
     }
@@ -3083,13 +3089,70 @@ pub const Window = extern struct {
         const priv = self.private();
         if (priv.surface_agents.fetchRemove(surface)) |kv| {
             if (kv.value.session_id) |sid| {
-                // Drop the durable entry for this exact session, then free.
-                self.removeSessionEntryById(sid);
                 Application.default().allocator().free(sid);
             }
+            // Reconcile the durable store from the (now reduced) live set.
+            // NOTE (issue #29 fix): we do NOT delete a durable entry keyed on
+            // this surface's session id here. A surface finalizes for many
+            // reasons that are not "the user ended this agent" (tab move, view
+            // switch, split rearrange), and deleting on finalize orphaned live
+            // worktrees from restore. Instead the store is rebuilt from the
+            // live agent set, so an entry only disappears when NO live surface
+            // in its worktree has that session — and a genuine session_end
+            // removed the surface_agents entry just above.
+            self.reconcileSessionStore();
             return true;
         }
         return false;
+    }
+
+    /// Rebuild the durable agent-session store (issue #29) from the current
+    /// live `surface_agents` set: one restorable entry per worktree, keyed on
+    /// the worktree, newest session winning. This is the single authoritative
+    /// writer — it can neither orphan a live worktree (RC1) nor accumulate a
+    /// stale/duplicate entry (RC2), because the file always mirrors exactly
+    /// what is restorable right now. Persists only when the set changed.
+    fn reconcileSessionStore(self: *Window) void {
+        const priv = self.private();
+        const alloc = Application.default().allocator();
+
+        var live: std.ArrayListUnmanaged(agent_session_store.Store.LiveAgent) = .empty;
+        defer live.deinit(alloc);
+        // Backing storage for worktree strings we resolve per surface.
+        var wt_bufs: std.ArrayListUnmanaged([]const u8) = .empty;
+        defer wt_bufs.deinit(alloc);
+
+        var it = priv.surface_agents.iterator();
+        while (it.next()) |entry| {
+            const ae = entry.value_ptr;
+            if (!ae.agent.canResumeExact()) continue;
+            const sid = ae.session_id orelse continue;
+            if (sid.len == 0) continue;
+            const surface = entry.key_ptr.*;
+            const worktree: ?[]const u8 = self.worktreePathForSurface(surface);
+            const cwd: []const u8 = worktree orelse (surface.getPwd() orelse continue);
+            if (cwd.len == 0) continue;
+            live.append(alloc, .{
+                .agent = ae.agent.name(),
+                .cwd = cwd,
+                .worktree = worktree,
+                .session_id = sid,
+            }) catch continue;
+        }
+
+        var store = agent_session_store.load(alloc);
+        defer store.deinit(alloc);
+        // During the post-restore grace window, only add/update — never prune —
+        // so a still-booting restored agent isn't dropped before it announces.
+        const may_prune = agent_reconcile_prune_after_ms == 0 or
+            std.time.milliTimestamp() >= agent_reconcile_prune_after_ms;
+        const changed = store.rebuildFromLive(alloc, live.items, may_prune) catch |err| {
+            log.warn("agent-session: reconcile failed: {}", .{err});
+            return;
+        };
+        if (changed) agent_session_store.save(alloc, &store) catch |err| {
+            log.warn("agent-session: save failed: {}", .{err});
+        };
     }
 
     /// Record (or replace) the agent session id for a surface (issue #29).
@@ -3106,13 +3169,11 @@ pub const Window = extern struct {
             if (std.mem.eql(u8, old, sid)) return;
         }
         const copy = alloc.dupeZ(u8, sid) catch return;
-        if (entry.session_id) |old| {
-            // The id changed: drop the stale durable entry before switching.
-            self.removeSessionEntryById(old);
-            alloc.free(old);
-        }
+        if (entry.session_id) |old| alloc.free(old);
         entry.session_id = copy;
-        // Record the durable entry for the new id (add on session-start / mint).
+        // Reconcile the durable store from the live set (handles both a fresh
+        // id and an id change: the worktree's entry is rewritten to the newest
+        // session, and any stale one for the same worktree is dropped).
         self.addSessionEntry(surface);
     }
 

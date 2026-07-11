@@ -167,7 +167,138 @@ pub const Store = struct {
         }
         return false;
     }
+
+    /// Find the index of the entry whose worktree (falling back to cwd) equals
+    /// `key`. Worktree is the RESTORE identity (issue #29 fix): at most one
+    /// restorable agent per worktree, so a new session in a worktree replaces
+    /// the old one instead of accumulating duplicates.
+    pub fn indexOfWorktree(self: *const Store, key: []const u8) ?usize {
+        for (self.sessions.items, 0..) |*s, i| {
+            const wt = s.worktree orelse s.cwd;
+            if (std.mem.eql(u8, wt, key)) return i;
+        }
+        return null;
+    }
+
+    /// A single live restorable agent, borrowed for `rebuildFromLive`.
+    pub const LiveAgent = struct {
+        agent: []const u8,
+        cwd: []const u8,
+        worktree: ?[]const u8,
+        session_id: []const u8,
+    };
+
+    /// Replace the store's contents with the given live agents, deduplicated by
+    /// worktree (last write wins), keeping only entries with a non-empty agent,
+    /// absolute cwd, and non-empty session id. This is the authoritative
+    /// reconcile (issue #29 fix): the on-disk list becomes a snapshot of what is
+    /// actually restorable, so a surface that merely finalized (tab move / view
+    /// switch) can't orphan an entry and a stale dead session can't linger.
+    ///
+    /// `may_prune`: when true, entries not present in `live` are dropped (steady
+    /// state). When false (post-restore grace window), existing entries are
+    /// preserved and `live` only adds/updates by worktree — so a restored agent
+    /// still booting (not yet re-announced) is never wiped before it appears.
+    ///
+    /// Returns true if the resulting set differs from the previous contents
+    /// (so the caller can skip a redundant save).
+    pub fn rebuildFromLive(self: *Store, alloc: Allocator, live: []const LiveAgent, may_prune: bool) !bool {
+        var next: std.ArrayListUnmanaged(Session) = .empty;
+        errdefer {
+            for (next.items) |*s| s.deinit(alloc);
+            next.deinit(alloc);
+        }
+
+        // When pruning is not allowed (post-restore grace), seed `next` with a
+        // copy of the existing entries so nothing is dropped; live agents then
+        // add/update by worktree on top. When pruning IS allowed, start empty
+        // so orphaned entries fall away.
+        if (!may_prune) {
+            for (self.sessions.items) |*s| {
+                const agent_copy = try alloc.dupeZ(u8, s.agent);
+                errdefer alloc.free(agent_copy);
+                const cwd_copy = try alloc.dupeZ(u8, s.cwd);
+                errdefer alloc.free(cwd_copy);
+                const wt_copy: ?[:0]u8 = if (s.worktree) |w| try alloc.dupeZ(u8, w) else null;
+                errdefer if (wt_copy) |w| alloc.free(w);
+                const sid_copy: ?[:0]u8 = if (s.session_id) |sd| try alloc.dupeZ(u8, sd) else null;
+                try next.append(alloc, .{ .agent = agent_copy, .cwd = cwd_copy, .worktree = wt_copy, .session_id = sid_copy });
+            }
+        }
+
+        for (live) |la| {
+            if (la.agent.len == 0 or la.cwd.len == 0 or la.session_id.len == 0) continue;
+            const key = la.worktree orelse la.cwd;
+            // Dedup by worktree: replace any existing entry for this worktree.
+            var replaced = false;
+            for (next.items) |*s| {
+                const wt = s.worktree orelse s.cwd;
+                if (std.mem.eql(u8, wt, key)) {
+                    // Last write wins: swap in the newer session's fields.
+                    const agent_copy = try alloc.dupeZ(u8, la.agent);
+                    const cwd_copy = try alloc.dupeZ(u8, la.cwd);
+                    const wt_copy: ?[:0]u8 = if (la.worktree) |w|
+                        (if (w.len > 0) try alloc.dupeZ(u8, w) else null)
+                    else
+                        null;
+                    const sid_copy = try alloc.dupeZ(u8, la.session_id);
+                    s.deinit(alloc);
+                    s.* = .{ .agent = agent_copy, .cwd = cwd_copy, .worktree = wt_copy, .session_id = sid_copy };
+                    replaced = true;
+                    break;
+                }
+            }
+            if (replaced) continue;
+
+            const agent_copy = try alloc.dupeZ(u8, la.agent);
+            errdefer alloc.free(agent_copy);
+            const cwd_copy = try alloc.dupeZ(u8, la.cwd);
+            errdefer alloc.free(cwd_copy);
+            const wt_copy: ?[:0]u8 = if (la.worktree) |w|
+                (if (w.len > 0) try alloc.dupeZ(u8, w) else null)
+            else
+                null;
+            errdefer if (wt_copy) |w| alloc.free(w);
+            const sid_copy = try alloc.dupeZ(u8, la.session_id);
+            try next.append(alloc, .{ .agent = agent_copy, .cwd = cwd_copy, .worktree = wt_copy, .session_id = sid_copy });
+        }
+
+        // Detect whether anything actually changed (order-insensitive by
+        // worktree key + session id) so callers can skip a redundant save.
+        const changed = !sameSet(self.sessions.items, next.items);
+        if (!changed) {
+            for (next.items) |*s| s.deinit(alloc);
+            next.deinit(alloc);
+            return false;
+        }
+
+        for (self.sessions.items) |*s| s.deinit(alloc);
+        self.sessions.deinit(alloc);
+        self.sessions = next;
+        return true;
+    }
 };
+
+/// True if two session sets are equal as sets keyed on (worktree|cwd) ->
+/// session_id. Used to avoid redundant saves after a reconcile.
+fn sameSet(a: []const Session, b: []const Session) bool {
+    if (a.len != b.len) return false;
+    for (a) |*sa| {
+        const ka = sa.worktree orelse sa.cwd;
+        const sida = sa.session_id orelse "";
+        var found = false;
+        for (b) |*sb| {
+            const kb = sb.worktree orelse sb.cwd;
+            const sidb = sb.session_id orelse "";
+            if (std.mem.eql(u8, ka, kb) and std.mem.eql(u8, sida, sidb)) {
+                found = true;
+                break;
+            }
+        }
+        if (!found) return false;
+    }
+    return true;
+}
 
 /// JSON wire shape. Forward-compatible: unknown fields are ignored on load,
 /// and absence of the file means "no sessions to restore".
@@ -448,4 +579,101 @@ test "removeBySessionId + indexOfSessionId" {
     // Removing a missing id is a no-op.
     try std.testing.expect(!store.removeBySessionId(alloc, "nope"));
     try std.testing.expectEqual(@as(usize, 1), store.sessions.items.len);
+}
+
+test "rebuildFromLive dedups by worktree, newest wins" {
+    const alloc = std.testing.allocator;
+    var store: Store = .{};
+    defer store.deinit(alloc);
+
+    // Seed with a stale entry for wt /a (simulating an old buggy write).
+    try std.testing.expect(try store.upsertBySessionId(alloc, "pi", "/a", "/a", "old-sid"));
+    try std.testing.expectEqual(@as(usize, 1), store.sessions.items.len);
+
+    // Live set: a NEW session in /a plus a session in /b. Two live agents in
+    // /a (same worktree) collapse to one (last wins).
+    const live = [_]Store.LiveAgent{
+        .{ .agent = "pi", .cwd = "/a", .worktree = "/a", .session_id = "new-sid-1" },
+        .{ .agent = "pi", .cwd = "/a", .worktree = "/a", .session_id = "new-sid-2" },
+        .{ .agent = "claude", .cwd = "/b", .worktree = "/b", .session_id = "sid-b" },
+    };
+    try std.testing.expect(try store.rebuildFromLive(alloc, &live, true));
+    try std.testing.expectEqual(@as(usize, 2), store.sessions.items.len);
+
+    // /a now holds the newest session, not the stale one.
+    const ia = store.indexOfWorktree("/a").?;
+    try std.testing.expectEqualStrings("new-sid-2", store.sessions.items[ia].session_id.?);
+    const ib = store.indexOfWorktree("/b").?;
+    try std.testing.expectEqualStrings("sid-b", store.sessions.items[ib].session_id.?);
+    try std.testing.expect(store.indexOfSessionId("old-sid") == null);
+}
+
+test "rebuildFromLive drops orphans and reports no-change idempotently" {
+    const alloc = std.testing.allocator;
+    var store: Store = .{};
+    defer store.deinit(alloc);
+    try std.testing.expect(try store.upsertBySessionId(alloc, "pi", "/a", "/a", "sid-a"));
+    try std.testing.expect(try store.upsertBySessionId(alloc, "pi", "/b", "/b", "sid-b"));
+
+    // Live set no longer has /b: it must be dropped (orphan), /a kept.
+    const live = [_]Store.LiveAgent{
+        .{ .agent = "pi", .cwd = "/a", .worktree = "/a", .session_id = "sid-a" },
+    };
+    try std.testing.expect(try store.rebuildFromLive(alloc, &live, true));
+    try std.testing.expectEqual(@as(usize, 1), store.sessions.items.len);
+    try std.testing.expect(store.indexOfWorktree("/b") == null);
+
+    // Rebuilding with the SAME live set reports no change (no redundant save).
+    try std.testing.expect(!try store.rebuildFromLive(alloc, &live, true));
+    try std.testing.expectEqual(@as(usize, 1), store.sessions.items.len);
+}
+
+test "rebuildFromLive skips incomplete live agents" {
+    const alloc = std.testing.allocator;
+    var store: Store = .{};
+    defer store.deinit(alloc);
+    const live = [_]Store.LiveAgent{
+        .{ .agent = "", .cwd = "/a", .worktree = "/a", .session_id = "s" }, // no agent
+        .{ .agent = "pi", .cwd = "", .worktree = null, .session_id = "s" }, // no cwd
+        .{ .agent = "pi", .cwd = "/c", .worktree = "/c", .session_id = "" }, // no id
+        .{ .agent = "pi", .cwd = "/ok", .worktree = "/ok", .session_id = "sid-ok" },
+    };
+    _ = try store.rebuildFromLive(alloc, &live, true);
+    try std.testing.expectEqual(@as(usize, 1), store.sessions.items.len);
+    try std.testing.expect(store.indexOfWorktree("/ok") != null);
+}
+
+test "rebuildFromLive with may_prune=false keeps orphans (restore grace)" {
+    const alloc = std.testing.allocator;
+    var store: Store = .{};
+    defer store.deinit(alloc);
+    // Two persisted worktrees survive a restart.
+    try std.testing.expect(try store.upsertBySessionId(alloc, "pi", "/a", "/a", "sid-a"));
+    try std.testing.expect(try store.upsertBySessionId(alloc, "pi", "/b", "/b", "sid-b"));
+
+    // Only /a has re-announced yet (its agent booted first). With pruning
+    // disabled, /b MUST be preserved so it isn't lost before it announces.
+    const live = [_]Store.LiveAgent{
+        .{ .agent = "pi", .cwd = "/a", .worktree = "/a", .session_id = "sid-a" },
+    };
+    _ = try store.rebuildFromLive(alloc, &live, false);
+    try std.testing.expectEqual(@as(usize, 2), store.sessions.items.len);
+    try std.testing.expect(store.indexOfWorktree("/a") != null);
+    try std.testing.expect(store.indexOfWorktree("/b") != null);
+
+    // A NEW worktree /c that announced during grace is added (add/update ok).
+    const live2 = [_]Store.LiveAgent{
+        .{ .agent = "pi", .cwd = "/c", .worktree = "/c", .session_id = "sid-c" },
+    };
+    _ = try store.rebuildFromLive(alloc, &live2, false);
+    try std.testing.expectEqual(@as(usize, 3), store.sessions.items.len);
+    try std.testing.expect(store.indexOfWorktree("/c") != null);
+
+    // Once grace passes (may_prune=true), a live set of just /a prunes the rest.
+    const live3 = [_]Store.LiveAgent{
+        .{ .agent = "pi", .cwd = "/a", .worktree = "/a", .session_id = "sid-a" },
+    };
+    _ = try store.rebuildFromLive(alloc, &live3, true);
+    try std.testing.expectEqual(@as(usize, 1), store.sessions.items.len);
+    try std.testing.expect(store.indexOfWorktree("/a") != null);
 }
