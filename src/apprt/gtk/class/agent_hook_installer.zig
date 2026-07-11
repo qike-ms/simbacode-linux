@@ -199,7 +199,13 @@ fn installOne(alloc: Allocator, home: []const u8, agent: Agent) !void {
         },
         .kiro => try installJsonHookMap(alloc, home, ".kiro/agents/kiro_default.json", &kiro_slots, agent, .flat),
         .copilot => try installOwnFile(alloc, home, ".copilot/hooks/simbacode.json", try copilotFileSource(alloc), agent),
-        .opencode => try installOwnFile(alloc, home, ".config/opencode/plugins/simbacode-presence.js", try openCodePluginSource(alloc), agent),
+        .opencode => {
+            try installOwnFile(alloc, home, ".config/opencode/plugins/simbacode-presence.js", try openCodePluginSource(alloc), agent);
+            // OpenCode only loads plugins listed in its config `plugin` array
+            // (no directory auto-discovery), so registering the file is
+            // required for it to load at all.
+            try patchOpenCodeConfig(alloc, home, true);
+        },
         .pi => try installOwnFile(alloc, home, ".pi/agent/extensions/simbacode/index.ts", try piExtensionSource(alloc), agent),
         .hermes => try installHermes(alloc, home),
     }
@@ -214,7 +220,10 @@ fn uninstallOne(alloc: Allocator, home: []const u8, agent: Agent) !void {
         },
         .kiro => try uninstallJsonHookMap(alloc, home, ".kiro/agents/kiro_default.json", .flat),
         .copilot => try uninstallOwnFile(alloc, home, ".copilot/hooks/simbacode.json"),
-        .opencode => try uninstallOwnFile(alloc, home, ".config/opencode/plugins/simbacode-presence.js"),
+        .opencode => {
+            try uninstallOwnFile(alloc, home, ".config/opencode/plugins/simbacode-presence.js");
+            try patchOpenCodeConfig(alloc, home, false);
+        },
         .pi => try uninstallOwnFile(alloc, home, ".pi/agent/extensions/simbacode/index.ts"),
         .hermes => try uninstallHermes(alloc, home),
     }
@@ -539,6 +548,89 @@ fn patchHermesAllowlist(alloc: Allocator, home: []const u8, script_path: []const
     const out = try std.json.Stringify.valueAlloc(alloc, std.json.Value{ .object = root }, .{ .whitespace = .indent_2 });
     defer alloc.free(out);
     try writeFileAtomic(alloc, path, out);
+}
+
+/// The plugin spec simbacode registers in OpenCode's config `plugin` array.
+/// OpenCode (>= the versions that dropped directory auto-discovery) loads
+/// plugins ONLY from the config `plugin` list — dropping a file in
+/// `~/.config/opencode/plugins/` is not enough. We use `{env:HOME}` (OpenCode's
+/// own substitution) so the entry is portable across users/home dirs, matching
+/// how other OpenCode plugins are referenced.
+const opencode_plugin_spec = "{env:HOME}/.config/opencode/plugins/simbacode-presence.js";
+const opencode_config_rel = ".config/opencode/opencode.json";
+
+/// Register (or remove) the simbacode presence plugin in OpenCode's config
+/// `plugin` array so OpenCode actually loads it. `install = strip ours + add`
+/// (idempotent); uninstall just strips ours. Every other plugin entry and all
+/// other config keys are preserved verbatim. A missing/empty file starts from
+/// an empty object; a non-object or unparseable file is left untouched (we
+/// never destroy config we don't understand).
+fn patchOpenCodeConfig(alloc: Allocator, home: []const u8, enable: bool) !void {
+    const path = try joinHome(alloc, home, opencode_config_rel);
+    defer alloc.free(path);
+
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    defer arena.deinit();
+    const aa = arena.allocator();
+
+    // Load the existing root object. Preserve every key; only touch `plugin`.
+    var root: std.json.Value = root: {
+        const existing = try readFileAlloc(aa, path);
+        if (existing) |bytes| {
+            if (std.mem.trim(u8, bytes, " \t\r\n").len == 0) break :root .{ .object = .init(aa) };
+            const parsed = std.json.parseFromSliceLeaky(std.json.Value, aa, bytes, .{}) catch {
+                // Unparseable (e.g. JSONC with comments, or hand-corrupted):
+                // don't risk clobbering. Log and skip — the file install still
+                // happened; the user can add the plugin entry manually.
+                log.warn("simbacode: cannot parse {s}; skipping plugin registration", .{opencode_config_rel});
+                return;
+            };
+            if (parsed != .object) {
+                log.warn("simbacode: {s} is not a JSON object; skipping plugin registration", .{opencode_config_rel});
+                return;
+            }
+            break :root parsed;
+        }
+        break :root .{ .object = .init(aa) };
+    };
+
+    // Rebuild the `plugin` array without any prior simbacode entry, preserving
+    // order of the user's own plugins.
+    var plugins: std.json.Array = .init(aa);
+    if (root.object.get("plugin")) |p| {
+        if (p == .array) {
+            for (p.array.items) |item| {
+                if (item == .string and isSimbacodePluginSpec(item.string)) continue;
+                try plugins.append(item);
+            }
+        } else if (p != .null) {
+            // `plugin` exists but isn't an array — don't overwrite an unexpected
+            // shape; skip rather than destroy it.
+            log.warn("simbacode: {s} `plugin` is not an array; skipping registration", .{opencode_config_rel});
+            return;
+        }
+    }
+    if (enable) try plugins.append(.{ .string = opencode_plugin_spec });
+
+    // Only write when something changed and there is something to persist.
+    // (Avoid creating an otherwise-empty config file just to hold an empty
+    // plugin array on uninstall of a never-registered plugin.)
+    if (!enable and root.object.get("plugin") == null) return;
+
+    try root.object.put("plugin", .{ .array = plugins });
+    const out = try std.json.Stringify.valueAlloc(alloc, root, .{ .whitespace = .indent_2 });
+    defer alloc.free(out);
+    try writeFileAtomic(alloc, path, out);
+    log.info("simbacode: {s} opencode plugin in {s}", .{ if (enable) "registered" else "unregistered", opencode_config_rel });
+}
+
+/// True if a config `plugin` spec refers to simbacode's presence plugin,
+/// regardless of how the home dir is spelled ({env:HOME}, an absolute path, or
+/// `~`). Matches on the stable filename tail so any prior registration is
+/// de-duplicated / cleanly removed.
+fn isSimbacodePluginSpec(spec: []const u8) bool {
+    return std.mem.endsWith(u8, spec, "/plugins/simbacode-presence.js") or
+        std.mem.eql(u8, spec, opencode_plugin_spec);
 }
 
 /// Install (idempotent) the canonical hook map into a JSON settings file.
@@ -1525,6 +1617,79 @@ test "opencode plugin + pi extension carry sentinel and events" {
     // conversation (issue #29).
     try testing.expect(std.mem.indexOf(u8, pi_src, "sessionid=") != null);
     try testing.expect(std.mem.indexOf(u8, pi_src, "emitNotification") != null);
+}
+
+test "patchOpenCodeConfig registers/unregisters plugin, preserves others, idempotent" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const home = try tmp.dir.realpathAlloc(alloc, ".");
+    defer alloc.free(home);
+
+    const cfg_path = try std.fs.path.join(alloc, &.{ home, ".config", "opencode", "opencode.json" });
+    defer alloc.free(cfg_path);
+
+    // Seed a config with a user plugin and an unrelated key.
+    try ensureParentDir(cfg_path);
+    try tmp.dir.writeFile(.{
+        .sub_path = ".config/opencode/opencode.json",
+        .data =
+        \\{ "model": "x", "plugin": ["{env:HOME}/mine/a.ts"] }
+        ,
+    });
+
+    // Enable: our plugin is appended; the user's is preserved; model untouched.
+    try patchOpenCodeConfig(alloc, home, true);
+    {
+        const bytes = (try readFileAlloc(alloc, cfg_path)).?;
+        defer alloc.free(bytes);
+        try testing.expect(std.mem.indexOf(u8, bytes, "{env:HOME}/mine/a.ts") != null);
+        try testing.expect(std.mem.indexOf(u8, bytes, opencode_plugin_spec) != null);
+        try testing.expect(std.mem.indexOf(u8, bytes, "\"model\"") != null);
+    }
+
+    // Idempotent: a second enable does not duplicate our entry.
+    try patchOpenCodeConfig(alloc, home, true);
+    {
+        const bytes = (try readFileAlloc(alloc, cfg_path)).?;
+        defer alloc.free(bytes);
+        const first = std.mem.indexOf(u8, bytes, "simbacode-presence.js").?;
+        try testing.expect(std.mem.indexOf(u8, bytes[first + 1 ..], "simbacode-presence.js") == null);
+    }
+
+    // Disable: our plugin is removed; the user's remains.
+    try patchOpenCodeConfig(alloc, home, false);
+    {
+        const bytes = (try readFileAlloc(alloc, cfg_path)).?;
+        defer alloc.free(bytes);
+        try testing.expect(std.mem.indexOf(u8, bytes, "simbacode-presence.js") == null);
+        try testing.expect(std.mem.indexOf(u8, bytes, "{env:HOME}/mine/a.ts") != null);
+    }
+}
+
+test "patchOpenCodeConfig creates config when absent, and isSimbacodePluginSpec matching" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const home = try tmp.dir.realpathAlloc(alloc, ".");
+    defer alloc.free(home);
+
+    // No config file yet: enable creates one with just our plugin.
+    try patchOpenCodeConfig(alloc, home, true);
+    const cfg_path = try std.fs.path.join(alloc, &.{ home, ".config", "opencode", "opencode.json" });
+    defer alloc.free(cfg_path);
+    const bytes = (try readFileAlloc(alloc, cfg_path)).?;
+    defer alloc.free(bytes);
+    try testing.expect(std.mem.indexOf(u8, bytes, opencode_plugin_spec) != null);
+
+    // Spec matching is home-spelling agnostic.
+    try testing.expect(isSimbacodePluginSpec("{env:HOME}/.config/opencode/plugins/simbacode-presence.js"));
+    try testing.expect(isSimbacodePluginSpec("/home/u/.config/opencode/plugins/simbacode-presence.js"));
+    try testing.expect(!isSimbacodePluginSpec("{env:HOME}/other/plugin.js"));
 }
 
 test "codex feature flag: enable creates [features] hooks = true" {
