@@ -1,10 +1,12 @@
 #!/usr/bin/env python3
-"""Generate the simbacode-linux app icon (white "SC" on a charcoal tile).
+"""Generate the simbacode-linux app icon (white "$c" on a charcoal tile).
 
 Writes images/gnome/<size>.png at every size the Zig build installs into the
-hicolor icon theme (see src/build/GhosttyResources.zig). The mark matches the
-macOS supacode icon: a bold white "SC" monogram on a dark charcoal tile that
-vignettes toward near-black at the edges, with rounded (squircle-ish) corners.
+hicolor icon theme (see src/build/GhosttyResources.zig). The mark is a bold
+white "$c" monogram (a shell-prompt "$" plus "c" for code) on a dark charcoal
+tile that vignettes toward near-black at the edges, with rounded (squircle-ish)
+corners. The "$c" wordmark deliberately differs from supacode's "SC" so the two
+apps are visually distinct.
 
 Rendered at 8x supersample then downscaled with Lanczos for crisp small sizes.
 
@@ -34,7 +36,7 @@ FONT_CANDIDATES = [
     "/System/Library/Fonts/Helvetica.ttc",
 ]
 
-# Match the macOS supacode icon.
+# Charcoal tile with a white monogram (distinct from supacode's "SC").
 BG_CENTER = (32, 32, 33)   # charcoal (dominant tone)
 BG_EDGE = (10, 10, 11)     # near-black edges / vignette
 TEXT = (255, 255, 255)     # white monogram
@@ -71,7 +73,7 @@ def render_master(px: int) -> Image.Image:
     center.putalpha(grad)
     tile = Image.alpha_composite(tile, center)
 
-    text = "SC"
+    text = "$c"
     font = ImageFont.truetype(font_path(), int(S * 0.44))
     spacing = int(S * 0.010)
 
