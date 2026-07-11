@@ -677,3 +677,24 @@ test "rebuildFromLive with may_prune=false keeps orphans (restore grace)" {
     try std.testing.expectEqual(@as(usize, 1), store.sessions.items.len);
     try std.testing.expect(store.indexOfWorktree("/a") != null);
 }
+
+test "rebuildFromLive never loses restored-but-idle sessions (data-loss regression)" {
+    const alloc = std.testing.allocator;
+    var store: Store = .{};
+    defer store.deinit(alloc);
+    // Four sessions restored from a prior run.
+    _ = try store.upsertBySessionId(alloc, "pi", "/a", "/a", "sid-a");
+    _ = try store.upsertBySessionId(alloc, "pi", "/b", "/b", "sid-b");
+    _ = try store.upsertBySessionId(alloc, "pi", "/c", "/c", "sid-c");
+    _ = try store.upsertBySessionId(alloc, "pi", "/d", "/d", "sid-d");
+
+    // The user opens a new window; the restored agent tabs are idle and have
+    // NOT emitted session_start, so the live set is empty. The periodic
+    // reconcile MUST NOT prune them (may_prune=false), or closing that window
+    // would lose every session.
+    const empty_live = [_]Store.LiveAgent{};
+    _ = try store.rebuildFromLive(alloc, &empty_live, false);
+    try std.testing.expectEqual(@as(usize, 4), store.sessions.items.len);
+    try std.testing.expect(store.indexOfWorktree("/a") != null);
+    try std.testing.expect(store.indexOfWorktree("/d") != null);
+}

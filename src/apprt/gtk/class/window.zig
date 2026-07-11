@@ -43,18 +43,6 @@ const log = std.log.scoped(.gtk_ghostty_window);
 /// duplicate agent tabs.
 var agent_sessions_restored: bool = false;
 
-/// Process-global timestamp (ms, monotonic) after which the reconcile is
-/// allowed to REMOVE durable entries (issue #29 fix). Set when restore runs.
-/// Until it passes, reconcile may only add/update — never drop — so restored
-/// tabs whose agents are still starting up (and haven't re-announced their
-/// session_start yet) can't be wiped from the store, and quitting during that
-/// window can't lose them. 0 means "no restore happened, removals allowed".
-var agent_reconcile_prune_after_ms: i64 = 0;
-
-/// Grace period after restore before reconcile may prune (ms). Generous: agent
-/// CLIs (pi/claude/…) can take several seconds to boot and emit session_start.
-const agent_reconcile_grace_ms: i64 = 30_000;
-
 /// True if `path` is an existing directory. Used to avoid launching a restored
 /// tab in a cwd that no longer exists (issue #29). Never panics.
 fn dirExists(path: [:0]const u8) bool {
@@ -1371,10 +1359,6 @@ pub const Window = extern struct {
         // Mark restored up-front so re-entrancy from tab creation (each restored
         // tab's agent will emit session_start -> persist) can't loop.
         agent_sessions_restored = true;
-        // Block reconcile from PRUNING entries until the grace window passes, so
-        // restored tabs whose agents are still booting (not yet re-announced)
-        // can't be wiped from the durable store (issue #29 fix).
-        agent_reconcile_prune_after_ms = std.time.milliTimestamp() + agent_reconcile_grace_ms;
 
         const alloc = Application.default().allocator();
         var store = agent_session_store.load(alloc);
@@ -1990,7 +1974,7 @@ pub const Window = extern struct {
 
         if (dead.items.len == 0) return;
         for (dead.items) |surface| {
-            _ = self.removeSurfaceAgent(surface);
+            _ = self.removeSurfaceAgent(surface, true);
             self.refreshTabAgentIcon(surface);
         }
         self.rebuildSidebarRows();
@@ -3072,7 +3056,9 @@ pub const Window = extern struct {
             // presence refresh after the id was learned), (re)record the entry.
             self.addSessionEntry(surface);
         } else {
-            _ = self.removeSurfaceAgent(surface);
+            // agent == null is a genuine detach (session_end / bare end), so
+            // drop the durable store entry for this worktree too.
+            _ = self.removeSurfaceAgent(surface, true);
         }
 
         self.refreshTabAgentIcon(surface);
@@ -3085,22 +3071,26 @@ pub const Window = extern struct {
     /// close, window close). Removes the DURABLE store entry by the surface's
     /// captured session id (issue #29 incremental model) and frees the owned
     /// id. Does NOT refresh the tab icon; callers do that.
-    fn removeSurfaceAgent(self: *Window, surface: *Surface) bool {
+    /// Remove a surface's agent presence entry. `positive_end` distinguishes
+    /// the two very different callers (issue #29 data-loss fix):
+    ///   - true  = the agent genuinely ended (session_end OSC, or the liveness
+    ///     sweep reaped a dead local pid). We ALSO drop the durable store entry
+    ///     for its worktree so it won't be restored next launch.
+    ///   - false = a generic surface finalize (tab move, view switch, split
+    ///     rearrange, window close). We drop only the in-memory presence; the
+    ///     durable store entry MUST survive, because the session is still
+    ///     restorable (a restored-but-idle tab that never re-announced would
+    ///     otherwise be lost on the next window close).
+    fn removeSurfaceAgent(self: *Window, surface: *Surface, positive_end: bool) bool {
         const priv = self.private();
+        // Capture the worktree BEFORE removing the surface entry, while the
+        // widget ancestry is still intact, for the positive-end store removal.
+        const do_store_remove = positive_end;
         if (priv.surface_agents.fetchRemove(surface)) |kv| {
             if (kv.value.session_id) |sid| {
                 Application.default().allocator().free(sid);
             }
-            // Reconcile the durable store from the (now reduced) live set.
-            // NOTE (issue #29 fix): we do NOT delete a durable entry keyed on
-            // this surface's session id here. A surface finalizes for many
-            // reasons that are not "the user ended this agent" (tab move, view
-            // switch, split rearrange), and deleting on finalize orphaned live
-            // worktrees from restore. Instead the store is rebuilt from the
-            // live agent set, so an entry only disappears when NO live surface
-            // in its worktree has that session — and a genuine session_end
-            // removed the surface_agents entry just above.
-            self.reconcileSessionStore();
+            if (do_store_remove) self.removeStoreEntryForWorktree(surface);
             return true;
         }
         return false;
@@ -3142,17 +3132,55 @@ pub const Window = extern struct {
 
         var store = agent_session_store.load(alloc);
         defer store.deinit(alloc);
-        // During the post-restore grace window, only add/update — never prune —
-        // so a still-booting restored agent isn't dropped before it announces.
-        const may_prune = agent_reconcile_prune_after_ms == 0 or
-            std.time.milliTimestamp() >= agent_reconcile_prune_after_ms;
-        const changed = store.rebuildFromLive(alloc, live.items, may_prune) catch |err| {
+        // Reconcile is ADD/UPDATE ONLY — it never prunes by absence. A restored
+        // agent tab that the user hasn't interacted with yet emits no
+        // session_start, so it is not in the live set; pruning by absence would
+        // silently delete it and lose the session on the next window close
+        // (the reported data-loss bug). Removal happens only on POSITIVE end
+        // signals: an explicit session_end, or the liveness sweep reaping a
+        // dead local pid — both via removeStoreEntryForWorktree.
+        const changed = store.rebuildFromLive(alloc, live.items, false) catch |err| {
             log.warn("agent-session: reconcile failed: {}", .{err});
             return;
         };
         if (changed) agent_session_store.save(alloc, &store) catch |err| {
             log.warn("agent-session: save failed: {}", .{err});
         };
+    }
+
+    /// Remove the durable store entry for `surface`'s worktree on a POSITIVE
+    /// end signal (issue #29 data-loss fix). Called from the explicit end
+    /// paths — an agent's `session_end`, and the liveness sweep reaping a dead
+    /// local pid — NOT from generic surface finalize (tab move / view switch /
+    /// window close), which must never drop a restorable session. No-op when
+    /// the surface's worktree still hosts another live agent surface (a split
+    /// or sibling tab keeping the worktree alive).
+    fn removeStoreEntryForWorktree(self: *Window, surface: *Surface) void {
+        const priv = self.private();
+        const worktree: ?[]const u8 = self.worktreePathForSurface(surface);
+        const key: []const u8 = worktree orelse (surface.getPwd() orelse return);
+        if (key.len == 0) return;
+
+        // Keep the entry if another live agent surface shares this worktree.
+        var it = priv.surface_agents.iterator();
+        while (it.next()) |entry| {
+            const other = entry.key_ptr.*;
+            if (other == surface) continue;
+            const owt: ?[]const u8 = self.worktreePathForSurface(other);
+            const okey: []const u8 = owt orelse (other.getPwd() orelse continue);
+            if (okey.len > 0 and std.mem.eql(u8, okey, key)) return;
+        }
+
+        const alloc = Application.default().allocator();
+        var store = agent_session_store.load(alloc);
+        defer store.deinit(alloc);
+        if (store.indexOfWorktree(key)) |i| {
+            var removed = store.sessions.orderedRemove(i);
+            removed.deinit(alloc);
+            agent_session_store.save(alloc, &store) catch |err| {
+                log.warn("agent-session: save-after-remove failed: {}", .{err});
+            };
+        }
     }
 
     /// Record (or replace) the agent session id for a surface (issue #29).
@@ -3207,7 +3235,7 @@ pub const Window = extern struct {
             return;
         }
         var changed = false;
-        if (self.removeSurfaceAgent(surface)) changed = true;
+        if (self.removeSurfaceAgent(surface, false)) changed = true;
         if (self.clearSurfaceAttention(surface)) changed = true;
         _ = priv.tracked_surfaces.remove(surface);
         // The surface is gone (tab/split/window close); its durable session
@@ -3222,7 +3250,7 @@ pub const Window = extern struct {
     /// teardown so a crashed/exited agent doesn't leave a stale tab icon
     /// (trio footgun #1: missing end-events leak icons).
     pub fn clearSurfaceAgent(self: *Window, surface: *Surface) void {
-        if (self.removeSurfaceAgent(surface)) {
+        if (self.removeSurfaceAgent(surface, false)) {
             self.refreshTabAgentIcon(surface);
             self.rebuildSidebarRows();
         }
@@ -4090,7 +4118,7 @@ pub const Window = extern struct {
             // Removing agent presence must also refresh the sidebar so a
             // worktree leaves the "Active" section when its last agent ends
             // (#22). removeSurfaceAgent decrements the per-worktree count.
-            if (self.removeSurfaceAgent(s)) changed = true;
+            if (self.removeSurfaceAgent(s, false)) changed = true;
             if (self.clearSurfaceAttention(s)) changed = true;
         }
         if (changed) self.rebuildSidebarRows();
@@ -4345,7 +4373,7 @@ pub const Window = extern struct {
                 if (new_tree) |nt| {
                     if (treeContains(nt, surface)) continue;
                 }
-                if (self.removeSurfaceAgent(surface)) changed = true;
+                if (self.removeSurfaceAgent(surface, false)) changed = true;
                 _ = self.clearSurfaceAttention(surface);
             }
         }
