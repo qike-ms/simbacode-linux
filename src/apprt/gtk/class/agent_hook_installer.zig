@@ -837,6 +837,12 @@ fn openCodePluginSource(alloc: Allocator) ![]u8 {
     defer alloc.free(idle);
     const awaiting = try hooks.compositeCommandFull(alloc, &.{.awaiting_input}, false, .opencode, .none);
     defer alloc.free(awaiting);
+    // Turn-done: go idle AND raise the done bell. OpenCode's plugin can't pipe
+    // the hook JSON on stdin, so we use a literal-title notify (agent label,
+    // empty body) — enough to raise the sidebar bell + banner like every other
+    // agent's Stop->idle+notify does.
+    const done = try openCodeDoneCommand(alloc);
+    defer alloc.free(done);
 
     const j_ss = try jsString(alloc, session_start);
     defer alloc.free(j_ss);
@@ -848,6 +854,8 @@ fn openCodePluginSource(alloc: Allocator) ![]u8 {
     defer alloc.free(j_idle);
     const j_await = try jsString(alloc, awaiting);
     defer alloc.free(j_await);
+    const j_done = try jsString(alloc, done);
+    defer alloc.free(j_done);
 
     return std.fmt.allocPrint(alloc,
         \\// {s}
@@ -879,11 +887,15 @@ fn openCodePluginSource(alloc: Allocator) ![]u8 {
         \\    dispose: async () => {{
         \\      await emit({s})
         \\    }},
-        \\    "tool.execute.before": async (input) => {{
+        \\    // A new user message starts a turn: stay BUSY the whole turn so the
+        \\    // indicator bounces continuously (not just briefly per tool).
+        \\    "chat.message": async (input) => {{
         \\      track(input)
         \\      await emit({s})
         \\    }},
-        \\    "tool.execute.after": async (input) => {{
+        \\    // Tool calls also keep it busy; we do NOT flip idle after each tool
+        \\    // (that stuttered the bounce). Idle+bell come on turn end below.
+        \\    "tool.execute.before": async (input) => {{
         \\      track(input)
         \\      await emit({s})
         \\    }},
@@ -905,7 +917,24 @@ fn openCodePluginSource(alloc: Allocator) ![]u8 {
         \\  }}
         \\}}
         \\
-    , .{ hooks.ownership_marker, j_ss, j_sei, j_busy, j_idle, j_await, j_idle, j_busy, j_sei });
+    , .{ hooks.ownership_marker, j_ss, j_sei, j_busy, j_busy, j_await, j_done, j_busy, j_sei });
+}
+
+/// Build the OpenCode "turn done" command: go idle AND raise the done bell.
+/// The bell is a literal-title notify (agent label, empty body) because the
+/// OpenCode plugin runs commands with the terminal on stdin and nothing piped,
+/// so the stdin-reading notify used by other agents can't run here. Composed
+/// as a single guarded brace group like the other legs. Caller owns the result.
+fn openCodeDoneCommand(alloc: Allocator) ![]u8 {
+    const idle = try hooks.emitShell(alloc, .idle, .opencode, false);
+    defer alloc.free(idle);
+    const notify = try hooks.emitLiteralNotifyShell(alloc, .opencode);
+    defer alloc.free(notify);
+    return std.fmt.allocPrint(
+        alloc,
+        "{s} && {{ {s}; {s}; {s}; }} >/dev/null 2>&1 || true {s}",
+        .{ hooks.osc_guard_expr, hooks.tty_resolve_snippet, idle, notify, hooks.ownership_marker },
+    );
 }
 
 /// JSON-encode `value` as a double-quoted JS string literal (escapes `"`, `\`,
@@ -1478,6 +1507,15 @@ test "opencode plugin + pi extension carry sentinel and events" {
     try testing.expect(std.mem.indexOf(u8, plugin, hooks.ownership_marker) != null);
     try testing.expect(std.mem.indexOf(u8, plugin, "event=session_start") != null);
     try testing.expect(std.mem.indexOf(u8, plugin, "SimbacodePresence") != null);
+    // Bounce whole-turn: busy starts on a new user message (turn start), and we
+    // no longer flip idle after each tool (that stuttered the bounce).
+    try testing.expect(std.mem.indexOf(u8, plugin, "\"chat.message\": async") != null);
+    try testing.expect(std.mem.indexOf(u8, plugin, "\"tool.execute.after\"") == null);
+    try testing.expect(std.mem.indexOf(u8, plugin, "event=busy") != null);
+    // Done bell: session.idle emits idle AND a notify so the bell rings when
+    // OpenCode finishes a turn (previously it emitted a bare idle, no bell).
+    try testing.expect(std.mem.indexOf(u8, plugin, "session.idle") != null);
+    try testing.expect(std.mem.indexOf(u8, plugin, "kind=notify") != null);
 
     const pi_src = try piExtensionSource(alloc);
     defer alloc.free(pi_src);

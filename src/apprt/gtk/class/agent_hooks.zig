@@ -244,6 +244,28 @@ pub fn emitNotifyShell(alloc: Allocator, agent: Agent, reads_stdin: bool) ![]u8 
     );
 }
 
+/// Build a notify leg with a LITERAL title (no stdin read), for agents whose
+/// hook context can't pipe the hook JSON on stdin — e.g. the OpenCode plugin,
+/// which runs commands via `$`sh -c ...`` with the terminal on stdin. The title
+/// is the agent's display label (base64-encoded at build time), the body is
+/// empty. This raises the same done/needs-you bell + banner that the stdin
+/// notify does for other agents, just without a message body. Caller owns the
+/// result.
+pub fn emitLiteralNotifyShell(alloc: Allocator, agent: Agent) ![]u8 {
+    // Base64 the title once, at generation time, so the shell has no work to do
+    // and can't fail. std.base64 standard alphabet, no newline.
+    const title = agent.rawValue();
+    const enc = std.base64.standard.Encoder;
+    const title_b64 = try alloc.alloc(u8, enc.calcSize(title.len));
+    defer alloc.free(title_b64);
+    _ = enc.encode(title_b64, title);
+    return std.fmt.allocPrint(
+        alloc,
+        "printf '\\033]3008;start={s};kind=notify;title=%s;body=\\033\\\\' \"{s}\" > \"$__tty\"",
+        .{ agent.rawValue(), title_b64 },
+    );
+}
+
 /// Compose the OSC 3008 hook command: one guard, then (once it passes) the tty
 /// resolve plus one presence emit per event and/or a notify emit, all in a
 /// single brace group whose output is suppressed, with the trailing ownership
