@@ -23,7 +23,7 @@ cd "$(dirname "$0")/.."
 
 LOCAL="${HOME}/.local"
 DEST="${DEST:-${LOCAL}/bin/simbacode}"
-SRC="zig-out/bin/ghostty"
+SRC="${SRC:-zig-out/bin/ghostty}"
 
 build=1
 [[ "${1:-}" == "--no-build" ]] && build=0
@@ -47,6 +47,24 @@ if [[ ! -x "$SRC" ]]; then
   exit 1
 fi
 
+# Refuse an unsafe artifact before replacing the working binary. `ldd` alone
+# is insufficient: a bad binary can both statically export vendored Fc* symbols
+# and dynamically load the system copy through GTK/Pango.
+verify_system_fontconfig() {
+  local binary="$1"
+  if ! readelf -d "$binary" 2>/dev/null | grep -Fq 'Shared library: [libfontconfig.so.1]'; then
+    echo "error: build is not dynamically linked to system libfontconfig.so.1" >&2
+    return 1
+  fi
+  if nm -D "$binary" 2>/dev/null | grep -qE ' [TDB] Fc'; then
+    echo "error: build exports vendored fontconfig symbols; refusing unsafe build" >&2
+    return 1
+  fi
+}
+
+verify_system_fontconfig "$SRC"
+echo "==> Verified build: single system fontconfig linkage"
+
 mkdir -p "$(dirname "$DEST")"
 
 # Atomic install: write next to the destination (same filesystem, so rename is
@@ -60,19 +78,6 @@ trap - EXIT
 
 echo "==> Installed $DEST"
 ls -la "$DEST"
-
-# Refuse to call a build successful unless it uses the one system fontconfig
-# shared with GTK/Pango. `ldd` alone is insufficient: a bad binary can both
-# statically export vendored Fc* symbols and dynamically load the system copy.
-if ! readelf -d "$DEST" 2>/dev/null | grep -Fq 'Shared library: [libfontconfig.so.1]'; then
-  echo "error: installed binary is not dynamically linked to system libfontconfig.so.1" >&2
-  exit 1
-fi
-if nm -D "$DEST" 2>/dev/null | grep -qE ' [TDB] Fc'; then
-  echo "error: installed binary exports vendored fontconfig symbols; refusing unsafe build" >&2
-  exit 1
-fi
-echo "==> Verified: single system fontconfig linkage"
 
 # Warn if an old process is still running the previous inode.
 if pgrep -f "$DEST" >/dev/null 2>&1; then
