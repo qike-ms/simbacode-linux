@@ -17,6 +17,7 @@
 #   scripts/install-binary.sh            # build (ReleaseFast) + install
 #   scripts/install-binary.sh --no-build # install the existing zig-out binary
 #   DEST=/path/to/simbacode scripts/install-binary.sh   # override install path
+#   SRC=/path/to/ghostty scripts/install-binary.sh --no-build  # test another artifact
 set -euo pipefail
 
 cd "$(dirname "$0")/.."
@@ -52,11 +53,19 @@ fi
 # and dynamically load the system copy through GTK/Pango.
 verify_system_fontconfig() {
   local binary="$1"
-  if ! readelf -d "$binary" 2>/dev/null | grep -Fq 'Shared library: [libfontconfig.so.1]'; then
+  command -v readelf >/dev/null || {
+    echo "error: readelf is required to verify fontconfig linkage" >&2
+    return 1
+  }
+  command -v nm >/dev/null || {
+    echo "error: nm is required to verify fontconfig linkage" >&2
+    return 1
+  }
+  if ! LC_ALL=C readelf -d "$binary" 2>/dev/null | grep -Fq 'Shared library: [libfontconfig.so.1]'; then
     echo "error: build is not dynamically linked to system libfontconfig.so.1" >&2
     return 1
   fi
-  if nm -D "$binary" 2>/dev/null | grep -qE ' [TDB] Fc'; then
+  if nm -D --defined-only "$binary" 2>/dev/null | awk '{print $NF}' | grep -qE '^Fc'; then
     echo "error: build exports vendored fontconfig symbols; refusing unsafe build" >&2
     return 1
   fi
@@ -69,7 +78,7 @@ mkdir -p "$(dirname "$DEST")"
 
 # Atomic install: write next to the destination (same filesystem, so rename is
 # atomic and never hits ETXTBSY), then rename over the target.
-tmp="${DEST}.new.$$"
+tmp="$(mktemp "${DEST}.new.XXXXXX")"
 trap 'rm -f "$tmp"' EXIT
 cp "$SRC" "$tmp"
 chmod +x "$tmp"
