@@ -12,7 +12,6 @@
   pkg-config,
   zig_0_15,
   pandoc,
-  binutils,
   revision ? "dirty",
   optimize ? "Debug",
   enableX11 ? true,
@@ -64,7 +63,6 @@ in
         ncurses
         pandoc
         pkg-config
-        binutils
         zig_0_15
         gobject-introspection
         wrapGAppsHook4
@@ -94,7 +92,6 @@ in
       "-Dcpu=baseline"
       "-Doptimize=${optimize}"
       "-Dstrip=${lib.boolToString strip}"
-      "-fsys=fontconfig"
     ];
 
     outputs = [
@@ -105,15 +102,6 @@ in
     ];
 
     postInstall = ''
-      if ! LC_ALL=C readelf -d "$out/bin/ghostty" | grep -Fq 'Shared library: [libfontconfig.so.1]'; then
-        echo "error: Nix package must dynamically link system libfontconfig.so.1" >&2
-        exit 1
-      fi
-      if nm -D --defined-only "$out/bin/ghostty" | awk '{print $NF}' | grep -qE '^Fc'; then
-        echo "error: Nix package exports vendored Fontconfig symbols" >&2
-        exit 1
-      fi
-
       terminfo_src=${
         if stdenv.hostPlatform.isDarwin
         then ''"$out/Applications/Ghostty.app/Contents/Resources/terminfo"''

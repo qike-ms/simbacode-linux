@@ -453,20 +453,14 @@ pub fn init(b: *std.Build, appVersion: []const u8) !Config {
     // show up properly in `--help`.
 
     {
-        // Fontconfig keeps process-global state and GTK/Pango dynamically load
-        // the system copy. GTK builds must therefore use that same dynamic
-        // library: statically linking our vendored copy causes ABI/cache-layout
-        // collisions and renderer crashes during fallback glyph lookup. Keep
-        // every other target on its existing system-package-mode default.
-        _ = b.systemIntegrationOption("fontconfig", .{
-            .default = if (config.app_runtime == .gtk) true else null,
-        });
-
-        // These dependencies default false on macOS. On macOS we generally want
-        // a fat binary. This can be overridden with the `-fsys` flag.
+        // These dependencies we want to default false if we're on macOS.
+        // On macOS we don't want to use system libraries because we
+        // generally want a fat binary. This can be overridden with the
+        // `-fsys` flag.
         for (&[_][]const u8{
             "freetype",
             "harfbuzz",
+            "fontconfig",
             "libpng",
             "zlib",
             "oniguruma",

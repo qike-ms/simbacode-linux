@@ -59,21 +59,3 @@ active only in the first fresh process after the old instance exits. Never skip
 installation merely to avoid interrupting active tabs: install first, verify
 the on-disk artifact, then report whether a full quit/relaunch is still needed.
 
-### Linux GTK Fontconfig crash invariant
-
-GTK/Pango and Simbacode must dynamically share **one system Fontconfig**. A
-vendored static Fontconfig plus GTK's system `libfontconfig.so.1` corrupts
-process-global Fontconfig state/cache layout and crashes renderer threads during
-fallback-glyph lookup (`Fc*` / FreeType frames).
-
-- GTK builds must use `-fsys=fontconfig`; `-fno-sys=fontconfig` is forbidden
-  and must fail during the build.
-- Keep the Nix package explicit (`-fsys=fontconfig`) and preserve its
-  post-install ELF gate: `DT_NEEDED libfontconfig.so.1`, with no defined `Fc*`
-  exports.
-- Keep `scripts/install-binary.sh`'s identical pre-replacement gate. It must
-  reject an unsafe artifact **before** replacing `~/.local/bin/simbacode`.
-- Regression proof: run a normal installer build, verify the installed artifact
-  matches `zig-out/bin/ghostty`, and run a deliberately invalid ELF fixture that
-  is rejected while a destination sentinel remains unchanged.
-

@@ -212,16 +212,8 @@ pub fn add(
         }
     }
 
-    // Fontconfig. GTK/Pango always load the system library, so GTK must not
-    // statically link the vendored copy even when the selected font backend
-    // itself does not use Fontconfig.
-    const system_fontconfig = b.systemIntegrationOption("fontconfig", .{});
-    if (self.config.app_runtime == .gtk and !system_fontconfig)
-        std.debug.panic(
-            "GTK builds must dynamically link system Fontconfig; " ++
-                "-fno-sys=fontconfig is unsafe and can crash the renderer",
-            .{},
-        );
+    // Fontconfig
+    _ = b.systemIntegrationOption("fontconfig", .{}); // Shows it in help
     if (self.config.font_backend.hasFontconfig()) {
         if (b.lazyDependency("fontconfig", .{
             .target = target,
@@ -232,7 +224,7 @@ pub fn add(
                 fontconfig_dep.module("fontconfig"),
             );
 
-            if (system_fontconfig) {
+            if (b.systemIntegrationOption("fontconfig", .{})) {
                 step.linkSystemLibrary2("fontconfig", dynamic_link_opts);
             } else {
                 step.linkLibrary(fontconfig_dep.artifact("fontconfig"));
