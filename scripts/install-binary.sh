@@ -9,8 +9,9 @@
 #     succeeds regardless: the running process keeps its old inode, and the
 #     next launch picks up the new one.
 #   * The plain `zig build` in the README omits the PKG_CONFIG_PATH /
-#     LIBRARY_PATH that gtk4-layer-shell needs, so it fails to link. This wraps
-#     the exact env the build requires.
+#     LIBRARY_PATH that gtk4-layer-shell needs, and `-fsys=fontconfig` which
+#     prevents a vendored/system fontconfig ABI collision. This wraps the exact
+#     required build environment.
 #
 # Usage:
 #   scripts/install-binary.sh            # build (ReleaseFast) + install
@@ -29,11 +30,16 @@ build=1
 
 if [[ "$build" == 1 ]]; then
   echo "==> Building (ReleaseFast)…"
+  # -fsys=fontconfig is REQUIRED on Linux (commit 043c61e5): GTK/pango pull in
+  # the system libfontconfig.so.1, so statically linking the vendored copy puts
+  # TWO fontconfig versions in one process and segfaults inside FcFontMatch /
+  # FcCompare on font fallback. Use the system fontconfig instead.
   PKG_CONFIG_PATH="${LOCAL}/lib/x86_64-linux-gnu/pkgconfig:${PKG_CONFIG_PATH:-}" \
   LIBRARY_PATH="${LOCAL}/lib/x86_64-linux-gnu:${LIBRARY_PATH:-}" \
   zig build -Demit-macos-app=false -Doptimize=ReleaseFast \
     --search-prefix "${LOCAL}" \
-    -Dpatch-rpath="${LOCAL}/lib/x86_64-linux-gnu"
+    -Dpatch-rpath="${LOCAL}/lib/x86_64-linux-gnu" \
+    -fsys=fontconfig
 fi
 
 if [[ ! -x "$SRC" ]]; then
@@ -54,6 +60,19 @@ trap - EXIT
 
 echo "==> Installed $DEST"
 ls -la "$DEST"
+
+# Refuse to call a build successful unless it uses the one system fontconfig
+# shared with GTK/Pango. `ldd` alone is insufficient: a bad binary can both
+# statically export vendored Fc* symbols and dynamically load the system copy.
+if ! readelf -d "$DEST" 2>/dev/null | grep -Fq 'Shared library: [libfontconfig.so.1]'; then
+  echo "error: installed binary is not dynamically linked to system libfontconfig.so.1" >&2
+  exit 1
+fi
+if nm -D "$DEST" 2>/dev/null | grep -qE ' [TDB] Fc'; then
+  echo "error: installed binary exports vendored fontconfig symbols; refusing unsafe build" >&2
+  exit 1
+fi
+echo "==> Verified: single system fontconfig linkage"
 
 # Warn if an old process is still running the previous inode.
 if pgrep -f "$DEST" >/dev/null 2>&1; then
