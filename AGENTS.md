@@ -46,3 +46,16 @@ MINOR findings, fix all CRITICAL/MAJOR, and note anything deferred. See
 `dist/linux/simbacode/TRIO-REVIEW.md` for the established format. Do not skip
 this even for small changes.
 
+### Always install a fresh binary from the tested source state
+
+After every `simbacode-linux` code change, run `scripts/install-binary.sh`, then
+require `cmp -s zig-out/bin/ghostty ~/.local/bin/simbacode` to pass before
+declaring the work done. A successful source-tree build is not a user-testable
+delivery. The installer creates a fresh ReleaseFast build from the source state
+that passed tests and atomically replaces the binary even while Simbacode is
+running. The current process keeps its old inode until a full quit; because GTK
+single-instance launches can route into that old process, the fix becomes
+active only in the first fresh process after the old instance exits. Never skip
+installation merely to avoid interrupting active tabs: install first, verify
+the on-disk artifact, then report whether a full quit/relaunch is still needed.
+
