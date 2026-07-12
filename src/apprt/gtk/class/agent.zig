@@ -27,11 +27,21 @@ pub const Activity = enum {
     awaiting_input,
 };
 
+/// Decide whether an OSC presence/notification signal may affect a surface's
+/// agent state. The first agent to claim a surface owns it until that session
+/// ends. Coding agents commonly launch other coding-agent CLIs for reviews;
+/// those nested subprocesses share the same PTY and therefore emit OSC on the
+/// same surface, but must not replace or animate the interactive owner.
+pub fn admitsSignal(owner: ?Agent, sender: Agent) bool {
+    return owner == null or owner.? == sender;
+}
+
 /// Known coding agents, matching the macOS asset marks
 /// (claude-code-mark, codex-mark, pi-mark, kiro-mark) plus a generic fallback.
 pub const Agent = enum {
     claude,
     codex,
+    copilot,
     pi,
     kiro,
     hermes,
@@ -51,6 +61,7 @@ pub const Agent = enum {
 
         if (contains(lower, "claude")) return .claude;
         if (contains(lower, "codex")) return .codex;
+        if (contains(lower, "copilot")) return .copilot;
         if (contains(lower, "kiro")) return .kiro;
         if (contains(lower, "hermes")) return .hermes;
         // Check openclaw before opencode (both start with "open").
@@ -76,7 +87,7 @@ pub const Agent = enum {
             .hermes => @embedFile("agent-icons/agent-hermes-symbolic.svg"),
             // opencode/openclaw have no dedicated SVG yet; reuse the generic
             // mark for the tab indicator (the sidebar uses the text symbol).
-            .opencode, .openclaw, .generic => @embedFile("agent-icons/agent-generic-symbolic.svg"),
+            .copilot, .opencode, .openclaw, .generic => @embedFile("agent-icons/agent-generic-symbolic.svg"),
         };
     }
 
@@ -88,6 +99,7 @@ pub const Agent = enum {
         return switch (self) {
             .claude => "\u{2733}", // ✳ eight-spoked asterisk
             .codex => "\u{276F}", // ❯ single-char prompt mark (was ">_", too wide)
+            .copilot => "cp",
             .pi => "\u{03C0}", // π
             .kiro => "ki",
             .hermes => "h",
@@ -122,6 +134,7 @@ pub const Agent = enum {
         return switch (self) {
             .claude => "Claude Code",
             .codex => "Codex",
+            .copilot => "Copilot",
             .pi => "Pi",
             .kiro => "Kiro",
             .hermes => "Hermes",
@@ -139,6 +152,7 @@ pub const Agent = enum {
         return switch (self) {
             .claude => "claude",
             .codex => "codex",
+            .copilot => "copilot",
             .pi => "pi",
             .kiro => "kiro",
             .hermes => "hermes",
@@ -180,7 +194,7 @@ pub const Agent = enum {
             .hermes => "hermes --resume ",
             // Not live-verified (capture and/or resume-by-id unknown). Under
             // "never start new", these are NOT restorable until verified.
-            .kiro, .openclaw, .generic => null,
+            .copilot, .kiro, .openclaw, .generic => null,
         };
         const p = prefix orelse return null;
         return std.fmt.bufPrintZ(buf, "{s}{s}", .{ p, session_id }) catch null;
@@ -197,7 +211,7 @@ pub const Agent = enum {
     pub fn canResumeExact(self: Agent) bool {
         return switch (self) {
             .claude, .codex, .pi, .opencode, .hermes => true,
-            .kiro, .openclaw, .generic => false,
+            .copilot, .kiro, .openclaw, .generic => false,
         };
     }
 
@@ -223,11 +237,29 @@ pub fn newBellIcon() ?*gio.Icon {
     return icon.as(gio.Icon);
 }
 
+test "nested agent signals do not replace the surface owner" {
+    const testing = std.testing;
+
+    // An unowned surface can be claimed. The owner's complete lifecycle,
+    // including session_end, remains admissible so removal releases ownership.
+    try testing.expect(admitsSignal(null, .pi));
+    try testing.expect(admitsSignal(.pi, .pi));
+
+    // Every foreign lifecycle leg uses this same gate: session_start, busy,
+    // idle, awaiting_input, session_end, notify, and the legacy wire path.
+    try testing.expect(!admitsSignal(.pi, .codex));
+    try testing.expect(!admitsSignal(.codex, .pi));
+
+    // After owner removal the next agent can claim normally.
+    const released_owner: ?Agent = null;
+    try testing.expect(admitsSignal(released_owner, .codex));
+}
+
 test "Agent.name round-trips through parse" {
     const testing = std.testing;
     inline for (.{
-        Agent.claude, Agent.codex,    Agent.pi,       Agent.kiro,
-        Agent.hermes, Agent.opencode, Agent.openclaw,
+        Agent.claude, Agent.codex,  Agent.copilot,  Agent.pi,
+        Agent.kiro,   Agent.hermes, Agent.opencode, Agent.openclaw,
     }) |a| {
         try testing.expectEqual(a, Agent.parse(a.name()).?);
     }
@@ -238,7 +270,7 @@ test "Agent.name round-trips through parse" {
         try testing.expect(a.canResumeExact());
     }
     // Unverified agents must NOT be resumable (never fake-restore into fresh).
-    inline for (.{ Agent.kiro, Agent.openclaw, Agent.generic }) |a| {
+    inline for (.{ Agent.copilot, Agent.kiro, Agent.openclaw, Agent.generic }) |a| {
         try testing.expect(!a.canResumeExact());
     }
     var buf: [128]u8 = undefined;
@@ -278,6 +310,7 @@ test "Agent.parse known agents" {
     try testing.expectEqual(Agent.claude, Agent.parse("claude-code").?);
     try testing.expectEqual(Agent.claude, Agent.parse("Claude Code").?);
     try testing.expectEqual(Agent.codex, Agent.parse("codex").?);
+    try testing.expectEqual(Agent.copilot, Agent.parse("copilot").?);
     try testing.expectEqual(Agent.kiro, Agent.parse("kiro").?);
     try testing.expectEqual(Agent.hermes, Agent.parse("hermes").?);
     try testing.expectEqual(Agent.pi, Agent.parse("pi").?);

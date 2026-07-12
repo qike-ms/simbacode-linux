@@ -3264,6 +3264,15 @@ pub const Window = extern struct {
         return self.private().surface_agents.contains(surface);
     }
 
+    /// Whether a signal from `sender` belongs to this surface's owning agent.
+    /// The first agent keeps ownership until session_end; nested coding-agent
+    /// subprocesses on the same PTY are ignored instead of replacing the icon
+    /// or driving the wrong sidebar animation.
+    pub fn surfaceAdmitsAgentSignal(self: *Window, surface: *Surface, sender: agentpkg.Agent) bool {
+        const owner = if (self.private().surface_agents.get(surface)) |entry| entry.agent else null;
+        return agentpkg.admitsSignal(owner, sender);
+    }
+
     /// Whether `surface` is currently "in the user's face": its window is the
     /// active (focused) window AND its tab is the selected tab of the visible
     /// worktree view. Used to suppress redundant attention notifications when

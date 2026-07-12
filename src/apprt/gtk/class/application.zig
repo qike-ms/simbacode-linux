@@ -2507,6 +2507,19 @@ const Action = struct {
         // `attention` field (attention=1 / attention=true).
         const wants_attention = value.metadata.len > 0 and parseAttentionField(value.metadata);
 
+        // Apply the same first-owner rule to the supported legacy wire shape.
+        // A foreign legacy start/end/attention signal must not replace or
+        // detach the owner, clear its attention, or raise a nested-agent alert.
+        if (window) |win| {
+            if (agent) |sender| {
+                if (!win.surfaceAdmitsAgentSignal(surface, sender)) return true;
+            } else if (!active and win.surfaceHasAgent(surface)) {
+                // A bare legacy end has no sender identity, so it cannot prove
+                // that it belongs to the current owner. Ignore it while owned.
+                return true;
+            }
+        }
+
         // Agent presence -> per-tab indicator icon (req 3). On `start` with an
         // agent name, attach it; on `end`, detach. Keyed by surface pointer.
         if (window) |win| {
@@ -2609,6 +2622,15 @@ const Action = struct {
         else
             .generic;
 
+        // One surface has one interactive owner. Review/delegation subprocesses
+        // (for example Pi launching Codex) inherit the same PTY and emit valid
+        // OSC events on this surface, but their lifecycle must not replace,
+        // animate, detach, or notify as the owner. Once the owner sends
+        // session_end and is removed, the next agent may claim the surface.
+        if (window) |win| {
+            if (!win.surfaceAdmitsAgentSignal(surface, agent)) return;
+        }
+
         // Optional local pid for the liveness sweep (present only on the local
         // host; omitted over SSH). Drives the periodic sweep that reaps a
         // crashed local agent that never sent session_end. Reject non-positive
@@ -2701,6 +2723,13 @@ const Action = struct {
             (agentpkg.Agent.parse(value.id) orelse .generic)
         else
             .generic;
+
+        // A nested agent's completion notification shares the owner's PTY just
+        // like its presence events. Ignore it too; otherwise a Pi-owned tab can
+        // still gain a Codex bell after the Codex identity overwrite is fixed.
+        if (window) |win| {
+            if (!win.surfaceAdmitsAgentSignal(surface, agent)) return;
+        }
 
         const title_b64 = fieldValue(value.metadata, "title") orelse "";
         const body_b64 = fieldValue(value.metadata, "body") orelse "";
