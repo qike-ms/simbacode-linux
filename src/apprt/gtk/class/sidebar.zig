@@ -17,6 +17,35 @@ const ssh_command = @import("ssh_command.zig");
 
 const log = std.log.scoped(.simbacode_sidebar);
 
+/// Prevents a sidebar refresh from replacing ListBox rows between a pointer
+/// press and the matching activation. GTK resolves ListBox activation on
+/// release, so rebuilding rows mid-click can activate the row that moved under
+/// the pointer instead of the row the user pressed.
+pub const RebuildGuard = struct {
+    pointer_active: bool = false,
+    rebuild_deferred: bool = false,
+
+    pub fn pointerPressed(self: *RebuildGuard) void {
+        self.pointer_active = true;
+    }
+
+    /// Returns true when rows may be rebuilt now. Otherwise records one
+    /// coalesced rebuild to run after the pointer sequence finishes.
+    pub fn requestRebuild(self: *RebuildGuard) bool {
+        if (!self.pointer_active) return true;
+        self.rebuild_deferred = true;
+        return false;
+    }
+
+    /// Finish the pointer sequence. Returns true when a rebuild was deferred.
+    pub fn pointerFinished(self: *RebuildGuard) bool {
+        self.pointer_active = false;
+        const rebuild = self.rebuild_deferred;
+        self.rebuild_deferred = false;
+        return rebuild;
+    }
+};
+
 /// Status of a single worktree (or a repo's main checkout).
 pub const WorktreeStatus = struct {
     /// Display name (basename of the worktree path).
@@ -373,11 +402,41 @@ fn sortResults(results: []WorktreeStatus) void {
         fn lessThan(_: void, a: WorktreeStatus, b: WorktreeStatus) bool {
             const repo_cmp = std.mem.order(u8, a.repo_name, b.repo_name);
             if (repo_cmp != .eq) return repo_cmp == .lt;
+            const host_cmp = compareHosts(a.host, b.host);
+            if (host_cmp != .eq) return host_cmp == .lt;
+            const root_cmp = std.mem.order(u8, a.repo_root, b.repo_root);
+            if (root_cmp != .eq) return root_cmp == .lt;
             // Within a repo: main checkout (not is_worktree) sorts first.
             if (a.is_worktree != b.is_worktree) return !a.is_worktree;
             return std.mem.lessThan(u8, a.name, b.name);
         }
     }.lessThan);
+}
+
+pub fn compareHosts(a: ?RemoteHost, b: ?RemoteHost) std.math.Order {
+    const ah = a orelse return if (b == null) .eq else .lt;
+    const bh = b orelse return .gt;
+    const alias_cmp = std.mem.order(u8, ah.alias, bh.alias);
+    if (alias_cmp != .eq) return alias_cmp;
+    const user_cmp = compareOptionalString(ah.username, bh.username);
+    if (user_cmp != .eq) return user_cmp;
+    return compareOptionalPort(ah.port, bh.port);
+}
+
+fn compareOptionalString(a: ?[:0]u8, b: ?[:0]u8) std.math.Order {
+    const av = a orelse return if (b == null) .eq else .lt;
+    const bv = b orelse return .gt;
+    return std.mem.order(u8, av, bv);
+}
+
+fn compareOptionalPort(a: ?u16, b: ?u16) std.math.Order {
+    const av = a orelse return if (b == null) .eq else .lt;
+    const bv = b orelse return .gt;
+    return std.math.order(av, bv);
+}
+
+pub fn sameLocation(a: WorktreeStatus, b: WorktreeStatus) bool {
+    return std.mem.eql(u8, a.path, b.path) and compareHosts(a.host, b.host) == .eq;
 }
 
 /// Scan an explicit list of user-added project roots. Each root is treated as
@@ -431,21 +490,20 @@ pub fn scanPaths(alloc: Allocator, roots: []const sidebar_store.Root) ![]Worktre
         }
     }
 
-    // Deduplicate by worktree path: overlapping roots (e.g. `~/git` added
-    // alongside a child repo `~/git/foo`, or the same repo reached via two
-    // roots) would otherwise list the same worktree twice. Keep first seen.
-    // The map is pre-sized so getOrPut can't fail mid-loop — an OOM there would
-    // leave the in-place compaction half-done and make the function-wide
-    // errdefer double-free aliased survivor slots.
+    // Deduplicate by (host, worktree path): overlapping roots on the SAME
+    // location should collapse, but identical absolute paths on two SSH hosts
+    // are distinct worktrees and must both survive.
     {
-        var seen: std.StringHashMapUnmanaged(void) = .empty;
-        defer seen.deinit(alloc);
-        try seen.ensureTotalCapacity(alloc, @intCast(results.items.len));
         var w: usize = 0;
         for (results.items) |s| {
-            const gop = seen.getOrPutAssumeCapacity(s.path);
-            if (gop.found_existing) {
-                // Drop this duplicate; free its owned strings.
+            var duplicate = false;
+            for (results.items[0..w]) |kept| {
+                if (sameLocation(s, kept)) {
+                    duplicate = true;
+                    break;
+                }
+            }
+            if (duplicate) {
                 s.deinit(alloc);
                 continue;
             }
@@ -494,6 +552,44 @@ pub fn scan(alloc: Allocator, root: []const u8) ![]WorktreeStatus {
 pub fn freeStatuses(alloc: Allocator, statuses: []WorktreeStatus) void {
     for (statuses) |*s| s.deinit(alloc);
     alloc.free(statuses);
+}
+
+test "sameLocation distinguishes identical paths on different SSH hosts" {
+    const a = WorktreeStatus{
+        .name = "repo",
+        .path = "/srv/repo",
+        .branch = "main",
+        .dirty = false,
+        .ahead = 0,
+        .behind = 0,
+        .no_upstream = false,
+        .is_worktree = false,
+        .added = 0,
+        .removed = 0,
+        .repo_root = "/srv/repo",
+        .repo_name = "repo",
+        .host = .{ .alias = @constCast("host-a"), .port = null },
+    };
+    var b = a;
+    b.host = .{ .alias = @constCast("host-b"), .port = null };
+
+    try std.testing.expect(!sameLocation(a, b));
+    b.host = .{ .alias = @constCast("host-a"), .port = null };
+    try std.testing.expect(sameLocation(a, b));
+    b.host = .{ .alias = @constCast("host-a"), .port = 22 };
+    try std.testing.expect(!sameLocation(a, b));
+}
+
+test "RebuildGuard defers refresh until a sidebar click finishes" {
+    var guard: RebuildGuard = .{};
+
+    try std.testing.expect(guard.requestRebuild());
+    guard.pointerPressed();
+    try std.testing.expect(!guard.requestRebuild());
+    try std.testing.expect(!guard.requestRebuild());
+    try std.testing.expect(guard.pointerFinished());
+    try std.testing.expect(guard.requestRebuild());
+    try std.testing.expect(!guard.pointerFinished());
 }
 
 test "parseShortstat: insertions and deletions" {

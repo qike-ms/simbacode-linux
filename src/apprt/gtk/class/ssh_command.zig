@@ -72,17 +72,20 @@ pub const RemoteHost = struct {
             user = trimmed[0..at];
             host_port = trimmed[at + 1 ..];
         }
-        if (host_port.len == 0) return null;
+        if (host_port.len == 0 or host_port[0] == '-') return null;
+        if (user) |u| if (u.len == 0 or u[0] == '-') return null;
 
         var host: []const u8 = undefined;
         var port: ?u16 = null;
         if (host_port[0] == '[') {
-            // Bracketed IPv6: [host] or [host]:port
+            // Bracketed IPv6: [host] or [host]:port. Reject malformed tails or
+            // ports rather than silently changing the target/default port.
             const close = std.mem.indexOfScalar(u8, host_port, ']') orelse return null;
             host = host_port[1..close];
             const after = host_port[close + 1 ..];
-            if (after.len > 0 and after[0] == ':') {
-                port = std.fmt.parseInt(u16, after[1..], 10) catch null;
+            if (after.len > 0) {
+                if (after[0] != ':' or after.len == 1) return null;
+                port = std.fmt.parseInt(u16, after[1..], 10) catch return null;
             }
         } else if (std.mem.lastIndexOfScalar(u8, host_port, ':')) |colon| {
             // host:port only when the tail parses as a port; otherwise the
@@ -96,7 +99,7 @@ pub const RemoteHost = struct {
         } else {
             host = host_port;
         }
-        if (host.len == 0) return null;
+        if (host.len == 0 or host[0] == '-') return null;
 
         return .{
             .alias = host,
@@ -280,12 +283,65 @@ pub fn terminalCommandLine(
     // Destination.
     const dest = try host.sshDestination(alloc);
     defer alloc.free(dest);
+    const dest_q = try shellQuote(alloc, dest);
+    defer alloc.free(dest_q);
     try line.append(alloc, ' ');
-    try line.appendSlice(alloc, dest);
+    try line.appendSlice(alloc, dest_q);
     // Remote command (quoted for the local shell).
     try line.append(alloc, ' ');
     try line.appendSlice(alloc, script_q);
 
+    return line.toOwnedSliceSentinel(alloc, 0);
+}
+
+/// Open an interactive remote terminal, resume an exact agent session, then
+/// leave the user at the same remote worktree's login shell when the agent
+/// exits. `resume_command` is already restricted to an executable prefix plus
+/// an allowlisted session id by the caller.
+pub fn terminalCommandThenShell(
+    alloc: Allocator,
+    host: RemoteHost,
+    working_directory: []const u8,
+    resume_command: []const u8,
+    control_path: []const u8,
+) ![:0]u8 {
+    const dir_q = try shellQuote(alloc, working_directory);
+    defer alloc.free(dir_q);
+    // Run the resume inside a login shell so profile-provided PATH entries are
+    // available, then return to an interactive login shell in the same cwd.
+    const login_script = try std.fmt.allocPrint(
+        alloc,
+        "{s}; exec \"$SHELL\" -l",
+        .{resume_command},
+    );
+    defer alloc.free(login_script);
+    const login_script_q = try shellQuote(alloc, login_script);
+    defer alloc.free(login_script_q);
+    const remote_script = try std.fmt.allocPrint(
+        alloc,
+        "cd -- {s} && SIMBACODE_SURFACE_ID=${{SIMBACODE_SURFACE_ID:-remote}} " ++
+            "SIMBACODE_TTY=$(tty) SIMBACODE_SOCKET_PATH= exec \"$SHELL\" -l -c {s}",
+        .{ dir_q, login_script_q },
+    );
+    defer alloc.free(remote_script);
+    const script_q = try shellQuote(alloc, remote_script);
+    defer alloc.free(script_q);
+
+    var line: std.ArrayListUnmanaged(u8) = .empty;
+    errdefer line.deinit(alloc);
+    try line.appendSlice(alloc, ssh_executable_path);
+    try line.appendSlice(alloc, " -o ControlMaster=auto -o ControlPath=");
+    try line.appendSlice(alloc, control_path);
+    try line.appendSlice(alloc, " -o ControlPersist=10m -tt");
+    if (host.port) |p| try std.fmt.format(line.writer(alloc), " -p {d}", .{p});
+    const dest = try host.sshDestination(alloc);
+    defer alloc.free(dest);
+    const dest_q = try shellQuote(alloc, dest);
+    defer alloc.free(dest_q);
+    try line.append(alloc, ' ');
+    try line.appendSlice(alloc, dest_q);
+    try line.append(alloc, ' ');
+    try line.appendSlice(alloc, script_q);
     return line.toOwnedSliceSentinel(alloc, 0);
 }
 
@@ -338,6 +394,18 @@ test "appendOptionArguments emits -p only with a port" {
     try std.testing.expectEqual(@as(usize, 2), out.items.len);
     try std.testing.expectEqualStrings("-p", out.items[0]);
     try std.testing.expectEqualStrings("2222", out.items[1]);
+}
+
+test "parseAuthority rejects option-like hosts and users" {
+    try std.testing.expect(RemoteHost.parseAuthority("-oProxyCommand=bad") == null);
+    try std.testing.expect(RemoteHost.parseAuthority("user@-bad") == null);
+    try std.testing.expect(RemoteHost.parseAuthority("-oProxyCommand=bad@host") == null);
+}
+
+test "parseAuthority rejects malformed bracketed IPv6 ports" {
+    try std.testing.expect(RemoteHost.parseAuthority("[::1]:bad") == null);
+    try std.testing.expect(RemoteHost.parseAuthority("[::1]:") == null);
+    try std.testing.expect(RemoteHost.parseAuthority("[::1]junk") == null);
 }
 
 test "parseAuthority variants" {
@@ -455,13 +523,32 @@ test "invocation builds a full ssh argv (git shell-out)" {
     try std.testing.expect(saw_port);
 }
 
+test "terminalCommandThenShell resumes remotely and preserves terminal" {
+    const alloc = std.testing.allocator;
+    const host: RemoteHost = .{ .alias = "server", .username = "alice", .port = 2222 };
+    const line = try terminalCommandThenShell(
+        alloc,
+        host,
+        "/srv/project one",
+        "pi --session abc-123",
+        "~/.ssh/simbacode-%C",
+    );
+    defer alloc.free(line);
+    try std.testing.expect(std.mem.indexOf(u8, line, "alice@server") != null);
+    try std.testing.expect(std.mem.indexOf(u8, line, "-p 2222") != null);
+    try std.testing.expect(std.mem.indexOf(u8, line, "pi --session abc-123") != null);
+    try std.testing.expect(std.mem.indexOf(u8, line, "SIMBACODE_SURFACE_ID") != null);
+    try std.testing.expect(std.mem.indexOf(u8, line, "SIMBACODE_TTY=$(tty)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, line, "exec \"$SHELL\" -l") != null);
+}
+
 test "terminalCommandLine opens a login shell in the worktree" {
     const alloc = std.testing.allocator;
     const host: RemoteHost = .{ .alias = "server" };
     const line = try terminalCommandLine(alloc, host, "/home/u/proj", "~/.ssh/simbacode-%C");
     defer alloc.free(line);
     try std.testing.expectEqualStrings(
-        "/usr/bin/ssh -o ControlMaster=auto -o ControlPath=~/.ssh/simbacode-%C -o ControlPersist=10m -tt server 'cd -- '\\''/home/u/proj'\\'' && exec \"$SHELL\" -l'",
+        "/usr/bin/ssh -o ControlMaster=auto -o ControlPath=~/.ssh/simbacode-%C -o ControlPersist=10m -tt 'server' 'cd -- '\\''/home/u/proj'\\'' && exec \"$SHELL\" -l'",
         line,
     );
 }
@@ -472,7 +559,7 @@ test "terminalCommandLine without working dir" {
     const line = try terminalCommandLine(alloc, host, null, "~/.ssh/simbacode-%C");
     defer alloc.free(line);
     try std.testing.expectEqualStrings(
-        "/usr/bin/ssh -o ControlMaster=auto -o ControlPath=~/.ssh/simbacode-%C -o ControlPersist=10m -tt -p 2022 server 'exec \"$SHELL\" -l'",
+        "/usr/bin/ssh -o ControlMaster=auto -o ControlPath=~/.ssh/simbacode-%C -o ControlPersist=10m -tt -p 2022 'server' 'exec \"$SHELL\" -l'",
         line,
     );
 }

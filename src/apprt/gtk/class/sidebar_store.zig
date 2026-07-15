@@ -11,6 +11,7 @@
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
+const ssh_command = @import("ssh_command.zig");
 
 const log = std.log.scoped(.simbacode_sidebar);
 
@@ -290,8 +291,19 @@ pub fn loadFrom(alloc: Allocator, path: []const u8) Store {
             continue;
         }
         if (r.host) |h| {
-            if (h.alias.len == 0) {
-                log.warn("sidebar: skipping remote root with empty host: {s}", .{r.path});
+            if (std.mem.indexOfAny(u8, h.alias, "[]") != null or
+                (h.username != null and std.mem.indexOfAny(u8, h.username.?, "[]") != null))
+            {
+                log.warn("sidebar: skipping bracketed remote host for {s}", .{r.path});
+                continue;
+            }
+            const authority = if (h.username) |u|
+                std.fmt.allocPrint(alloc, "{s}@{s}", .{ u, h.alias }) catch continue
+            else
+                alloc.dupe(u8, h.alias) catch continue;
+            defer alloc.free(authority);
+            if (ssh_command.RemoteHost.parseAuthority(authority) == null) {
+                log.warn("sidebar: skipping invalid remote host for {s}", .{r.path});
                 continue;
             }
             const spec: RemoteSpec = .{

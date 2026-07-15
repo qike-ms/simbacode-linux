@@ -12,15 +12,14 @@
 //! crash-tolerant loads (a corrupt/foreign file yields an empty set, never a
 //! panic).
 //!
-//! Session identity: we persist only the info we can reliably recover on Linux
-//! — the agent name and its cwd (worktree). The per-agent CLI is responsible
-//! for actually resuming "the last conversation" for that cwd (e.g. `claude
-//! --continue`, `codex resume --last`). We intentionally do NOT try to persist
-//! an opaque agent-internal session id: those are agent-private and unstable,
-//! and the cwd + "resume last" contract is what every agent already supports.
+//! Session identity: for agents with a live-verified exact-resume contract we
+//! persist the agent name, real cwd, host-qualified worktree identity, and
+//! allowlisted opaque session id. Restore never falls back to "resume last" or
+//! a fresh conversation; an incomplete/unverified entry is skipped.
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
+const ssh_command = @import("ssh_command.zig");
 
 const log = std.log.scoped(.simbacode_agent_session);
 
@@ -41,7 +40,7 @@ pub const Session = struct {
     /// Optional agent session id (issue #29). When present the restore builds
     /// a session-SPECIFIC resume (e.g. `claude --resume <id>`) so the EXACT
     /// conversation reopens — essential when several tabs run the same agent.
-    /// When absent we fall back to the agent's "continue last" form.
+    /// When absent the entry is not exact-restorable and is skipped.
     session_id: ?[:0]u8 = null,
 
     pub fn deinit(self: *const Session, alloc: Allocator) void {
@@ -168,10 +167,9 @@ pub const Store = struct {
         return false;
     }
 
-    /// Find the index of the entry whose worktree (falling back to cwd) equals
-    /// `key`. Worktree is the RESTORE identity (issue #29 fix): at most one
-    /// restorable agent per worktree, so a new session in a worktree replaces
-    /// the old one instead of accumulating duplicates.
+    /// Find one entry whose worktree (falling back to cwd) equals `key`.
+    /// Multiple sessions may share a worktree; callers needing exact identity
+    /// must use `indexOfSessionId`.
     pub fn indexOfWorktree(self: *const Store, key: []const u8) ?usize {
         for (self.sessions.items, 0..) |*s, i| {
             const wt = s.worktree orelse s.cwd;
@@ -188,8 +186,8 @@ pub const Store = struct {
         session_id: []const u8,
     };
 
-    /// Replace the store's contents with the given live agents, deduplicated by
-    /// worktree (last write wins), keeping only entries with a non-empty agent,
+    /// Replace the store's contents with the given live agents, keyed by exact
+    /// session id, keeping only entries with a non-empty agent,
     /// absolute cwd, and non-empty session id. This is the authoritative
     /// reconcile (issue #29 fix): the on-disk list becomes a snapshot of what is
     /// actually restorable, so a surface that merely finalized (tab move / view
@@ -211,7 +209,7 @@ pub const Store = struct {
 
         // When pruning is not allowed (post-restore grace), seed `next` with a
         // copy of the existing entries so nothing is dropped; live agents then
-        // add/update by worktree on top. When pruning IS allowed, start empty
+        // add/update by exact session id on top. When pruning IS allowed, start empty
         // so orphaned entries fall away.
         if (!may_prune) {
             for (self.sessions.items) |*s| {
@@ -228,24 +226,25 @@ pub const Store = struct {
 
         for (live) |la| {
             if (la.agent.len == 0 or la.cwd.len == 0 or la.session_id.len == 0) continue;
-            const key = la.worktree orelse la.cwd;
-            // Dedup by worktree: replace any existing entry for this worktree.
+            // Session id is the durable identity. Multiple tabs/agents may
+            // legitimately run in one worktree and must all survive restart.
             var replaced = false;
             for (next.items) |*s| {
-                const wt = s.worktree orelse s.cwd;
-                if (std.mem.eql(u8, wt, key)) {
-                    // Last write wins: swap in the newer session's fields.
-                    const agent_copy = try alloc.dupeZ(u8, la.agent);
-                    const cwd_copy = try alloc.dupeZ(u8, la.cwd);
-                    const wt_copy: ?[:0]u8 = if (la.worktree) |w|
-                        (if (w.len > 0) try alloc.dupeZ(u8, w) else null)
-                    else
-                        null;
-                    const sid_copy = try alloc.dupeZ(u8, la.session_id);
-                    s.deinit(alloc);
-                    s.* = .{ .agent = agent_copy, .cwd = cwd_copy, .worktree = wt_copy, .session_id = sid_copy };
-                    replaced = true;
-                    break;
+                if (s.session_id) |existing_sid| {
+                    if (std.mem.eql(u8, existing_sid, la.session_id)) {
+                        // Same session re-announced: refresh its mutable fields.
+                        const agent_copy = try alloc.dupeZ(u8, la.agent);
+                        const cwd_copy = try alloc.dupeZ(u8, la.cwd);
+                        const wt_copy: ?[:0]u8 = if (la.worktree) |w|
+                            (if (w.len > 0) try alloc.dupeZ(u8, w) else null)
+                        else
+                            null;
+                        const sid_copy = try alloc.dupeZ(u8, la.session_id);
+                        s.deinit(alloc);
+                        s.* = .{ .agent = agent_copy, .cwd = cwd_copy, .worktree = wt_copy, .session_id = sid_copy };
+                        replaced = true;
+                        break;
+                    }
                 }
             }
             if (replaced) continue;
@@ -264,7 +263,7 @@ pub const Store = struct {
         }
 
         // Detect whether anything actually changed (order-insensitive by
-        // worktree key + session id) so callers can skip a redundant save.
+        // session id) so callers can skip a redundant save.
         const changed = !sameSet(self.sessions.items, next.items);
         if (!changed) {
             for (next.items) |*s| s.deinit(alloc);
@@ -279,18 +278,26 @@ pub const Store = struct {
     }
 };
 
-/// True if two session sets are equal as sets keyed on (worktree|cwd) ->
-/// session_id. Used to avoid redundant saves after a reconcile.
+/// True if two session sets are equal by session id and all restore-relevant
+/// fields. A session can move worktrees without changing id; that must persist.
 fn sameSet(a: []const Session, b: []const Session) bool {
     if (a.len != b.len) return false;
     for (a) |*sa| {
-        const ka = sa.worktree orelse sa.cwd;
         const sida = sa.session_id orelse "";
         var found = false;
         for (b) |*sb| {
-            const kb = sb.worktree orelse sb.cwd;
             const sidb = sb.session_id orelse "";
-            if (std.mem.eql(u8, ka, kb) and std.mem.eql(u8, sida, sidb)) {
+            const worktree_same = blk: {
+                if (sa.worktree) |wa| {
+                    break :blk if (sb.worktree) |wb| std.mem.eql(u8, wa, wb) else false;
+                }
+                break :blk sb.worktree == null;
+            };
+            if (std.mem.eql(u8, sida, sidb) and
+                std.mem.eql(u8, sa.agent, sb.agent) and
+                std.mem.eql(u8, sa.cwd, sb.cwd) and
+                worktree_same)
+            {
                 found = true;
                 break;
             }
@@ -361,18 +368,31 @@ pub fn loadFrom(alloc: Allocator, path: []const u8) Store {
             if (s.cwd.len > 0) log.warn("agent-session: skipping non-absolute cwd {s}", .{s.cwd});
             continue;
         }
-        // Reject a non-absolute worktree rather than carrying it (fall back to
-        // cwd on restore).
-        const wt: ?[]const u8 = if (s.worktree) |w|
-            (if (w.len > 0 and std.fs.path.isAbsolute(w)) w else null)
-        else
-            null;
+        // Worktree identity is either a local absolute path or a canonical
+        // host-qualified remote key. Reject every other relative value.
+        const wt: ?[]const u8 = if (s.worktree) |w| blk: {
+            if (!validWorktreeKey(w)) {
+                log.warn("agent-session: skipping invalid worktree key {s}", .{w});
+                continue;
+            }
+            break :blk w;
+        } else null;
         store.add(alloc, s.agent, s.cwd, wt, s.sessionId) catch |err| {
             log.debug("agent-session: skipping entry: {}", .{err});
             continue;
         };
     }
     return store;
+}
+
+fn validWorktreeKey(key: []const u8) bool {
+    if (std.fs.path.isAbsolute(key)) return true;
+    if (!std.mem.startsWith(u8, key, "ssh://")) return false;
+    const rest = key["ssh://".len..];
+    const slash = std.mem.indexOfScalar(u8, rest, '/') orelse return false;
+    if (slash == 0 or slash + 1 >= rest.len) return false;
+    if (!std.fs.path.isAbsolute(rest[slash..])) return false;
+    return ssh_command.RemoteHost.parseAuthority(rest[0..slash]) != null;
 }
 
 /// Persist `store` to `~/.simbacode/agent-sessions.json`.
@@ -474,6 +494,27 @@ test "saveTo then loadFrom round-trips sessions" {
     try std.testing.expect(loaded.sessions.items[1].session_id == null);
 }
 
+test "saveTo then loadFrom preserves a remote worktree key" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir = try tmp.dir.realpathAlloc(alloc, ".");
+    defer alloc.free(dir);
+    const path = try std.fs.path.join(alloc, &.{ dir, "agent-sessions.json" });
+    defer alloc.free(path);
+
+    var store: Store = .{};
+    defer store.deinit(alloc);
+    try store.add(alloc, "pi", "/srv/repo", "ssh://alice@host:2222/srv/repo", "sid-remote");
+    try saveTo(alloc, path, &store);
+
+    var loaded = loadFrom(alloc, path);
+    defer loaded.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), loaded.sessions.items.len);
+    try std.testing.expectEqualStrings("/srv/repo", loaded.sessions.items[0].cwd);
+    try std.testing.expectEqualStrings("ssh://alice@host:2222/srv/repo", loaded.sessions.items[0].worktree.?);
+}
+
 test "loadFrom missing file yields empty store" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
@@ -501,6 +542,7 @@ test "loadFrom skips non-absolute cwd" {
         .data =
         \\{ "schemaVersion": 1, "sessions": [
         \\  { "agent": "claude", "cwd": "relative/dir" },
+        \\  { "agent": "pi", "cwd": "/remote/cwd", "worktree": "ssh://broken" },
         \\  { "agent": "codex", "cwd": "/abs/keep" },
         \\  { "agent": "", "cwd": "/abs/noagent" }
         \\] }
@@ -581,7 +623,7 @@ test "removeBySessionId + indexOfSessionId" {
     try std.testing.expectEqual(@as(usize, 1), store.sessions.items.len);
 }
 
-test "rebuildFromLive dedups by worktree, newest wins" {
+test "rebuildFromLive preserves distinct sessions per worktree" {
     const alloc = std.testing.allocator;
     var store: Store = .{};
     defer store.deinit(alloc);
@@ -590,22 +632,33 @@ test "rebuildFromLive dedups by worktree, newest wins" {
     try std.testing.expect(try store.upsertBySessionId(alloc, "pi", "/a", "/a", "old-sid"));
     try std.testing.expectEqual(@as(usize, 1), store.sessions.items.len);
 
-    // Live set: a NEW session in /a plus a session in /b. Two live agents in
-    // /a (same worktree) collapse to one (last wins).
+    // Live set: two DISTINCT sessions in /a plus a session in /b. Every
+    // session survives; worktree is not a uniqueness key.
     const live = [_]Store.LiveAgent{
         .{ .agent = "pi", .cwd = "/a", .worktree = "/a", .session_id = "new-sid-1" },
         .{ .agent = "pi", .cwd = "/a", .worktree = "/a", .session_id = "new-sid-2" },
         .{ .agent = "claude", .cwd = "/b", .worktree = "/b", .session_id = "sid-b" },
     };
     try std.testing.expect(try store.rebuildFromLive(alloc, &live, true));
-    try std.testing.expectEqual(@as(usize, 2), store.sessions.items.len);
-
-    // /a now holds the newest session, not the stale one.
-    const ia = store.indexOfWorktree("/a").?;
-    try std.testing.expectEqualStrings("new-sid-2", store.sessions.items[ia].session_id.?);
-    const ib = store.indexOfWorktree("/b").?;
-    try std.testing.expectEqualStrings("sid-b", store.sessions.items[ib].session_id.?);
+    try std.testing.expectEqual(@as(usize, 3), store.sessions.items.len);
+    try std.testing.expect(store.indexOfSessionId("new-sid-1") != null);
+    try std.testing.expect(store.indexOfSessionId("new-sid-2") != null);
+    try std.testing.expect(store.indexOfSessionId("sid-b") != null);
     try std.testing.expect(store.indexOfSessionId("old-sid") == null);
+}
+
+test "rebuildFromLive persists location changes for same session id" {
+    const alloc = std.testing.allocator;
+    var store: Store = .{};
+    defer store.deinit(alloc);
+    try store.add(alloc, "pi", "/old", "/old", "sid-move");
+    const live = [_]Store.LiveAgent{
+        .{ .agent = "pi", .cwd = "/new", .worktree = "/new", .session_id = "sid-move" },
+    };
+    try std.testing.expect(try store.rebuildFromLive(alloc, &live, false));
+    const moved = store.sessions.items[store.indexOfSessionId("sid-move").?];
+    try std.testing.expectEqualStrings("/new", moved.cwd);
+    try std.testing.expectEqualStrings("/new", moved.worktree.?);
 }
 
 test "rebuildFromLive drops orphans and reports no-change idempotently" {

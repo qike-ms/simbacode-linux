@@ -177,7 +177,7 @@ pub const Agent = enum {
     /// `buf` is caller-owned scratch; the returned slice points into it and is
     /// NUL-terminated so it can be used directly as a `Command.shell`.
     pub fn resumeCommand(self: Agent, session_id: []const u8, buf: []u8) ?[:0]const u8 {
-        if (session_id.len == 0) return null;
+        if (!validSessionId(session_id)) return null;
         // Per-agent "resume THIS exact session" prefix; the id is appended
         // verbatim (the emit side sanitizes the id to [A-Za-z0-9._-]).
         const prefix: ?[]const u8 = switch (self) {
@@ -198,6 +198,33 @@ pub const Agent = enum {
         };
         const p = prefix orelse return null;
         return std.fmt.bufPrintZ(buf, "{s}{s}", .{ p, session_id }) catch null;
+    }
+
+    /// Resume the exact session, then replace the command wrapper with the
+    /// user's login shell when the agent exits. Restored agents are launched as
+    /// a terminal's top-level command; without this continuation, quitting the
+    /// agent closes the last page in its worktree and the window falls through
+    /// to an unrelated non-empty worktree.
+    pub fn resumeCommandThenShell(self: Agent, session_id: []const u8, buf: []u8) ?[:0]const u8 {
+        var resume_buf: [512]u8 = undefined;
+        const resume_cmd = self.resumeCommand(session_id, &resume_buf) orelse return null;
+        return std.fmt.bufPrintZ(
+            buf,
+            "{s}; if [ -n \"${{SHELL:-}}\" ]; then exec \"$SHELL\" -l; else exec /bin/sh; fi",
+            .{resume_cmd},
+        ) catch null;
+    }
+
+    /// Session IDs enter a shell command during exact-session restore. Treat
+    /// OSC input and persisted JSON as untrusted even though managed hooks also
+    /// sanitize on emit: only the documented OSC-safe alphabet is accepted.
+    pub fn validSessionId(session_id: []const u8) bool {
+        if (session_id.len == 0 or session_id.len > 128) return false;
+        for (session_id) |c| switch (c) {
+            'a'...'z', 'A'...'Z', '0'...'9', '.', '_', '-' => {},
+            else => return false,
+        };
+        return true;
     }
 
     /// Whether this agent has a live-verified session-id capture AND a
@@ -302,6 +329,25 @@ test "Agent.name round-trips through parse" {
         "hermes --resume 20260101_120000_abcd",
         Agent.hermes.resumeCommand("20260101_120000_abcd", &buf).?,
     );
+
+    // A restored agent returns to a shell in the same terminal/worktree when
+    // the user quits it; it must not close the page and trigger worktree
+    // fallback navigation.
+    try testing.expectEqualStrings(
+        "pi --session 019f-abc; if [ -n \"${SHELL:-}\" ]; then exec \"$SHELL\" -l; else exec /bin/sh; fi",
+        Agent.pi.resumeCommandThenShell("019f-abc", &buf).?,
+    );
+    try testing.expect(Agent.kiro.resumeCommandThenShell("someid", &buf) == null);
+
+    // OSC and persisted state are untrusted: shell metacharacters and
+    // over-budget IDs must never reach the restore command.
+    try testing.expect(Agent.validSessionId("abc-123_DEF.xyz"));
+    try testing.expect(!Agent.validSessionId(""));
+    try testing.expect(!Agent.validSessionId("$(touch-pwned)"));
+    try testing.expect(!Agent.validSessionId("abc;echo-pwned"));
+    var oversized: [129]u8 = @splat('a');
+    try testing.expect(!Agent.validSessionId(&oversized));
+    try testing.expect(Agent.pi.resumeCommand("abc;echo-pwned", &buf) == null);
 }
 
 test "Agent.parse known agents" {

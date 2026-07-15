@@ -41,7 +41,7 @@ const log = std.log.scoped(.gtk_ghostty_window);
 /// on the first window to realize, not once per window. Multiple windows share
 /// a single persisted snapshot, so replaying it in every window would spawn
 /// duplicate agent tabs.
-var agent_sessions_restored: bool = false;
+var agent_sessions_restore_state: enum { not_started, in_progress, complete } = .not_started;
 
 /// True if `path` is an existing directory. Used to avoid launching a restored
 /// tab in a cwd that no longer exists (issue #29). Never panics.
@@ -49,6 +49,76 @@ fn dirExists(path: [:0]const u8) bool {
     var dir = std.fs.cwd().openDirZ(path, .{}) catch return false;
     dir.close();
     return true;
+}
+
+/// Stable identity for a local or remote worktree/repository. Local keys are
+/// the path unchanged for backward compatibility; remote keys include the SSH
+/// authority so identical absolute paths on different hosts never alias.
+fn locationKey(
+    alloc: std.mem.Allocator,
+    path: []const u8,
+    host: ?*const sidebar.RemoteHost,
+) ![:0]u8 {
+    const authority = if (host) |h| try authorityString(alloc, h) else null;
+    defer if (authority) |a| alloc.free(a);
+    return locationKeyAuthority(alloc, path, authority);
+}
+
+fn locationKeyAuthority(
+    alloc: std.mem.Allocator,
+    path: []const u8,
+    authority: ?[]const u8,
+) ![:0]u8 {
+    return if (authority) |a|
+        std.fmt.allocPrintSentinel(alloc, "ssh://{s}{s}", .{ a, path }, 0)
+    else
+        alloc.dupeZ(u8, path);
+}
+
+fn authorityString(alloc: std.mem.Allocator, h: *const sidebar.RemoteHost) ![:0]u8 {
+    const user_prefix: []const u8 = if (h.username) |u| u else "";
+    const at: []const u8 = if (h.username != null) "@" else "";
+    const ipv6 = std.mem.indexOfScalar(u8, h.alias, ':') != null;
+    if (h.port) |p| {
+        return if (ipv6)
+            std.fmt.allocPrintSentinel(alloc, "{s}{s}[{s}]:{d}", .{ user_prefix, at, h.alias, p }, 0)
+        else
+            std.fmt.allocPrintSentinel(alloc, "{s}{s}{s}:{d}", .{ user_prefix, at, h.alias, p }, 0);
+    }
+    return if (ipv6)
+        std.fmt.allocPrintSentinel(alloc, "{s}{s}[{s}]", .{ user_prefix, at, h.alias }, 0)
+    else
+        std.fmt.allocPrintSentinel(alloc, "{s}{s}{s}", .{ user_prefix, at, h.alias }, 0);
+}
+
+const RemoteLocation = struct {
+    host: ssh_command.RemoteHost,
+    path: []const u8,
+};
+
+/// Parse a location key created by `locationKey`. All returned slices borrow
+/// from `key`. Bracketed IPv6 authorities remain unambiguous.
+fn parseRemoteLocation(key: []const u8) ?RemoteLocation {
+    const prefix = "ssh://";
+    if (!std.mem.startsWith(u8, key, prefix)) return null;
+    const rest = key[prefix.len..];
+    const slash = std.mem.indexOfScalar(u8, rest, '/') orelse return null;
+    const authority = rest[0..slash];
+    const host = ssh_command.RemoteHost.parseAuthority(authority) orelse return null;
+    return .{ .host = host, .path = rest[slash..] };
+}
+
+test "remote location key round-trips host path and IPv6" {
+    const alloc = std.testing.allocator;
+    var host = sidebar.RemoteHost{ .alias = @constCast("::1"), .username = @constCast("alice"), .port = 2222 };
+    const key = try locationKey(alloc, "/srv/repo", &host);
+    defer alloc.free(key);
+    try std.testing.expectEqualStrings("ssh://alice@[::1]:2222/srv/repo", key);
+    const parsed = parseRemoteLocation(key).?;
+    try std.testing.expectEqualStrings("::1", parsed.host.alias);
+    try std.testing.expectEqualStrings("alice", parsed.host.username.?);
+    try std.testing.expectEqual(@as(u16, 2222), parsed.host.port.?);
+    try std.testing.expectEqualStrings("/srv/repo", parsed.path);
 }
 
 pub const Window = extern struct {
@@ -235,15 +305,6 @@ pub const Window = extern struct {
     };
 
     const Private = struct {
-        /// Tag for a sidebar ListBox row: either a collapsible repo header or a
-        /// worktree leaf. `index` indexes into `sidebar_statuses` for worktree
-        /// rows, or is the index of the repo's FIRST worktree for header rows
-        /// (used to read repo_root/repo_name for collapse toggling).
-        pub const SidebarRowRef = struct {
-            kind: enum { repo_header, worktree },
-            index: usize,
-        };
-
         /// simbacode (#22): an agent recorded on a surface. Drives the per-tab
         /// agent indicator icon and (via OSC-3008 events) its activity state.
         pub const AgentEntry = struct {
@@ -284,6 +345,12 @@ pub const Window = extern struct {
                 alloc.free(self.text);
             }
         };
+
+        /// A persisted session id attached to a freshly restored surface before
+        /// its session_start arrives. Owned; transferred into `AgentEntry` when
+        /// presence attaches, preventing rotated ids from leaving stale durable
+        /// entries behind.
+        restored_session_ids: std.AutoHashMapUnmanaged(*Surface, [:0]u8) = .empty,
 
         /// Whether this window is a quick terminal. If it is then it
         /// behaves slightly differently under certain scenarios.
@@ -368,10 +435,13 @@ pub const Window = extern struct {
         /// expand/collapse choice is sticky.
         sidebar_collapsed: std.StringHashMapUnmanaged(void) = .empty,
 
-        /// Parallel mapping from ListBox row index -> what that row represents
-        /// (a repo header, or a worktree by index into sidebar_statuses).
-        /// Rebuilt on every refresh. Owned by this window.
-        sidebar_rows: std.ArrayListUnmanaged(SidebarRowRef) = .empty,
+        /// Blocks destructive ListBox row rebuilds between a pointer press and
+        /// its activation. Without this, the 5s scan or an agent lifecycle OSC
+        /// can replace rows under an in-progress click and navigate elsewhere.
+        sidebar_rebuild_guard: sidebar.RebuildGuard = .{},
+        /// One coalesced post-event rebuild queued when a refresh arrived while
+        /// the pointer was down.
+        sidebar_rebuild_idle: ?c_uint = null,
 
         /// simbacode agent presence: maps a surface (by pointer, stable identity)
         /// to the agent attached to it plus the worktree path that owned the
@@ -1115,9 +1185,10 @@ pub const Window = extern struct {
         return null;
     }
 
-    /// Resolve the worktree path that owns `surface` (#22): the surface lives
-    /// in a Tab, which lives in a per-worktree Adw.TabView registered in
-    /// `worktree_views` keyed by path. Returns null for the default space
+    /// Resolve the worktree location key that owns `surface` (#22): the surface
+    /// lives in a Tab, which lives in a per-worktree Adw.TabView registered in
+    /// `worktree_views` keyed by local path or remote authority+path. Returns
+    /// null for the default space
     /// (empty-string key) or when no owning view is found.
     fn worktreePathForSurface(self: *Self, surface: *Surface) ?[]const u8 {
         const priv = self.private();
@@ -1157,11 +1228,14 @@ pub const Window = extern struct {
             return;
         };
 
-        // Resolve the active worktree's status row for branch/repo labels.
+        // Resolve the active location key back to its status row for labels.
         var repo_name: []const u8 = "";
         var branch: []const u8 = "";
+        const alloc = Application.default().allocator();
         for (priv.sidebar_statuses) |*st| {
-            if (std.mem.eql(u8, st.path, active_path)) {
+            const key = locationKey(alloc, st.path, if (st.host) |*h| h else null) catch continue;
+            defer alloc.free(key);
+            if (std.mem.eql(u8, key, active_path)) {
                 repo_name = st.repo_name;
                 branch = st.branch;
                 break;
@@ -1172,7 +1246,6 @@ pub const Window = extern struct {
             return;
         }
 
-        const alloc = Application.default().allocator();
         if (alloc.dupeZ(u8, branch)) |z| {
             defer alloc.free(z);
             priv.identity_branch.setText(z.ptr);
@@ -1332,8 +1405,8 @@ pub const Window = extern struct {
     /// agent is exact-resumable and the id is non-empty. Persists on change.
     /// Add-or-update the durable store for a surface that just learned (or
     /// changed) its agent session id (issue #29). Delegates to the single
-    /// authoritative reconcile so the on-disk list always mirrors the live set
-    /// (one entry per worktree, newest session winning).
+    /// authoritative reconcile; exact session id is the identity, so multiple
+    /// sessions in one worktree remain distinct.
     fn addSessionEntry(self: *Window, surface: *Surface) void {
         const priv = self.private();
         const entry = priv.surface_agents.getPtr(surface) orelse return;
@@ -1343,83 +1416,230 @@ pub const Window = extern struct {
         self.reconcileSessionStore();
     }
 
+    const AgentRestoreCtx = struct {
+        window: *Window,
+        store: agent_session_store.Store,
+        next: usize = 0,
+        original_view: *adw.TabView,
+        restore_original: bool,
+        /// The surface just made visible. Do not map the next worktree until
+        /// this one has really initialized its CoreSurface/child process.
+        waiting_surface: ?*Surface = null,
+        wait_ticks: u16 = 0,
+    };
+
     /// Restore agents that were running before the last restart (issue #29).
-    /// Runs exactly once, on the first realized window. For each persisted
-    /// session we relaunch the agent by its EXACT session id (never a fresh
-    /// session) in the right worktree space.
-    ///
-    /// Principle (#29): DO NOT CLEAR the file here. If we cleared it and the
-    /// user then quit before any lifecycle event rewrote it, the list would be
-    /// lost. The store is durable and mutated only by real lifecycle events
-    /// (session start adds, session end / tab close removes). A relaunched
-    /// agent re-announces its session_start, which reconciles the entry (and
-    /// updates the id if resume minted a new one).
+    /// Runs exactly once, on the first realized window. Replay is deliberately
+    /// spread across main-loop ticks: a hidden GtkStack child does not realize
+    /// its GLArea, so creating every tab synchronously starts only the final
+    /// visible agent and leaves the others dormant until their branch is
+    /// clicked. Briefly mapping one worktree per tick initializes every agent;
+    /// after the sweep we return to the worktree that was visible beforehand.
     fn restoreAgentSessions(self: *Window) void {
-        if (agent_sessions_restored) return;
-        // Mark restored up-front so re-entrancy from tab creation (each restored
-        // tab's agent will emit session_start -> persist) can't loop.
-        agent_sessions_restored = true;
+        if (agent_sessions_restore_state != .not_started) return;
 
         const alloc = Application.default().allocator();
         var store = agent_session_store.load(alloc);
-        defer store.deinit(alloc);
-        if (store.sessions.items.len == 0) return;
+        // Drop malformed/unsupported entries before claiming startup
+        // navigation. A non-empty but unrestorable legacy file must behave like
+        // an empty store and allow normal first-worktree auto-open.
+        var i: usize = 0;
+        while (i < store.sessions.items.len) {
+            const s = &store.sessions.items[i];
+            const local_location_exists = if (s.worktree) |w|
+                if (parseRemoteLocation(w) != null) true else self.resolveRestoreCwd(s.cwd, w) != null
+            else
+                self.resolveRestoreCwd(s.cwd, null) != null;
+            const valid = if (agentpkg.Agent.parse(s.agent)) |agent|
+                agent.canResumeExact() and
+                    s.session_id != null and
+                    agentpkg.Agent.validSessionId(s.session_id.?) and
+                    local_location_exists
+            else
+                false;
+            if (valid) {
+                i += 1;
+            } else {
+                var removed = store.sessions.orderedRemove(i);
+                removed.deinit(alloc);
+            }
+        }
+        if (store.sessions.items.len == 0) {
+            store.deinit(alloc);
+            agent_sessions_restore_state = .not_started;
+            return;
+        }
 
         log.info("restoring {d} agent session(s)", .{store.sessions.items.len});
-
-        // Belt-and-suspenders dedup: even if the on-disk list somehow carries
-        // two entries for one worktree (older buggy writes), restore each
-        // worktree at most once so a worktree can never reopen twice.
-        var seen_worktrees: std.StringHashMapUnmanaged(void) = .empty;
-        defer seen_worktrees.deinit(alloc);
-
-        for (store.sessions.items) |*s| {
-            const agent = agentpkg.Agent.parse(s.agent) orelse continue;
-            const sid = s.session_id orelse continue;
-            if (sid.len == 0) continue;
-            const wt_key: []const u8 = if (s.worktree) |w| w else s.cwd;
-            if (seen_worktrees.contains(wt_key)) {
-                log.warn("agent-session: skipping duplicate restore for worktree {s}", .{wt_key});
-                continue;
-            }
-            seen_worktrees.put(alloc, wt_key, {}) catch {};
-            // Resume the EXACT session. If the agent isn't exact-resumable, the
-            // command is null and we skip it (never start a fresh session).
-            var cmd_buf: [1024]u8 = undefined;
-            const resume_cmd = agent.resumeCommand(sid, &cmd_buf) orelse continue;
-
-            // Build a shell command that resumes the agent. Freed after the tab
-            // has duped it into its own config.
-            const cmd: configpkg.Command = .{ .shell = resume_cmd };
-
-            // Restore into the right worktree tab space when we know it, and
-            // validate the cwd still exists (fall back to worktree, else skip
-            // launching in a dead dir).
-            const wt: ?[:0]const u8 = if (s.worktree) |w| w else null;
-            if (wt) |path| {
-                const view = self.ensureWorktreeView(path);
-                self.switchToWorktreeView(view);
-            }
-            const cwd = self.resolveRestoreCwd(s.cwd, wt);
-            self.newTabForWindow(null, .{
-                .command = cmd,
-                .working_directory = cwd,
-            });
-        }
-        // NOTE: intentionally NOT clearing the store (principle #3).
+        const ctx = alloc.create(AgentRestoreCtx) catch {
+            store.deinit(alloc);
+            return;
+        };
+        ctx.* = .{
+            .window = self,
+            .store = store,
+            .original_view = self.activeTabView(),
+            // At startup the default view is only a placeholder. Keeping the
+            // final restored worktree visible avoids returning to a blank pane.
+            .restore_original = self.activeWorktreePath() != null,
+        };
+        _ = self.ref();
+        agent_sessions_restore_state = .in_progress;
+        _ = glib.timeoutAdd(50, restoreNextAgentSession, ctx);
+        // NOTE: intentionally NOT clearing the durable store (principle #3).
     }
 
-    /// Choose a still-valid working directory for a restored tab. Prefers the
-    /// recorded cwd; if it no longer exists, tries the worktree; if neither
-    /// exists returns the cwd unchanged (the shell will fall back to $HOME on
-    /// chdir failure rather than crash).
-    fn resolveRestoreCwd(self: *Window, cwd: [:0]const u8, worktree: ?[:0]const u8) [:0]const u8 {
+    fn restoreNextAgentSession(ud: ?*anyopaque) callconv(.c) c_int {
+        const ctx: *AgentRestoreCtx = @ptrCast(@alignCast(ud orelse return 0));
+        const self = ctx.window;
+        const alloc = Application.default().allocator();
+
+        if (self.private().disposing) {
+            finishAgentRestore(ctx, false);
+            return 0;
+        }
+
+        if (ctx.waiting_surface) |surface| {
+            if (surface.core() == null and ctx.wait_ticks < 200) {
+                ctx.wait_ticks += 1;
+                return @intFromBool(true);
+            }
+            if (surface.core() == null) {
+                log.warn("agent-session: surface did not initialize before restore timeout", .{});
+            }
+            surface.unref();
+            ctx.waiting_surface = null;
+            ctx.wait_ticks = 0;
+        }
+
+        while (ctx.next < ctx.store.sessions.items.len) {
+            ctx.next += 1;
+            const s = &ctx.store.sessions.items[ctx.next - 1];
+            const agent = agentpkg.Agent.parse(s.agent) orelse continue;
+            if (!agent.canResumeExact()) continue;
+            const sid = s.session_id orelse continue;
+            if (!agentpkg.Agent.validSessionId(sid)) continue;
+            const wt: ?[:0]const u8 = if (s.worktree) |w| w else null;
+            const view = if (wt) |key| self.ensureWorktreeView(key) else ctx.original_view;
+            self.switchToWorktreeView(view);
+
+            if (wt) |key| {
+                if (parseRemoteLocation(key)) |remote| {
+                    var resume_buf: [512]u8 = undefined;
+                    const resume_cmd = agent.resumeCommand(sid, &resume_buf) orelse continue;
+                    const remote_cmd = ssh_command.terminalCommandThenShell(
+                        alloc,
+                        remote.host,
+                        remote.path,
+                        resume_cmd,
+                        ssh_command.default_control_path,
+                    ) catch |err| {
+                        log.warn("agent-session: cannot build remote resume command: {}", .{err});
+                        continue;
+                    };
+                    defer alloc.free(remote_cmd);
+                    self.newTabForWindow(null, .{ .command = .{ .shell = remote_cmd } });
+                    if (self.getActiveSurface()) |surface| {
+                        self.seedRestoredSessionId(surface, sid);
+                        ctx.waiting_surface = surface.ref();
+                    }
+                    // Return to GTK so this now-visible GLArea can realize and
+                    // start its child before we map the next worktree.
+                    return @intFromBool(true);
+                }
+            }
+
+            var cmd_buf: [1024]u8 = undefined;
+            const resume_cmd = agent.resumeCommandThenShell(sid, &cmd_buf) orelse continue;
+            const cwd = self.resolveRestoreCwd(s.cwd, wt) orelse {
+                log.warn("agent-session: skipping missing local cwd {s}", .{s.cwd});
+                continue;
+            };
+            self.newTabForWindow(null, .{
+                .command = .{ .shell = resume_cmd },
+                .working_directory = cwd,
+            });
+            if (self.getActiveSurface()) |surface| {
+                self.seedRestoredSessionId(surface, sid);
+                ctx.waiting_surface = surface.ref();
+            }
+            return @intFromBool(true);
+        }
+
+        finishAgentRestore(ctx, true);
+        return 0;
+    }
+
+    fn finishAgentRestore(ctx: *AgentRestoreCtx, restore_view: bool) void {
+        const self = ctx.window;
+        const alloc = Application.default().allocator();
+        if (ctx.waiting_surface) |surface| surface.unref();
+        agent_sessions_restore_state = if (restore_view) .complete else .in_progress;
+        if (restore_view and ctx.restore_original and !self.private().disposing) {
+            self.switchToWorktreeView(ctx.original_view);
+            if (self.getActiveSurface()) |surface| surface.grabFocus();
+        }
+        ctx.store.deinit(alloc);
+        alloc.destroy(ctx);
+        self.unref();
+        if (!restore_view) _ = glib.idleAdd(retryAgentRestore, null);
+    }
+
+    /// If the window that owned startup replay disappeared, hand the durable
+    /// replay to another already-realized Simbacode window instead of marking
+    /// the process complete with sessions still unstarted.
+    fn retryAgentRestore(_: ?*anyopaque) callconv(.c) c_int {
+        if (agent_sessions_restore_state != .in_progress) return 0;
+        var found = false;
+        var node: ?*glib.List = Application.default().as(gtk.Application).getWindows();
+        while (node) |item| : (node = item.f_next) {
+            const object: *gobject.Object = @ptrCast(@alignCast(item.f_data orelse continue));
+            const window = gobject.ext.cast(Window, object) orelse continue;
+            if (window.private().disposing) continue;
+            // Main-loop callbacks do not interleave: release the latch and
+            // immediately claim it in this same callback, leaving no window in
+            // which a sidebar scan can auto-open an extra startup shell.
+            agent_sessions_restore_state = .not_started;
+            window.restoreAgentSessions();
+            found = true;
+            break;
+        }
+        // No live window exists to receive the replay. Release the latch so a
+        // window created later in this process can claim it during realize.
+        if (!found) agent_sessions_restore_state = .not_started;
+        return 0;
+    }
+
+    /// Attach the persisted id before the resumed process can announce a
+    /// rotated id; this makes replacement/removal exact across lifecycle races.
+    fn seedRestoredSessionId(self: *Window, surface: *Surface, sid: []const u8) void {
+        if (!agentpkg.Agent.validSessionId(sid)) return;
+        self.setSurfaceSessionData(surface, sid);
+        const priv = self.private();
+        const alloc = Application.default().allocator();
+        if (priv.surface_agents.getPtr(surface)) |entry| {
+            if (entry.session_id == null) entry.session_id = alloc.dupeZ(u8, sid) catch return;
+            return;
+        }
+        self.trackSurface(surface);
+        const copy = alloc.dupeZ(u8, sid) catch return;
+        const gop = priv.restored_session_ids.getOrPut(alloc, surface) catch {
+            alloc.free(copy);
+            return;
+        };
+        if (gop.found_existing) alloc.free(gop.value_ptr.*);
+        gop.value_ptr.* = copy;
+    }
+
+    /// Choose a valid local restore directory, failing closed when neither the
+    /// recorded cwd nor local worktree exists.
+    fn resolveRestoreCwd(self: *Window, cwd: [:0]const u8, worktree: ?[:0]const u8) ?[:0]const u8 {
         _ = self;
         if (dirExists(cwd)) return cwd;
         if (worktree) |w| {
-            if (dirExists(w)) return w;
+            if (std.fs.path.isAbsolute(w) and dirExists(w)) return w;
         }
-        return cwd;
+        return null;
     }
 
     /// Sync the tab binding group (title/subtitle/etc.) from the active view's
@@ -1762,6 +1982,10 @@ pub const Window = extern struct {
         // of touching this disposing window. The worker holds a window ref, so
         // the object stays alive until its idle callback runs and unrefs.
         priv.sidebar_scan_abandoned = true;
+        if (priv.tab_overview_focus_timer) |timer| {
+            _ = glib.Source.remove(timer);
+            priv.tab_overview_focus_timer = null;
+        }
         if (priv.sidebar_timer) |timer| {
             _ = glib.Source.remove(timer);
             priv.sidebar_timer = null;
@@ -1787,8 +2011,10 @@ pub const Window = extern struct {
             priv.sidebar_collapsed.deinit(alloc);
             priv.sidebar_collapsed = .empty;
         }
-        priv.sidebar_rows.deinit(alloc);
-        priv.sidebar_rows = .empty;
+        if (priv.sidebar_rebuild_idle) |source| {
+            _ = glib.Source.remove(source);
+            priv.sidebar_rebuild_idle = null;
+        }
         {
             // Free owned agent session ids (#29) before dropping the map.
             var it = priv.surface_agents.valueIterator();
@@ -1796,6 +2022,12 @@ pub const Window = extern struct {
         }
         priv.surface_agents.deinit(alloc);
         priv.surface_agents = .empty;
+        {
+            var it = priv.restored_session_ids.valueIterator();
+            while (it.next()) |sid| alloc.free(sid.*);
+            priv.restored_session_ids.deinit(alloc);
+            priv.restored_session_ids = .empty;
+        }
 
         // Drop the GObject weak-refs we registered on tracked surfaces so the
         // weak-notify can't fire into this half-disposed window. `disposing`
@@ -1919,6 +2151,37 @@ pub const Window = extern struct {
             self,
             .{},
         );
+
+        // Observe the complete primary-button sequence in capture phase. A
+        // background scan or OSC event may request a sidebar rebuild at any
+        // point; while the pointer is down we defer that destructive rebuild
+        // until after GTK has emitted row-activated for the originally pressed
+        // row. This prevents refresh-time click retargeting.
+        const click = gtk.GestureClick.new();
+        click.as(gtk.GestureSingle).setButton(gdk.BUTTON_PRIMARY);
+        click.as(gtk.EventController).setPropagationPhase(.capture);
+        _ = gtk.GestureClick.signals.pressed.connect(
+            click,
+            *Window,
+            sidebarPointerPressed,
+            self,
+            .{},
+        );
+        _ = gtk.GestureClick.signals.released.connect(
+            click,
+            *Window,
+            sidebarPointerReleased,
+            self,
+            .{},
+        );
+        _ = gtk.Gesture.signals.cancel.connect(
+            click.as(gtk.Gesture),
+            *Window,
+            sidebarPointerCancelled,
+            self,
+            .{},
+        );
+        priv.sidebar_list.as(gtk.Widget).addController(click.as(gtk.EventController));
 
         // First scan immediately, then poll.
         self.refreshSidebar();
@@ -2098,12 +2361,13 @@ pub const Window = extern struct {
         // Refresh the identity chip now that branch/repo labels are available (#10).
         self.updateIdentityChip();
 
-        // One-time startup jump: open the first repo's first worktree so the
-        // initial terminal belongs to a real repo instead of the no-worktree
-        // default space (which is confusing — agents started there show in no
-        // sidebar folder). Only when the user is still on the default space, so
-        // we never yank them out of a worktree they navigated to.
-        if (!priv.did_initial_worktree_open and priv.sidebar_statuses.len > 0) {
+        // One-time startup jump: open the first repo's first worktree only when
+        // no persisted-agent replay is active/complete. Restore owns startup
+        // navigation and tab creation; racing it would create an extra shell.
+        if (agent_sessions_restore_state == .not_started and
+            !priv.did_initial_worktree_open and
+            priv.sidebar_statuses.len > 0)
+        {
             priv.did_initial_worktree_open = true;
             if (self.activeWorktreePath() == null) {
                 self.openWorktree(&priv.sidebar_statuses[0]);
@@ -2281,8 +2545,12 @@ pub const Window = extern struct {
         const user_trim = std.mem.trim(u8, user_text, " \t");
         const port_trim = std.mem.trim(u8, port_text, " \t");
 
-        if (host_trim.len == 0) {
-            self.addToast("Remote host is required");
+        if (host_trim.len == 0 or host_trim[0] == '-' or
+            std.mem.indexOfAny(u8, host_trim, "[]") != null or
+            (user_trim.len > 0 and
+                (user_trim[0] == '-' or std.mem.indexOfAny(u8, user_trim, "[]") != null)))
+        {
+            self.addToast("Remote host or username is invalid");
             return;
         }
         if (path_trim.len == 0 or !std.fs.path.isAbsolute(path_trim)) {
@@ -2449,28 +2717,65 @@ pub const Window = extern struct {
     /// as the durable key attached to the remove button. Caller owns result.
     fn remoteAuthorityString(self: *Window, h: *const sidebar.RemoteHost) ![:0]u8 {
         _ = self;
-        const alloc = Application.default().allocator();
-        const user_prefix: []const u8 = if (h.username) |u| u else "";
-        const at: []const u8 = if (h.username != null) "@" else "";
-        if (h.port) |p| {
-            return std.fmt.allocPrintSentinel(alloc, "{s}{s}{s}:{d}", .{ user_prefix, at, h.alias, p }, 0);
-        }
-        return std.fmt.allocPrintSentinel(alloc, "{s}{s}{s}", .{ user_prefix, at, h.alias }, 0);
+        return authorityString(Application.default().allocator(), h);
+    }
+
+    fn sidebarPointerPressed(
+        _: *gtk.GestureClick,
+        _: c_int,
+        _: f64,
+        _: f64,
+        self: *Window,
+    ) callconv(.c) void {
+        self.private().sidebar_rebuild_guard.pointerPressed();
+    }
+
+    fn sidebarPointerReleased(
+        _: *gtk.GestureClick,
+        _: c_int,
+        _: f64,
+        _: f64,
+        self: *Window,
+    ) callconv(.c) void {
+        self.finishSidebarPointerSequence();
+    }
+
+    fn sidebarPointerCancelled(
+        _: *gtk.Gesture,
+        _: ?*gdk.EventSequence,
+        self: *Window,
+    ) callconv(.c) void {
+        self.finishSidebarPointerSequence();
+    }
+
+    /// End pointer protection, but queue the deferred rebuild on an idle source
+    /// rather than running it inside the release signal. The ListBox's own
+    /// release handler still needs the original row alive to emit activation.
+    fn finishSidebarPointerSequence(self: *Window) void {
+        const priv = self.private();
+        if (!priv.sidebar_rebuild_guard.pointerFinished()) return;
+        if (priv.sidebar_rebuild_idle != null) return;
+        priv.sidebar_rebuild_idle = glib.idleAdd(sidebarDeferredRebuild, self);
+    }
+
+    fn sidebarDeferredRebuild(ud: ?*anyopaque) callconv(.c) c_int {
+        const self: *Window = @ptrCast(@alignCast(ud orelse return 0));
+        self.private().sidebar_rebuild_idle = null;
+        if (!self.private().disposing) self.rebuildSidebarRows();
+        return 0;
     }
 
     /// Rebuild the ListBox rows from `sidebar_statuses`, grouping worktrees
-    /// under collapsible repo headers. Also rebuilds the `sidebar_rows`
-    /// index->ref mapping used by row activation. Safe to call any time the
-    /// statuses, attention set, or collapsed set changes.
+    /// under collapsible repo headers. Each row carries its immutable path
+    /// identity, so activation never depends on a parallel positional array.
     fn rebuildSidebarRows(self: *Window) void {
         const priv = self.private();
-        const alloc = Application.default().allocator();
         const statuses = priv.sidebar_statuses;
 
-        priv.sidebar_rows.clearRetainingCapacity();
+        if (!priv.sidebar_rebuild_guard.requestRebuild()) return;
         priv.sidebar_list.removeAll();
 
-        // The worktree leaf row matching the currently-visible worktree, so we
+        // The worktree leaf row matching the currently-visible location, so we
         // can highlight it after the rebuild. GTK drops selection on removeAll,
         // and single-selection otherwise sticks on the top row (misleading).
         const active_path = self.activeWorktreePath();
@@ -2480,25 +2785,31 @@ pub const Window = extern struct {
         while (i < statuses.len) {
             // Find the contiguous run of worktrees belonging to this repo.
             const repo_root = statuses[i].repo_root;
+            const repo_host = statuses[i].host;
             var j = i;
-            while (j < statuses.len and std.mem.eql(u8, statuses[j].repo_root, repo_root)) : (j += 1) {}
+            while (j < statuses.len and
+                std.mem.eql(u8, statuses[j].repo_root, repo_root) and
+                sidebar.compareHosts(statuses[j].host, repo_host) == .eq) : (j += 1)
+            {}
             const group = statuses[i..j];
+            const repo_key = locationKey(Application.default().allocator(), repo_root, if (repo_host) |*h| h else null) catch return;
+            defer Application.default().allocator().free(repo_key);
 
-            const collapsed = priv.sidebar_collapsed.contains(repo_root);
+            const collapsed = priv.sidebar_collapsed.contains(repo_key);
 
             // Repo header row.
             const header = self.buildRepoHeaderRow(group, collapsed);
             priv.sidebar_list.append(header.as(gtk.Widget));
-            priv.sidebar_rows.append(alloc, .{ .kind = .repo_header, .index = i }) catch {};
 
             // Worktree leaf rows (hidden when collapsed).
             if (!collapsed) {
-                for (group, i..) |*st, idx| {
+                for (group) |*st| {
                     const row = self.buildWorktreeRow(st);
                     priv.sidebar_list.append(row.as(gtk.Widget));
-                    priv.sidebar_rows.append(alloc, .{ .kind = .worktree, .index = idx }) catch {};
                     if (active_path) |ap| {
-                        if (std.mem.eql(u8, ap, st.path)) active_row = row;
+                        const key = locationKey(Application.default().allocator(), st.path, if (st.host) |*h| h else null) catch continue;
+                        defer Application.default().allocator().free(key);
+                        if (std.mem.eql(u8, ap, key)) active_row = row;
                     }
                 }
             }
@@ -2542,7 +2853,11 @@ pub const Window = extern struct {
         for (group) |*st| {
             added +|= st.added;
             removed +|= st.removed;
-            if (self.pathHasAttention(st.path)) any_attention = true;
+            if (!any_attention) {
+                const key = locationKey(alloc, st.path, if (st.host) |*h| h else null) catch continue;
+                defer alloc.free(key);
+                any_attention = self.pathHasAttention(key);
+            }
         }
 
         const arrow: []const u8 = if (collapsed) "\u{25B8}" else "\u{25BE}";
@@ -2663,6 +2978,28 @@ pub const Window = extern struct {
             box.append(remove_btn.as(gtk.Widget));
         }
 
+        // Activation reads this immutable identity from the row itself, not a
+        // positional side array that can drift during asynchronous refreshes.
+        if (repo_root_str.len > 0) {
+            const root_z = alloc.dupeZ(u8, repo_root_str) catch return row;
+            defer alloc.free(root_z);
+            row.as(gobject.Object).setDataFull(
+                "simbacode-repo-root",
+                glib.strdup(root_z.ptr),
+                glibFreeData,
+            );
+            if (group_host) |*h| {
+                if (self.remoteAuthorityString(h)) |authority| {
+                    defer alloc.free(authority);
+                    row.as(gobject.Object).setDataFull(
+                        "simbacode-repo-host",
+                        glib.strdup(authority.ptr),
+                        glibFreeData,
+                    );
+                } else |_| {}
+            }
+        }
+
         row.setChild(box.as(gtk.Widget));
         return row;
     }
@@ -2718,7 +3055,9 @@ pub const Window = extern struct {
         // When this worktree has an unclicked notification, the leading marker
         // becomes a bell instead of the status dot (clicking the row jumps to
         // the notifying tab). Otherwise it stays the git-status dot.
-        const has_attention = self.pathHasAttention(st.path);
+        const worktree_key = locationKey(alloc, st.path, if (st.host) |*h| h else null) catch return row;
+        defer alloc.free(worktree_key);
+        const has_attention = self.pathHasAttention(worktree_key);
 
         const branch_z = alloc.dupeZ(u8, st.branch) catch return row;
         defer alloc.free(branch_z);
@@ -2774,7 +3113,7 @@ pub const Window = extern struct {
         // doesn't overwrite the first. Drawn between the branch name and the
         // diff badges.
         var agent_buf: [8]AgentMark = undefined;
-        for (self.agentsForPath(st.path, &agent_buf)) |m| appendAgentIcon(box, m.agent, m.busy);
+        for (self.agentsForPath(worktree_key, &agent_buf)) |m| appendAgentIcon(box, m.agent, m.busy);
 
         // Badge label (right): fixed size, right-aligned, never clipped.
         if (badges.len > 0) {
@@ -2786,33 +3125,86 @@ pub const Window = extern struct {
             box.append(badge_label.as(gtk.Widget));
         }
 
+        const path_z = alloc.dupeZ(u8, st.path) catch return row;
+        defer alloc.free(path_z);
+        row.as(gobject.Object).setDataFull(
+            "simbacode-worktree-path",
+            glib.strdup(path_z.ptr),
+            glibFreeData,
+        );
+        if (st.host) |*h| {
+            if (self.remoteAuthorityString(h)) |authority| {
+                defer alloc.free(authority);
+                row.as(gobject.Object).setDataFull(
+                    "simbacode-worktree-host",
+                    glib.strdup(authority.ptr),
+                    glibFreeData,
+                );
+            } else |_| return row;
+        }
+
         row.setChild(box.as(gtk.Widget));
         return row;
     }
 
-    /// Row activation: a repo header toggles collapse; a worktree leaf opens
-    /// (or focuses) that worktree's tab.
+    /// Row activation uses the immutable identity attached to the activated
+    /// row. If that identity no longer exists in the latest scan, it fails
+    /// closed rather than opening whatever now occupies the same position.
     fn sidebarRowActivated(
         _: *gtk.ListBox,
         row: *gtk.ListBoxRow,
         self: *Window,
     ) callconv(.c) void {
-        const priv = self.private();
-        const idx = row.getIndex();
-        if (idx < 0) return;
-        const ri: usize = @intCast(idx);
-        if (ri >= priv.sidebar_rows.items.len) return;
+        const alloc = Application.default().allocator();
+        if (row.as(gobject.Object).getData("simbacode-worktree-path")) |data| {
+            const path_cstr: [*:0]const u8 = @ptrCast(data);
+            const path = std.mem.sliceTo(path_cstr, 0);
+            const row_host: ?[]const u8 = if (row.as(gobject.Object).getData("simbacode-worktree-host")) |host_data| blk: {
+                const host_cstr: [*:0]const u8 = @ptrCast(host_data);
+                break :blk std.mem.sliceTo(host_cstr, 0);
+            } else null;
 
-        const row_ref = priv.sidebar_rows.items[ri];
-        switch (row_ref.kind) {
-            .repo_header => {
-                if (row_ref.index >= priv.sidebar_statuses.len) return;
-                self.toggleRepoCollapsed(priv.sidebar_statuses[row_ref.index].repo_root);
-            },
-            .worktree => {
-                if (row_ref.index >= priv.sidebar_statuses.len) return;
-                self.openWorktree(&priv.sidebar_statuses[row_ref.index]);
-            },
+            for (self.private().sidebar_statuses) |*st| {
+                if (!std.mem.eql(u8, st.path, path)) continue;
+                if (row_host) |expected| {
+                    const h = if (st.host) |*host| host else continue;
+                    const actual = self.remoteAuthorityString(h) catch continue;
+                    defer alloc.free(actual);
+                    if (!std.mem.eql(u8, expected, actual)) continue;
+                } else if (st.host != null) continue;
+                self.openWorktree(st);
+                return;
+            }
+            return;
+        }
+
+        if (row.as(gobject.Object).getData("simbacode-repo-root")) |data| {
+            const root_cstr: [*:0]const u8 = @ptrCast(data);
+            const root = alloc.dupe(u8, std.mem.sliceTo(root_cstr, 0)) catch return;
+            defer alloc.free(root);
+            const row_host: ?[]const u8 = if (row.as(gobject.Object).getData("simbacode-repo-host")) |host_data| blk: {
+                const host_cstr: [*:0]const u8 = @ptrCast(host_data);
+                break :blk std.mem.sliceTo(host_cstr, 0);
+            } else null;
+            // Header identity must still exist in the latest async scan. A
+            // stale row fails closed instead of creating collapse state for a
+            // removed or host-colliding repository.
+            var found = false;
+            for (self.private().sidebar_statuses) |*st| {
+                if (!std.mem.eql(u8, st.repo_root, root)) continue;
+                const actual = locationKey(alloc, st.repo_root, if (st.host) |*h| h else null) catch continue;
+                defer alloc.free(actual);
+                const expected = locationKeyAuthority(alloc, root, row_host) catch continue;
+                defer alloc.free(expected);
+                if (std.mem.eql(u8, actual, expected)) {
+                    found = true;
+                    break;
+                }
+            }
+            if (!found) return;
+            const key = locationKeyAuthority(alloc, root, row_host) catch return;
+            defer alloc.free(key);
+            self.toggleRepoCollapsed(key);
         }
     }
 
@@ -2839,13 +3231,17 @@ pub const Window = extern struct {
     /// set of terminal tabs (Worktree.ID -> [TerminalTabID]); the user can open
     /// many tabs/splits under one folder, not just one.
     fn openWorktree(self: *Window, st: *const sidebar.WorktreeStatus) void {
+        const alloc = Application.default().allocator();
+        const key = locationKey(alloc, st.path, if (st.host) |*h| h else null) catch return;
+        defer alloc.free(key);
+
         // If this worktree has an unclicked notification, jump straight to the
         // (most recent) notifying surface/tab instead of just switching views.
-        if (self.pathHasAttention(st.path)) {
-            if (self.focusAttentionSurfaceForPath(st.path)) return;
+        if (self.pathHasAttention(key)) {
+            if (self.focusAttentionSurfaceForPath(key)) return;
         }
 
-        const view = self.ensureWorktreeView(st.path);
+        const view = self.ensureWorktreeView(key);
         const had_tabs = view.getNPages() > 0;
         self.switchToWorktreeView(view);
 
@@ -2855,7 +3251,6 @@ pub const Window = extern struct {
         // just set the working directory.
         if (!had_tabs) {
             if (st.host) |*h| {
-                const alloc = Application.default().allocator();
                 const ssh_host = h.asSshHost();
                 const cmd_line = ssh_command.terminalCommandLine(
                     alloc,
@@ -3043,6 +3438,17 @@ pub const Window = extern struct {
         if (agent) |a| {
             self.trackSurface(surface);
             const gop = priv.surface_agents.getOrPut(alloc, surface) catch return;
+            const restored_sid = if (!gop.found_existing)
+                priv.restored_session_ids.fetchRemove(surface)
+            else
+                null;
+            const carried_sid: ?[:0]u8 = if (!gop.found_existing and restored_sid == null)
+                if (surface.as(gobject.Object).getData("simbacode-session-id")) |data| blk: {
+                    const cstr: [*:0]const u8 = @ptrCast(data);
+                    break :blk alloc.dupeZ(u8, std.mem.sliceTo(cstr, 0)) catch null;
+                } else null
+            else
+                null;
             gop.value_ptr.* = .{
                 .agent = a,
                 // Preserve activity + pid + session id across a re-attach on the
@@ -3050,14 +3456,32 @@ pub const Window = extern struct {
                 // session_start, and must survive a bare presence refresh).
                 .activity = if (gop.found_existing) gop.value_ptr.activity else .idle,
                 .pid = if (gop.found_existing) gop.value_ptr.pid else null,
-                .session_id = if (gop.found_existing) gop.value_ptr.session_id else null,
+                .session_id = if (gop.found_existing)
+                    gop.value_ptr.session_id
+                else if (restored_sid) |kv|
+                    kv.value
+                else
+                    carried_sid,
             };
             // If we already have a captured session id for this surface (e.g. a
             // presence refresh after the id was learned), (re)record the entry.
             self.addSessionEntry(surface);
         } else {
-            // agent == null is a genuine detach (session_end / bare end), so
-            // drop the durable store entry for this worktree too.
+            // agent == null is a genuine detach (session_end / bare end). A
+            // restored or moved process can end before presence attaches in
+            // this window, so fall back to the carried GObject identity.
+            var removed_pending = false;
+            if (priv.restored_session_ids.fetchRemove(surface)) |kv| {
+                self.removeStoreEntryForSession(kv.value);
+                alloc.free(kv.value);
+                removed_pending = true;
+            }
+            if (!removed_pending and !priv.surface_agents.contains(surface)) {
+                if (surface.as(gobject.Object).getData("simbacode-session-id")) |data| {
+                    const cstr: [*:0]const u8 = @ptrCast(data);
+                    self.removeStoreEntryForSession(std.mem.sliceTo(cstr, 0));
+                }
+            }
             _ = self.removeSurfaceAgent(surface, true);
         }
 
@@ -3074,8 +3498,8 @@ pub const Window = extern struct {
     /// Remove a surface's agent presence entry. `positive_end` distinguishes
     /// the two very different callers (issue #29 data-loss fix):
     ///   - true  = the agent genuinely ended (session_end OSC, or the liveness
-    ///     sweep reaped a dead local pid). We ALSO drop the durable store entry
-    ///     for its worktree so it won't be restored next launch.
+    ///     sweep reaped a dead local pid). We ALSO drop its exact durable
+    ///     session id so it won't be restored next launch.
     ///   - false = a generic surface finalize (tab move, view switch, split
     ///     rearrange, window close). We drop only the in-memory presence; the
     ///     durable store entry MUST survive, because the session is still
@@ -3085,20 +3509,20 @@ pub const Window = extern struct {
         const priv = self.private();
         // Capture the worktree BEFORE removing the surface entry, while the
         // widget ancestry is still intact, for the positive-end store removal.
-        const do_store_remove = positive_end;
         if (priv.surface_agents.fetchRemove(surface)) |kv| {
             if (kv.value.session_id) |sid| {
+                if (positive_end) self.removeStoreEntryForSession(sid);
                 Application.default().allocator().free(sid);
             }
-            if (do_store_remove) self.removeStoreEntryForWorktree(surface);
+            if (positive_end) self.setSurfaceSessionData(surface, null);
             return true;
         }
         return false;
     }
 
     /// Rebuild the durable agent-session store (issue #29) from the current
-    /// live `surface_agents` set: one restorable entry per worktree, keyed on
-    /// the worktree, newest session winning. This is the single authoritative
+    /// live `surface_agents` set: one entry per exact session id, with multiple
+    /// sessions allowed in a worktree. This is the single authoritative
     /// writer — it can neither orphan a live worktree (RC1) nor accumulate a
     /// stale/duplicate entry (RC2), because the file always mirrors exactly
     /// what is restorable right now. Persists only when the set changed.
@@ -3108,10 +3532,6 @@ pub const Window = extern struct {
 
         var live: std.ArrayListUnmanaged(agent_session_store.Store.LiveAgent) = .empty;
         defer live.deinit(alloc);
-        // Backing storage for worktree strings we resolve per surface.
-        var wt_bufs: std.ArrayListUnmanaged([]const u8) = .empty;
-        defer wt_bufs.deinit(alloc);
-
         var it = priv.surface_agents.iterator();
         while (it.next()) |entry| {
             const ae = entry.value_ptr;
@@ -3120,7 +3540,9 @@ pub const Window = extern struct {
             if (sid.len == 0) continue;
             const surface = entry.key_ptr.*;
             const worktree: ?[]const u8 = self.worktreePathForSurface(surface);
-            const cwd: []const u8 = worktree orelse (surface.getPwd() orelse continue);
+            // Keep cwd as the real filesystem path. The worktree key may be a
+            // host-qualified `ssh://...` identity and is not itself a cwd.
+            const cwd: []const u8 = surface.getPwd() orelse continue;
             if (cwd.len == 0) continue;
             live.append(alloc, .{
                 .agent = ae.agent.name(),
@@ -3138,7 +3560,7 @@ pub const Window = extern struct {
         // silently delete it and lose the session on the next window close
         // (the reported data-loss bug). Removal happens only on POSITIVE end
         // signals: an explicit session_end, or the liveness sweep reaping a
-        // dead local pid — both via removeStoreEntryForWorktree.
+        // dead local pid — both via removeStoreEntryForSession.
         const changed = store.rebuildFromLive(alloc, live.items, false) catch |err| {
             log.warn("agent-session: reconcile failed: {}", .{err});
             return;
@@ -3148,35 +3570,15 @@ pub const Window = extern struct {
         };
     }
 
-    /// Remove the durable store entry for `surface`'s worktree on a POSITIVE
-    /// end signal (issue #29 data-loss fix). Called from the explicit end
-    /// paths — an agent's `session_end`, and the liveness sweep reaping a dead
-    /// local pid — NOT from generic surface finalize (tab move / view switch /
-    /// window close), which must never drop a restorable session. No-op when
-    /// the surface's worktree still hosts another live agent surface (a split
-    /// or sibling tab keeping the worktree alive).
-    fn removeStoreEntryForWorktree(self: *Window, surface: *Surface) void {
-        const priv = self.private();
-        const worktree: ?[]const u8 = self.worktreePathForSurface(surface);
-        const key: []const u8 = worktree orelse (surface.getPwd() orelse return);
-        if (key.len == 0) return;
-
-        // Keep the entry if another live agent surface shares this worktree.
-        var it = priv.surface_agents.iterator();
-        while (it.next()) |entry| {
-            const other = entry.key_ptr.*;
-            if (other == surface) continue;
-            const owt: ?[]const u8 = self.worktreePathForSurface(other);
-            const okey: []const u8 = owt orelse (other.getPwd() orelse continue);
-            if (okey.len > 0 and std.mem.eql(u8, okey, key)) return;
-        }
-
+    /// Remove exactly the positively-ended session. Multiple agent tabs may
+    /// share one worktree, so worktree-keyed removal can delete a sibling or
+    /// leave the ended session to resurrect on restart.
+    fn removeStoreEntryForSession(self: *Window, session_id: []const u8) void {
+        _ = self;
         const alloc = Application.default().allocator();
         var store = agent_session_store.load(alloc);
         defer store.deinit(alloc);
-        if (store.indexOfWorktree(key)) |i| {
-            var removed = store.sessions.orderedRemove(i);
-            removed.deinit(alloc);
+        if (store.removeBySessionId(alloc, session_id)) {
             agent_session_store.save(alloc, &store) catch |err| {
                 log.warn("agent-session: save-after-remove failed: {}", .{err});
             };
@@ -3191,18 +3593,56 @@ pub const Window = extern struct {
         const priv = self.private();
         const alloc = Application.default().allocator();
         const entry = priv.surface_agents.getPtr(surface) orelse return;
-        if (sid.len == 0) return;
+        if (!agentpkg.Agent.validSessionId(sid)) return;
         // No-op if unchanged.
         if (entry.session_id) |old| {
             if (std.mem.eql(u8, old, sid)) return;
         }
         const copy = alloc.dupeZ(u8, sid) catch return;
-        if (entry.session_id) |old| alloc.free(old);
+        self.setSurfaceSessionData(surface, sid);
+        const old = entry.session_id;
         entry.session_id = copy;
-        // Reconcile the durable store from the live set (handles both a fresh
-        // id and an id change: the worktree's entry is rewritten to the newest
-        // session, and any stale one for the same worktree is dropped).
-        self.addSessionEntry(surface);
+        // Persist the replacement atomically from the old durable record when
+        // possible, so session-id rotation does not depend on OSC-7 pwd timing.
+        if (old) |old_sid| {
+            if (!self.replaceStoreSessionId(old_sid, sid)) self.addSessionEntry(surface);
+            alloc.free(old_sid);
+        } else {
+            self.addSessionEntry(surface);
+        }
+    }
+
+    fn setSurfaceSessionData(self: *Window, surface: *Surface, sid: ?[]const u8) void {
+        _ = self;
+        const object = surface.as(gobject.Object);
+        const value = sid orelse {
+            object.setDataFull("simbacode-session-id", null, null);
+            return;
+        };
+        const alloc = Application.default().allocator();
+        const z = alloc.dupeZ(u8, value) catch return;
+        defer alloc.free(z);
+        object.setDataFull(
+            "simbacode-session-id",
+            glib.strdup(z.ptr),
+            glibFreeData,
+        );
+    }
+
+    fn replaceStoreSessionId(self: *Window, old_sid: []const u8, new_sid: []const u8) bool {
+        _ = self;
+        const alloc = Application.default().allocator();
+        var store = agent_session_store.load(alloc);
+        defer store.deinit(alloc);
+        const i = store.indexOfSessionId(old_sid) orelse return false;
+        const replacement = alloc.dupeZ(u8, new_sid) catch return false;
+        if (store.sessions.items[i].session_id) |old| alloc.free(old);
+        store.sessions.items[i].session_id = replacement;
+        agent_session_store.save(alloc, &store) catch |err| {
+            log.warn("agent-session: save-after-id-rotation failed: {}", .{err});
+            return false;
+        };
+        return true;
     }
 
     /// Register a GObject weak-ref on `surface` (once) so that when the surface
@@ -3236,6 +3676,14 @@ pub const Window = extern struct {
         }
         var changed = false;
         if (self.removeSurfaceAgent(surface, false)) changed = true;
+        if (priv.restored_session_ids.fetchRemove(surface)) |kv| {
+            // Finalization here means the user closed the restored surface
+            // before presence attached; remove the exact durable session so it
+            // does not resurrect next launch.
+            self.removeStoreEntryForSession(kv.value);
+            Application.default().allocator().free(kv.value);
+            changed = true;
+        }
         if (self.clearSurfaceAttention(surface)) changed = true;
         _ = priv.tracked_surfaces.remove(surface);
         // The surface is gone (tab/split/window close); its durable session
@@ -3304,12 +3752,21 @@ pub const Window = extern struct {
         const pwd = surface.getPwd() orelse return null;
         if (pwd.len == 0) return null;
         const priv = self.private();
+        const owner_key = self.worktreePathForSurface(surface);
+        const alloc = Application.default().allocator();
 
         // Exact worktree match -> "repo/branch" (or just "repo" for the main
-        // checkout whose branch we still show for context).
+        // checkout whose branch we still show for context). Compare canonical
+        // location keys so equal remote paths on different hosts don't borrow
+        // each other's label.
         var best_repo: ?[]const u8 = null;
         var best_repo_len: usize = 0;
         for (priv.sidebar_statuses) |*st| {
+            const key = locationKey(alloc, st.path, if (st.host) |*h| h else null) catch continue;
+            defer alloc.free(key);
+            if (owner_key) |owner| {
+                if (!std.mem.eql(u8, owner, key)) continue;
+            } else if (st.host != null) continue;
             if (std.mem.eql(u8, st.path, pwd)) {
                 return std.fmt.bufPrint(buf, "{s}/{s}", .{ st.repo_name, st.branch }) catch st.repo_name;
             }
@@ -3407,9 +3864,12 @@ pub const Window = extern struct {
     /// Whether any agent runs in (or under) any worktree in `group` (a repo's
     /// contiguous worktree run). Drives the repo-header bot icon (#4).
     fn groupHasAgent(self: *Window, group: []const sidebar.WorktreeStatus) bool {
+        const alloc = Application.default().allocator();
         var buf: [8]AgentMark = undefined;
         for (group) |*st| {
-            if (self.agentsForPath(st.path, &buf).len > 0) return true;
+            const key = locationKey(alloc, st.path, if (st.host) |*h| h else null) catch continue;
+            defer alloc.free(key);
+            if (self.agentsForPath(key, &buf).len > 0) return true;
         }
         return false;
     }
@@ -3417,9 +3877,12 @@ pub const Window = extern struct {
     /// Whether any agent under `group` is currently busy, so a collapsed repo
     /// header can bounce its indicator too.
     fn groupHasBusyAgent(self: *Window, group: []const sidebar.WorktreeStatus) bool {
+        const alloc = Application.default().allocator();
         var buf: [8]AgentMark = undefined;
         for (group) |*st| {
-            for (self.agentsForPath(st.path, &buf)) |m| {
+            const key = locationKey(alloc, st.path, if (st.host) |*h| h else null) catch continue;
+            defer alloc.free(key);
+            for (self.agentsForPath(key, &buf)) |m| {
                 if (m.busy) return true;
             }
         }
@@ -3571,9 +4034,10 @@ pub const Window = extern struct {
         const priv = self.private();
         const alloc = Application.default().allocator();
 
-        // The worktree path lets the popover row navigate back to the surface.
-        const pwd = surface.getPwd() orelse "";
-        const path = alloc.dupeZ(u8, pwd) catch return;
+        // The canonical location key lets the popover navigate back without
+        // confusing identical paths on different SSH hosts.
+        const location = self.worktreePathForSurface(surface) orelse (surface.getPwd() orelse "");
+        const path = alloc.dupeZ(u8, location) catch return;
 
         // Prefix with the repo/worktree context (#2): "<repo> \u00b7 <agent>".
         var ctx_buf: [256]u8 = undefined;
@@ -3780,10 +4244,13 @@ pub const Window = extern struct {
         n.read = true;
         const path = n.path;
 
-        // Navigate to the worktree the notification came from, if known.
+        // Navigate to the exact local/remote worktree, if still known.
         if (path.len > 0) {
+            const alloc = Application.default().allocator();
             for (priv.sidebar_statuses) |*st| {
-                if (std.mem.eql(u8, st.path, path)) {
+                const key = locationKey(alloc, st.path, if (st.host) |*h| h else null) catch continue;
+                defer alloc.free(key);
+                if (std.mem.eql(u8, key, path)) {
                     self.openWorktree(st);
                     break;
                 }
@@ -3911,9 +4378,13 @@ pub const Window = extern struct {
         _: *CloseConfirmationDialog,
         page: *adw.TabPage,
     ) callconv(.c) void {
+        const child = page.getChild();
+        if (ext.getAncestor(Window, child.as(gtk.Widget))) |window| {
+            if (gobject.ext.cast(Tab, child)) |tab| window.removeTabDurableSessions(tab);
+        }
         const tab_view = ext.getAncestor(
             adw.TabView,
-            page.getChild().as(gtk.Widget),
+            child.as(gtk.Widget),
         ) orelse {
             log.warn("close confirmation called for non-existent page", .{});
             return;
@@ -3954,6 +4425,7 @@ pub const Window = extern struct {
         // If the tab says it doesn't need confirmation then we go ahead
         // and close immediately.
         if (!tab.getNeedsConfirmQuit()) {
+            self.removeTabDurableSessions(tab);
             view.closePageFinish(page, @intFromBool(true));
             return @intFromBool(true);
         }
@@ -3978,6 +4450,35 @@ pub const Window = extern struct {
         // Show it
         dialog.present(child);
         return @intFromBool(true);
+    }
+
+    /// User-confirmed tab closure is a positive end for every exact session in
+    /// the tab. Generic page-detach remains non-destructive for drag/move.
+    fn removeTabDurableSessions(self: *Window, tab: *Tab) void {
+        // The GObject data travels with a tab across drag-detach/reparenting,
+        // unlike window-local maps. It guarantees a later close in the
+        // destination window removes the exact durable session.
+        if (tab.getSurfaceTree()) |tree| {
+            var surfaces = tree.iterator();
+            while (surfaces.next()) |entry| {
+                const data = entry.view.as(gobject.Object).getData("simbacode-session-id") orelse continue;
+                const sid_cstr: [*:0]const u8 = @ptrCast(data);
+                self.removeStoreEntryForSession(std.mem.sliceTo(sid_cstr, 0));
+            }
+        }
+        var it = self.private().surface_agents.iterator();
+        while (it.next()) |entry| {
+            const surface = entry.key_ptr.*;
+            const owner = ext.getAncestor(Tab, surface.as(gtk.Widget)) orelse continue;
+            if (owner != tab) continue;
+            if (entry.value_ptr.session_id) |sid| self.removeStoreEntryForSession(sid);
+        }
+        var pending = self.private().restored_session_ids.iterator();
+        while (pending.next()) |entry| {
+            const surface = entry.key_ptr.*;
+            const owner = ext.getAncestor(Tab, surface.as(gtk.Widget)) orelse continue;
+            if (owner == tab) self.removeStoreEntryForSession(entry.value_ptr.*);
+        }
     }
 
     fn tabViewSelectedPage(
@@ -4072,9 +4573,17 @@ pub const Window = extern struct {
             self,
         );
 
-        // Remove the tree handlers
+        // Remove the tree handlers. Pending restored ids are carried on the
+        // Surface GObject across drag-detach; drop only this source window's
+        // mirror so later finalization here cannot delete a live moved session.
         if (tab.getSurfaceTree()) |tree| {
             self.disconnectSurfaceHandlers(tree);
+            var surfaces = tree.iterator();
+            while (surfaces.next()) |entry| {
+                if (self.private().restored_session_ids.fetchRemove(entry.view)) |kv| {
+                    Application.default().allocator().free(kv.value);
+                }
+            }
         }
 
         // simbacode: clear agent presence for any surface in this tab so a
@@ -4099,16 +4608,13 @@ pub const Window = extern struct {
             const s = entry.key_ptr.*;
             if (ext.getAncestor(Tab, s.as(gtk.Widget))) |t| {
                 if (t == tab) to_remove.append(alloc, s) catch {};
-            } else {
-                // Surface no longer has a tab ancestor (being torn down): drop.
-                to_remove.append(alloc, s) catch {};
             }
         }
         // ...and from the attention map.
         var ait = priv.sidebar_attention.iterator();
         while (ait.next()) |entry| {
             const s = entry.key_ptr.*;
-            const same = if (ext.getAncestor(Tab, s.as(gtk.Widget))) |t| t == tab else true;
+            const same = if (ext.getAncestor(Tab, s.as(gtk.Widget))) |t| t == tab else false;
             if (same) {
                 // Avoid duplicates; cheap linear check (sets are tiny).
                 var dup = false;
@@ -4382,8 +4888,18 @@ pub const Window = extern struct {
                 if (new_tree) |nt| {
                     if (treeContains(nt, surface)) continue;
                 }
-                if (self.removeSurfaceAgent(surface, false)) changed = true;
-                _ = self.clearSurfaceAttention(surface);
+                if (surface.as(gobject.Object).getData("simbacode-session-id")) |data| {
+                    const cstr: [*:0]const u8 = @ptrCast(data);
+                    self.removeStoreEntryForSession(std.mem.sliceTo(cstr, 0));
+                    changed = true;
+                }
+                if (self.private().restored_session_ids.fetchRemove(surface)) |kv| {
+                    self.removeStoreEntryForSession(kv.value);
+                    Application.default().allocator().free(kv.value);
+                    changed = true;
+                }
+                if (self.removeSurfaceAgent(surface, true)) changed = true;
+                if (self.clearSurfaceAttention(surface)) changed = true;
             }
         }
 
