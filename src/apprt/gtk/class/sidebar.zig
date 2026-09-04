@@ -161,14 +161,60 @@ fn runChild(
     cwd: ?[]const u8,
     argv: []const []const u8,
 ) ?[]u8 {
-    const result = std.process.Child.run(.{
-        .allocator = alloc,
-        .argv = argv,
-        .cwd = cwd,
-        .max_output_bytes = 1024 * 1024,
-    }) catch |err| {
+    // Zig 0.15's Child.run leaks a zombie when a POSIX child fails between
+    // fork and exec (for example, when a sidebar root disappears before the
+    // child's chdir). Drive Child explicitly so the error path always waits.
+    var child = std.process.Child.init(argv, alloc);
+    child.stdin_behavior = .Ignore;
+    child.stdout_behavior = .Pipe;
+    child.stderr_behavior = .Pipe;
+    child.cwd = cwd;
+
+    child.spawn() catch |err| {
+        log.debug("command spawn failed cwd={?s} err={}", .{ cwd, err });
+        return null;
+    };
+
+    var stdout: std.ArrayList(u8) = .empty;
+    defer stdout.deinit(alloc);
+    var stderr: std.ArrayList(u8) = .empty;
+    defer stderr.deinit(alloc);
+
+    child.collectOutput(alloc, &stdout, &stderr, 1024 * 1024) catch |err| {
+        _ = child.kill() catch {};
+        closeChildPipes(&child);
+        log.debug("command output failed cwd={?s} err={}", .{ cwd, err });
+        return null;
+    };
+
+    const term = child.wait() catch |err| {
+        // waitForSpawn records pre-exec failures in child.term but returns the
+        // spawn error before reaping. kill() observes that state and performs
+        // the required stream cleanup; explicitly reap the known child PID.
+        if (child.term != null and @import("builtin").os.tag != .windows) {
+            // wait() cannot finish cleanup after waitForSpawn stores the
+            // pre-exec error, so close its private pipe before reaping.
+            closeChildPipes(&child);
+            _ = std.posix.waitpid(child.id, 0);
+        } else {
+            _ = child.kill() catch {};
+            closeChildPipes(&child);
+        }
         log.debug("command failed cwd={?s} err={}", .{ cwd, err });
         return null;
+    };
+
+    const stdout_owned = stdout.toOwnedSlice(alloc) catch return null;
+    const stderr_owned = stdout_err: {
+        break :stdout_err stderr.toOwnedSlice(alloc) catch {
+            alloc.free(stdout_owned);
+            return null;
+        };
+    };
+    const result: std.process.Child.RunResult = .{
+        .stdout = stdout_owned,
+        .stderr = stderr_owned,
+        .term = term,
     };
     defer alloc.free(result.stderr);
     switch (result.term) {
@@ -190,6 +236,21 @@ fn runChild(
     };
     alloc.free(result.stdout);
     return out;
+}
+
+fn closeChildPipes(child: *std.process.Child) void {
+    if (@import("builtin").os.tag != .windows) {
+        if (child.err_pipe) |fd| {
+            std.posix.close(fd);
+            child.err_pipe = null;
+        }
+    }
+    if (child.stdin) |file| file.close();
+    child.stdin = null;
+    if (child.stdout) |file| file.close();
+    child.stdout = null;
+    if (child.stderr) |file| file.close();
+    child.stderr = null;
 }
 
 /// Run a local git command in `cwd`, returning trimmed stdout. Caller owns
@@ -552,6 +613,56 @@ pub fn scan(alloc: Allocator, root: []const u8) ![]WorktreeStatus {
 pub fn freeStatuses(alloc: Allocator, statuses: []WorktreeStatus) void {
     for (statuses) |*s| s.deinit(alloc);
     alloc.free(statuses);
+}
+
+test "runChild reaps a child when its working directory disappeared" {
+    if (@import("builtin").os.tag != .linux) return error.SkipZigTest;
+
+    var tmp = std.testing.tmpDir(.{});
+    const missing_cwd = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(missing_cwd);
+    tmp.cleanup();
+
+    const children_path = "/proc/thread-self/children";
+    const before = std.fs.cwd().readFileAlloc(std.testing.allocator, children_path, 4096) catch
+        return error.SkipZigTest;
+    defer std.testing.allocator.free(before);
+
+    try std.testing.expect(runChild(
+        std.testing.allocator,
+        missing_cwd,
+        &.{ "git", "status", "--porcelain" },
+    ) == null);
+
+    const after = try std.fs.cwd().readFileAlloc(std.testing.allocator, children_path, 4096);
+    defer std.testing.allocator.free(after);
+    try std.testing.expectEqualStrings(before, after);
+}
+
+test "scanPaths tolerates a deleted configured root without leaking children" {
+    if (@import("builtin").os.tag != .linux) return error.SkipZigTest;
+
+    var tmp = std.testing.tmpDir(.{});
+    const missing_root = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(missing_root);
+    tmp.cleanup();
+
+    const path = try std.testing.allocator.dupeZ(u8, missing_root);
+    defer std.testing.allocator.free(path);
+    const roots = [_]sidebar_store.Root{.{ .path = path }};
+
+    const children_path = "/proc/thread-self/children";
+    const before = std.fs.cwd().readFileAlloc(std.testing.allocator, children_path, 4096) catch
+        return error.SkipZigTest;
+    defer std.testing.allocator.free(before);
+
+    const statuses = try scanPaths(std.testing.allocator, &roots);
+    defer freeStatuses(std.testing.allocator, statuses);
+    try std.testing.expectEqual(@as(usize, 0), statuses.len);
+
+    const after = try std.fs.cwd().readFileAlloc(std.testing.allocator, children_path, 4096);
+    defer std.testing.allocator.free(after);
+    try std.testing.expectEqualStrings(before, after);
 }
 
 test "sameLocation distinguishes identical paths on different SSH hosts" {
