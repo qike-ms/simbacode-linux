@@ -530,6 +530,15 @@ pub fn scanPaths(alloc: Allocator, roots: []const sidebar_store.Root) ![]Worktre
             continue;
         }
 
+        // Reject a root that was removed after it was persisted before
+        // spawning git. The directory can still disappear after this check;
+        // runChild's reaping path handles that race without leaking zombies.
+        var root_dir = std.fs.openDirAbsolute(root, .{}) catch |err| {
+            log.warn("cannot open sidebar root {s}: {}", .{ root, err });
+            continue;
+        };
+        root_dir.close();
+
         // First try the root itself as a repository.
         const before = results.items.len;
         try scanRepo(alloc, .{}, root, &results);
@@ -639,7 +648,7 @@ test "runChild reaps a child when its working directory disappeared" {
     try std.testing.expectEqualStrings(before, after);
 }
 
-test "scanPaths tolerates a deleted configured root without leaking children" {
+test "repeated scans of a deleted configured root do not leak children" {
     if (@import("builtin").os.tag != .linux) return error.SkipZigTest;
 
     var tmp = std.testing.tmpDir(.{});
@@ -656,9 +665,12 @@ test "scanPaths tolerates a deleted configured root without leaking children" {
         return error.SkipZigTest;
     defer std.testing.allocator.free(before);
 
-    const statuses = try scanPaths(std.testing.allocator, &roots);
-    defer freeStatuses(std.testing.allocator, statuses);
-    try std.testing.expectEqual(@as(usize, 0), statuses.len);
+    var i: usize = 0;
+    while (i < 100) : (i += 1) {
+        const statuses = try scanPaths(std.testing.allocator, &roots);
+        defer freeStatuses(std.testing.allocator, statuses);
+        try std.testing.expectEqual(@as(usize, 0), statuses.len);
+    }
 
     const after = try std.fs.cwd().readFileAlloc(std.testing.allocator, children_path, 4096);
     defer std.testing.allocator.free(after);
