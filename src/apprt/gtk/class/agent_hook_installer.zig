@@ -1189,14 +1189,15 @@ const pi_extension_index_ts =
     \\ *                        so the app's liveness sweep can reap a crashed agent.
     \\ *
     \\ * Hook event mapping:
-    \\ *   extension load      -> session_start
+    \\ *   Pi session_start    -> presence + persisted session capture when available
+    \\ *   Pi turn_end         -> persisted session capture after message persistence
     \\ *   Pi agent_start      -> busy
     \\ *   Pi agent_end        -> idle + notification with last_assistant_message
     \\ *   Pi session_shutdown -> session_end + idle
     \\ */
     \\
     \\import type { ExtensionAPI } from "@mariozechner/pi-coding-agent";
-    \\import { openSync, writeSync, closeSync } from "node:fs";
+    \\import { openSync, writeSync, closeSync, existsSync } from "node:fs";
     \\
     \\interface NotifyContent {
     \\  title?: string;
@@ -1315,12 +1316,27 @@ const pi_extension_index_ts =
     \\export default function (pi: ExtensionAPI) {
     \\  if (!isSimbacodeSurface()) return;
     \\
-    \\  // Emit session_start from the session_start event so we can read the
-    \\  // session id off ctx.sessionManager (it isn't known at load time, and it
-    \\  // changes on resume/fork). This carries sessionid= so a restart can
-    \\  // resume the EXACT conversation (issue #29). Fired for new/resume/fork.
-    \\  pi.on("session_start", (_event, ctx) => {
-    \\    emitPresenceWithSession("session_start", sessionIdOf(ctx));
+    \\  // Pi allocates an id before its lazily-created JSONL file exists. Only
+    \\  // publish the id once that file exists; otherwise simbacode could save
+    \\  // an id that `pi --session` can never resume after an abrupt restart.
+    \\  const emitSessionStart = (ctx: any) => {
+    \\    try {
+    \\      const sessionFile = ctx?.sessionManager?.getSessionFile?.();
+    \\      if (typeof sessionFile === "string" && existsSync(sessionFile)) {
+    \\        emitPresenceWithSession("session_start", sessionIdOf(ctx));
+    \\        return;
+    \\      }
+    \\    } catch {
+    \\      // Treat an unreadable session path as not yet resumable.
+    \\    }
+    \\    emitPresence("session_start");
+    \\  };
+    \\  pi.on("session_start", (_event, ctx) => emitSessionStart(ctx));
+    \\
+    \\  pi.on("turn_end", (_event, ctx) => {
+    \\    // Pi emits turn_end after persisting the assistant message, so this
+    \\    // captures a new session at the first point its JSONL is resumable.
+    \\    emitSessionStart(ctx);
     \\  });
     \\
     \\  pi.on("agent_start", (_event, _ctx) => {
@@ -1613,9 +1629,14 @@ test "opencode plugin + pi extension carry sentinel and events" {
     defer alloc.free(pi_src);
     try testing.expect(std.mem.indexOf(u8, pi_src, hooks.ownership_marker) != null);
     try testing.expect(std.mem.indexOf(u8, pi_src, "emitPresenceWithSession(\"session_start\"") != null);
-    // The pi extension probes for a session id so restore can resume the exact
-    // conversation (issue #29).
+    // Pi's id is published only after its lazily-created session file exists,
+    // then rechecked at turn_end after message persistence.
     try testing.expect(std.mem.indexOf(u8, pi_src, "sessionid=") != null);
+    try testing.expect(std.mem.indexOf(u8, pi_src, "existsSync(sessionFile)") != null);
+    try testing.expect(std.mem.indexOf(u8, pi_src, "pi.on(\"turn_end\"") != null);
+    try testing.expect(std.mem.indexOf(u8, pi_src, "emitSessionStart(ctx);") != null);
+    // A deliberate Pi exit must still remove its durable running-session entry.
+    try testing.expect(std.mem.indexOf(u8, pi_src, "emitPresence(\"session_end\")") != null);
     try testing.expect(std.mem.indexOf(u8, pi_src, "emitNotification") != null);
 }
 
